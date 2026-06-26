@@ -1,0 +1,4 @@
+interface:
+  display_name: "ve-adrive-cli"
+  short_description: "Use Volcengine A-Drive file storage"
+  default_prompt: "Use $ve-adrive-cli to inspect A-Drive resources safely."

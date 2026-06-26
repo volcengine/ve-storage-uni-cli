@@ -1,0 +1,4 @@
+interface:
+  display_name: "ve-tos-cli"
+  short_description: "Use Volcengine TOS object storage"
+  default_prompt: "Use $ve-tos-cli to inspect Volcengine TOS resources safely."

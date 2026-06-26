@@ -1,0 +1,35 @@
+{
+  "_license": "Apache-2.0",
+  "publisher": "Volcengine",
+  "releaseRepo": "https://github.com/volcengine/ve-storage-uni-cli",
+  "manifestVersion": "1.12.0",
+  "packages": [
+    {
+      "identifier": "Volcengine.VeTosCli",
+      "name": "Volcengine TOS CLI",
+      "moniker": "ve-tos-cli",
+      "description": "Dedicated TOS command-line interface for Volcengine storage services",
+      "commands": [
+        "ve-tos-cli"
+      ]
+    },
+    {
+      "identifier": "Volcengine.TosCli",
+      "name": "ByteCloud TOS CLI",
+      "moniker": "tos-cli",
+      "description": "Dedicated ByteCloud TOS command-line interface",
+      "commands": [
+        "tos-cli"
+      ]
+    },
+    {
+      "identifier": "Volcengine.VeAdriveCli",
+      "name": "Volcengine ADrive CLI",
+      "moniker": "ve-adrive-cli",
+      "description": "Dedicated ADrive command-line interface for Volcengine storage services",
+      "commands": [
+        "ve-adrive-cli"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,77 @@
+# Copyright (c) 2025 Beijing Volcano Engine Technology Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[workspace]
+members = [
+    "crates/tos-core",
+    "crates/tos",
+    "crates/toscli",
+    "crates/tosvector",
+    "crates/tostable",
+    "crates/adrive",
+]
+
+[workspace.dependencies]
+clap = { version = "4", features = ["derive", "env", "string"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+schemars = "0.8"
+indicatif = "0.17"
+comfy-table = "7"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+url = "2"
+jmespath = "0.3"
+strsim = "0.11"
+ulid = "1"
+quick-xml = { version = "0.36", features = ["serialize"] }
+rmcp = { version = "0.8", default-features = false, features = ["server", "transport-async-rw", "transport-io", "transport-sse-server", "macros", "base64"] }
+futures = "0.3"
+crc64fast = "1"
+
+[package]
+name = "ve-storage-uni-cli"
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Unified command-line interface for Volcengine storage services"
+readme = "README.md"
+homepage = "https://github.com/volcengine/ve-storage-uni-cli"
+repository = "https://github.com/volcengine/ve-storage-uni-cli"
+
+[dependencies]
+tos-core = { version = "1.0.0", path = "crates/tos-core" }
+ve-tos-cli = { package = "ve-tos-cli-core", version = "1.0.0", path = "crates/tos" }
+tos-cli = { package = "tos-cli-core", version = "1.0.0", path = "crates/toscli" }
+ve-adrive-cli = { package = "ve-adrive-cli-core", version = "1.0.0", path = "crates/adrive" }
+clap = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[[bin]]
+name = "ve-storage-uni-cli"
+path = "src/main.rs"

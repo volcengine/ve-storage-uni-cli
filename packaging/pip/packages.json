@@ -1,0 +1,29 @@
+{
+  "_license": "Apache-2.0",
+  "packages": [
+    {
+      "name": "ve-tos-cli",
+      "module": "ve_tos_cli_package",
+      "commands": [
+        "ve-tos-cli"
+      ],
+      "description": "Dedicated TOS command-line interface for Volcengine storage services"
+    },
+    {
+      "name": "tos-cli",
+      "module": "tos_cli_package",
+      "commands": [
+        "tos-cli"
+      ],
+      "description": "Dedicated ByteCloud TOS command-line interface"
+    },
+    {
+      "name": "ve-adrive-cli",
+      "module": "ve_adrive_cli_package",
+      "commands": [
+        "ve-adrive-cli"
+      ],
+      "description": "Dedicated ADrive command-line interface for Volcengine storage services"
+    }
+  ]
+}

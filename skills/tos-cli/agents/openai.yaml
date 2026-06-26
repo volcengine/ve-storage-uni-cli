@@ -1,0 +1,4 @@
+interface:
+  display_name: "tos-cli"
+  short_description: "Use ByteCloud TOS object storage"
+  default_prompt: "Use $tos-cli to inspect ByteCloud TOS resources safely."
