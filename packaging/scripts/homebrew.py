@@ -25,15 +25,11 @@ from pathlib import Path
 TARGET_ARCHIVES = {
     "aarch64-apple-darwin": "ve-storage-uni-cli-aarch64-apple-darwin.tar.gz",
     "x86_64-apple-darwin": "ve-storage-uni-cli-x86_64-apple-darwin.tar.gz",
-    "aarch64-unknown-linux-gnu": "ve-storage-uni-cli-aarch64-unknown-linux-gnu.tar.gz",
-    "x86_64-unknown-linux-gnu": "ve-storage-uni-cli-x86_64-unknown-linux-gnu.tar.gz",
 }
 
 TARGETS = {
     "macos_arm": TARGET_ARCHIVES["aarch64-apple-darwin"],
     "macos_intel": TARGET_ARCHIVES["x86_64-apple-darwin"],
-    "linux_arm": TARGET_ARCHIVES["aarch64-unknown-linux-gnu"],
-    "linux_intel": TARGET_ARCHIVES["x86_64-unknown-linux-gnu"],
 }
 
 
@@ -61,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target",
         choices=sorted(TARGET_ARCHIVES),
-        help="Generate formulae from a single target archive instead of all Homebrew targets",
+        help="Generate formulae from a single macOS target archive instead of both macOS targets",
     )
     return parser.parse_args()
 
@@ -141,16 +137,6 @@ end
     else
       url "{url(repo_url, version, TARGETS["macos_intel"])}"
       sha256 "{required["macos_intel"]}"
-    end
-  end
-
-  on_linux do
-    if Hardware::CPU.arm?
-      url "{url(repo_url, version, TARGETS["linux_arm"])}"
-      sha256 "{required["linux_arm"]}"
-    else
-      url "{url(repo_url, version, TARGETS["linux_intel"])}"
-      sha256 "{required["linux_intel"]}"
     end
   end
 

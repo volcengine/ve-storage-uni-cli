@@ -18,12 +18,17 @@
 from __future__ import annotations
 
 import argparse
+import email.utils
 import glob
+import hashlib
+import math
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import time
+from datetime import timezone
 from pathlib import Path
 
 
@@ -32,6 +37,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PUBLIC_PACKAGES = ("ve-tos-cli", "tos-cli", "ve-adrive-cli")
 ENTRY_CRATES = PUBLIC_PACKAGES
 CARGO_PUBLISH_RETRY_DELAYS = (15, 30, 60, 120)
+CARGO_RATE_LIMIT_RETRY_BUFFER_SECONDS = 5
+CARGO_RATE_LIMIT_RETRY_AFTER_PATTERN = re.compile(
+    r"Please try again after (?P<retry_after>.+? GMT)"
+)
 CARGO_PUBLISH_STEPS = (
     ("tos-core", ("cargo", "publish", "-p", "tos-core")),
     ("ve-tos-cli-core", ("cargo", "publish", "-p", "ve-tos-cli-core")),
@@ -53,11 +62,38 @@ CARGO_PUBLISH_STEPS = (
 )
 
 
-def run_command(command: list[str] | tuple[str, ...], execute: bool = True) -> None:
+def run_command(
+    command: list[str] | tuple[str, ...],
+    execute: bool = True,
+    capture_output: bool = False,
+) -> None:
     printable = " ".join(shlex.quote(part) for part in command)
     print(f"$ {printable}")
-    if execute:
+    if not execute:
+        return
+    if not capture_output:
         subprocess.run(list(command), cwd=ROOT, check=True)
+        return
+
+    completed_process = subprocess.run(
+        list(command),
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if completed_process.stdout:
+        print(completed_process.stdout, end="")
+    if completed_process.stderr:
+        print(completed_process.stderr, end="", file=sys.stderr)
+    if completed_process.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed_process.returncode,
+            list(command),
+            output=completed_process.stdout,
+            stderr=completed_process.stderr,
+        )
 
 
 def command_succeeds(command: list[str] | tuple[str, ...]) -> bool:
@@ -83,29 +119,92 @@ def should_retry_cargo_publish(command: list[str] | tuple[str, ...]) -> bool:
     )
 
 
+def called_process_error_output(error: subprocess.CalledProcessError) -> str:
+    output_parts = []
+    for stream_output in (error.output, error.stderr):
+        if isinstance(stream_output, bytes):
+            output_parts.append(stream_output.decode(errors="replace"))
+        elif stream_output:
+            output_parts.append(str(stream_output))
+    if not output_parts:
+        output_parts.append(str(error))
+    return "\n".join(output_parts)
+
+
+def cargo_rate_limit_retry_delay(error: subprocess.CalledProcessError) -> int | None:
+    error_output = called_process_error_output(error)
+    if "429 Too Many Requests" not in error_output:
+        return None
+    retry_after_match = CARGO_RATE_LIMIT_RETRY_AFTER_PATTERN.search(error_output)
+    if retry_after_match is None:
+        return None
+    try:
+        retry_after = email.utils.parsedate_to_datetime(
+            retry_after_match.group("retry_after")
+        )
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if retry_after.tzinfo is None:
+        retry_after = retry_after.replace(tzinfo=timezone.utc)
+    retry_after_seconds = retry_after.timestamp() - time.time()
+    return max(
+        0,
+        math.ceil(retry_after_seconds + CARGO_RATE_LIMIT_RETRY_BUFFER_SECONDS),
+    )
+
+
 def run_cargo_publish_command(command: list[str], execute: bool) -> None:
     if not execute or not should_retry_cargo_publish(command):
         run_command(command, execute=execute)
         return
 
-    for attempt, retry_delay in enumerate((*CARGO_PUBLISH_RETRY_DELAYS, None), start=1):
+    for attempt, fallback_retry_delay in enumerate(
+        (*CARGO_PUBLISH_RETRY_DELAYS, None),
+        start=1,
+    ):
         try:
-            run_command(command, execute=True)
+            run_command(command, execute=True, capture_output=True)
             return
-        except subprocess.CalledProcessError:
-            if retry_delay is None:
+        except subprocess.CalledProcessError as error:
+            if fallback_retry_delay is None:
                 raise
-            # [Review Fix #CargoIndexRetry] Dependent first-time crates can
-            # become visible in the crates.io index seconds after upload.
+            rate_limit_retry_delay = cargo_rate_limit_retry_delay(error)
+            if rate_limit_retry_delay is None:
+                retry_delay = fallback_retry_delay
+                retry_reason = "for registry index propagation"
+            else:
+                retry_delay = rate_limit_retry_delay
+                # [Review Fix #CargoRateLimitRetry] crates.io returns an
+                # absolute UTC retry time for new-crate publish rate limits.
+                retry_reason = "after crates.io rate-limit window"
             print(
                 f"# cargo publish failed on attempt {attempt}; "
-                f"retrying in {retry_delay}s for registry index propagation"
+                f"retrying in {retry_delay}s {retry_reason}"
             )
             time.sleep(retry_delay)
 
 
 def script_command(script_name: str, args: list[str]) -> list[str]:
     return [sys.executable, str(SCRIPT_DIR / script_name), *args]
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def run_checksums(args: argparse.Namespace) -> None:
+    checksums_path = args.checksums or args.out_dir / "SHA256SUMS"
+    entries = []
+    for asset_path in sorted(args.out_dir.iterdir()):
+        if asset_path.is_dir() or asset_path.resolve() == checksums_path.resolve():
+            continue
+        entries.append(f"{sha256_file(asset_path)}  {asset_path.name}")
+    checksums_path.write_text("\n".join(entries) + "\n", encoding="utf-8")
+    print(f"# wrote {checksums_path}")
 
 
 def release_dir(base_target_dir: Path, target: str) -> Path:
@@ -116,18 +215,61 @@ def entry_release_dir(entry_name: str, target: str) -> Path:
     return ROOT / "packaging" / "cargo" / entry_name / "target" / target / "release"
 
 
-def binary_dirs_for_target(target: str, root_target_dir: Path) -> list[Path]:
-    return [entry_release_dir(entry_name, target) for entry_name in ENTRY_CRATES]
+def is_linux_gnu_target(target: str) -> bool:
+    return "-unknown-linux-gnu" in target
+
+
+def is_windows_msvc_target(target: str) -> bool:
+    return target.endswith("-pc-windows-msvc")
+
+
+def cargo_artifact_target(target: str) -> str:
+    linux_gnu_glibc_marker = "-unknown-linux-gnu."
+    if linux_gnu_glibc_marker not in target:
+        return target
+
+    arch_name, _, _glibc_version = target.partition(linux_gnu_glibc_marker)
+    # [Review Fix #2] cargo-zigbuild accepts glibc-versioned Linux targets, but
+    # Cargo writes the artifacts under the base GNU triple directory.
+    return f"{arch_name}-unknown-linux-gnu"
+
+
+def build_command_prefix(target: str) -> list[str]:
+    if is_linux_gnu_target(target):
+        return ["cargo", "zigbuild"]
+    if is_windows_msvc_target(target):
+        return ["cargo", "xwin", "build"]
+    return ["cargo", "build"]
+
+
+def binary_dirs_for_target(
+    target: str,
+    root_target_dir: Path,
+) -> list[Path]:
+    del root_target_dir
+    artifact_target = cargo_artifact_target(target)
+    return [entry_release_dir(entry_name, artifact_target) for entry_name in ENTRY_CRATES]
 
 
 def build_release_binaries(target: str, skip_build: bool) -> None:
     if skip_build:
         return
 
+    # [Review Fix #1] Keep release.py as the only user-facing build entrypoint:
+    # select the cross-build backend from the target triple instead of making
+    # release operators invoke cargo-zigbuild or cargo-xwin directly.
+    command_prefix = build_command_prefix(target)
     for entry_name in ENTRY_CRATES:
         manifest = f"packaging/cargo/{entry_name}/Cargo.toml"
         run_command(
-            ["cargo", "build", "--release", "--target", target, "--manifest-path", manifest]
+            [
+                *command_prefix,
+                "--release",
+                "--target",
+                target,
+                "--manifest-path",
+                manifest,
+            ]
         )
 
 
@@ -243,9 +385,10 @@ def run_homebrew(args: argparse.Namespace) -> None:
     if args.tap_dir is None and (args.commit or args.push):
         raise SystemExit("--tap-dir is required when committing or pushing Homebrew formulae")
     if args.tap_dir is None:
-        print("# copy dist/homebrew/Formula/*.rb into the homebrew tap, then commit and push")
+        print("# copy dist/homebrew/Formula/*.rb into the Formula repository, then commit and push")
         return
 
+    validate_homebrew_formula_repo(args.tap_dir)
     formula_dir = args.tap_dir / "Formula"
     formula_dir.mkdir(parents=True, exist_ok=True)
     for formula_path in sorted(args.out_dir.glob("*.rb")):
@@ -396,6 +539,15 @@ def default_release_commit_message(version: str) -> str:
     return f"Release Volcengine storage CLIs v{version}"
 
 
+def validate_homebrew_formula_repo(repo_dir: Path) -> None:
+    marker_path = repo_dir / "packaging" / "homebrew" / "formulae.json"
+    if not marker_path.is_file():
+        raise SystemExit(
+            "--tap-dir must point to a ve-storage-uni-cli checkout "
+            "so Formula files are published into the source repository"
+        )
+
+
 def run_all(args: argparse.Namespace) -> None:
     if args.publish and args.tap_dir is None:
         raise SystemExit("--publish requires --tap-dir so Homebrew can be published")
@@ -405,9 +557,13 @@ def run_all(args: argparse.Namespace) -> None:
     execute_npm_publish = args.execute_publish or args.publish
     upload_pip = args.upload or args.publish
     build_pip_wheel = args.build_wheel or args.publish
-    submit_winget = args.submit or args.publish
-    commit_homebrew = args.homebrew_commit or args.publish
-    push_homebrew = args.homebrew_push or args.publish
+    # [Review Fix #MacWingetPublish] macOS release machines publish WinGet
+    # manifests through a GitHub PR, so --publish must not imply local submit.
+    submit_winget = args.submit
+    # [Review Fix #HomebrewInternalSync] Internal source checkouts can sync
+    # Formula files to GitHub, so --publish must not force a direct git push.
+    commit_homebrew = args.homebrew_commit
+    push_homebrew = args.homebrew_push
 
     run_archives(args)
     release_checksums = checksums_for_all(args)
@@ -523,6 +679,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_archive_options(archives)
     archives.set_defaults(func=run_archives)
 
+    checksums = subparsers.add_parser("checksums", help="Regenerate release SHA256SUMS")
+    checksums.add_argument("--out-dir", default=Path("dist"), type=Path)
+    checksums.add_argument("--checksums", type=Path, help="Checksum output path")
+    checksums.set_defaults(func=run_checksums)
+
     npm = subparsers.add_parser("npm", help="Generate npm packages")
     add_common_version(npm)
     npm.add_argument("--out-dir", default=Path("dist/npm"), type=Path)
@@ -553,17 +714,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generate formulae from one target archive",
     )
     homebrew.add_argument("--out-dir", default=Path("dist/homebrew/Formula"), type=Path)
-    homebrew.add_argument("--tap-dir", type=Path, help="Optional local homebrew tap checkout")
+    homebrew.add_argument(
+        "--tap-dir",
+        type=Path,
+        help="Optional local Homebrew Formula repository checkout",
+    )
     homebrew.add_argument("--commit", action="store_true", help="Commit copied formulae in --tap-dir")
-    homebrew.add_argument("--push", action="store_true", help="Push the Homebrew tap after commit")
-    homebrew.add_argument("--commit-message", help="Homebrew tap commit message")
+    homebrew.add_argument("--push", action="store_true", help="Push Homebrew Formulae after commit")
+    homebrew.add_argument("--commit-message", help="Homebrew Formulae commit message")
     homebrew.set_defaults(func=run_homebrew)
 
     winget = subparsers.add_parser("winget", help="Generate WinGet manifests")
     add_common_version(winget)
     add_checksum_options(winget)
     winget.add_argument("--out-dir", default=Path("dist/winget"), type=Path)
-    winget.add_argument("--submit", action="store_true", help="Run wingetcreate submit")
+    winget.add_argument("--submit", action="store_true", help=argparse.SUPPRESS)
     winget.set_defaults(func=run_winget)
 
     github_release = subparsers.add_parser(
@@ -584,16 +749,20 @@ def build_parser() -> argparse.ArgumentParser:
     all_channels.add_argument("--execute-publish", action="store_true", help="Run npm publish")
     all_channels.add_argument("--build-wheel", action="store_true")
     all_channels.add_argument("--upload", action="store_true", help="Upload wheels with twine")
-    all_channels.add_argument("--tap-dir", type=Path, help="Optional local homebrew tap checkout")
+    all_channels.add_argument(
+        "--tap-dir",
+        type=Path,
+        help="Optional source repository checkout that receives Homebrew Formula files",
+    )
     all_channels.add_argument("--homebrew-target", help="Generate Homebrew formulae from one target archive")
     all_channels.add_argument(
         "--homebrew-commit",
         action="store_true",
         help="Commit copied formulae in --tap-dir",
     )
-    all_channels.add_argument("--homebrew-push", action="store_true", help="Push the Homebrew tap")
-    all_channels.add_argument("--homebrew-commit-message", help="Homebrew tap commit message")
-    all_channels.add_argument("--submit", action="store_true", help="Run wingetcreate submit")
+    all_channels.add_argument("--homebrew-push", action="store_true", help="Push Homebrew Formulae")
+    all_channels.add_argument("--homebrew-commit-message", help="Homebrew Formulae commit message")
+    all_channels.add_argument("--submit", action="store_true", help=argparse.SUPPRESS)
     all_channels.add_argument("--execute-cargo", action="store_true", help="Run cargo publish")
     all_channels.add_argument("--cargo-dry-run", action="store_true", help="Pass --dry-run to cargo publish")
     all_channels.add_argument("--allow-dirty", action="store_true", help="Pass --allow-dirty to cargo publish")
@@ -622,7 +791,7 @@ def build_parser() -> argparse.ArgumentParser:
     all_channels.add_argument(
         "--publish",
         action="store_true",
-        help="Publish Cargo, GitHub Release assets, npm, PyPI, Homebrew tap, and WinGet",
+        help="Publish Cargo, GitHub Release assets, npm, PyPI, and write Homebrew Formulae",
     )
     all_channels.set_defaults(
         func=run_all,

@@ -18,8 +18,9 @@ one of these installation methods:
 cargo install ve-adrive-cli
 npm install -g ve-adrive-cli
 pip install ve-adrive-cli
-brew install volcengine/tap/ve-adrive-cli
-winget install Volcengine.VeAdriveCli
+brew tap volcengine/ve-storage-uni-cli https://github.com/volcengine/ve-storage-uni-cli
+brew install ve-adrive-cli
+winget install ve-adrive-cli
 curl -fsSL https://github.com/volcengine/ve-storage-uni-cli/releases/latest/download/install.sh | sh -s -- ve-adrive-cli
 ```
 

@@ -20,6 +20,11 @@ license = "Apache-2.0"
 description = "Dedicated ADrive command-line installer for the Volcengine storage unified CLI"
 homepage = "https://github.com/volcengine/ve-storage-uni-cli"
 repository = "https://github.com/volcengine/ve-storage-uni-cli"
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/src/**",
+]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

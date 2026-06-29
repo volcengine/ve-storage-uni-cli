@@ -20,6 +20,11 @@ license = "Apache-2.0"
 description = "Dedicated ByteCloud TOS command-line installer"
 homepage = "https://github.com/volcengine/ve-storage-uni-cli"
 repository = "https://github.com/volcengine/ve-storage-uni-cli"
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/src/**",
+]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

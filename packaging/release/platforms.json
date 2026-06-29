@@ -27,6 +27,14 @@
       "archive": "ve-storage-uni-cli-x86_64-unknown-linux-gnu.tar.gz"
     },
     {
+      "triple": "x86_64-unknown-linux-gnu.2.17",
+      "os": "linux",
+      "arch": "x64",
+      "libc": "glibc",
+      "minimum_glibc": "2.17",
+      "archive": "ve-storage-uni-cli-x86_64-unknown-linux-gnu.2.17.tar.gz"
+    },
+    {
       "triple": "aarch64-unknown-linux-gnu",
       "os": "linux",
       "arch": "arm64",
@@ -34,23 +42,18 @@
       "archive": "ve-storage-uni-cli-aarch64-unknown-linux-gnu.tar.gz"
     },
     {
-      "triple": "x86_64-unknown-linux-musl",
+      "triple": "aarch64-unknown-linux-gnu.2.17",
       "os": "linux",
-      "arch": "x64",
-      "libc": "musl",
-      "archive": "ve-storage-uni-cli-x86_64-unknown-linux-musl.tar.gz"
+      "arch": "arm64",
+      "libc": "glibc",
+      "minimum_glibc": "2.17",
+      "archive": "ve-storage-uni-cli-aarch64-unknown-linux-gnu.2.17.tar.gz"
     },
     {
       "triple": "x86_64-pc-windows-msvc",
       "os": "win32",
       "arch": "x64",
       "archive": "ve-storage-uni-cli-x86_64-pc-windows-msvc.zip"
-    },
-    {
-      "triple": "aarch64-pc-windows-msvc",
-      "os": "win32",
-      "arch": "arm64",
-      "archive": "ve-storage-uni-cli-aarch64-pc-windows-msvc.zip"
     }
   ]
 }

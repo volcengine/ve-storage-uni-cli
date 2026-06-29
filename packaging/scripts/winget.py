@@ -24,7 +24,6 @@ from pathlib import Path
 
 WINDOWS_ARCHIVES = {
     "x64": "ve-storage-uni-cli-x86_64-pc-windows-msvc.zip",
-    "arm64": "ve-storage-uni-cli-aarch64-pc-windows-msvc.zip",
 }
 
 

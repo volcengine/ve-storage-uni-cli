@@ -8,24 +8,24 @@ PUBLIC_SKILLS = {
         "cargo": "cargo install ve-tos-cli",
         "npm": "npm install -g ve-tos-cli",
         "pip": "pip install ve-tos-cli",
-        "brew": "brew install volcengine/tap/ve-tos-cli",
-        "winget": "winget install Volcengine.VeTosCli",
+        "brew": "brew install ve-tos-cli",
+        "winget": "winget install ve-tos-cli",
     },
     "tos-cli": {
         "command": "tos-cli",
         "cargo": "cargo install tos-cli",
         "npm": "npm install -g tos-cli",
         "pip": "pip install tos-cli",
-        "brew": "brew install volcengine/tap/tos-cli",
-        "winget": "winget install Volcengine.TosCli",
+        "brew": "brew install tos-cli",
+        "winget": "winget install tos-cli",
     },
     "ve-adrive-cli": {
         "command": "ve-adrive-cli",
         "cargo": "cargo install ve-adrive-cli",
         "npm": "npm install -g ve-adrive-cli",
         "pip": "pip install ve-adrive-cli",
-        "brew": "brew install volcengine/tap/ve-adrive-cli",
-        "winget": "winget install Volcengine.VeAdriveCli",
+        "brew": "brew install ve-adrive-cli",
+        "winget": "winget install ve-adrive-cli",
     },
 }
 
@@ -54,6 +54,7 @@ def test_public_cli_skills_explain_binary_lookup_and_installation():
         assert f"`{command_name} --version`" in content
         assert "Do not run storage operations if the binary is missing" in content
         assert "CLI installation" in content
+        assert "brew tap volcengine/ve-storage-uni-cli https://github.com/volcengine/ve-storage-uni-cli" in content
         assert skill_info["cargo"] in content
         assert skill_info["npm"] in content
         assert skill_info["pip"] in content

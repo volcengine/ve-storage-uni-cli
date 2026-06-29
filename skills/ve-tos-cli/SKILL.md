@@ -19,8 +19,9 @@ of these installation methods:
 cargo install ve-tos-cli
 npm install -g ve-tos-cli
 pip install ve-tos-cli
-brew install volcengine/tap/ve-tos-cli
-winget install Volcengine.VeTosCli
+brew tap volcengine/ve-storage-uni-cli https://github.com/volcengine/ve-storage-uni-cli
+brew install ve-tos-cli
+winget install ve-tos-cli
 curl -fsSL https://github.com/volcengine/ve-storage-uni-cli/releases/latest/download/install.sh | sh -s -- ve-tos-cli
 ```
 

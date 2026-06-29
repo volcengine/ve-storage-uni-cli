@@ -14,6 +14,42 @@ def load_homebrew_module():
     return module
 
 
+def test_homebrew_targets_are_macos_only():
+    homebrew = load_homebrew_module()
+
+    assert set(homebrew.TARGET_ARCHIVES) == {
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+    }
+
+
+def test_default_formula_requires_only_macos_checksums():
+    homebrew = load_homebrew_module()
+    formula = {
+        "name": "ve-tos-cli",
+        "class": "VeTosCli",
+        "description": "test formula",
+        "commands": ["ve-tos-cli"],
+    }
+    sums = {
+        "ve-storage-uni-cli-aarch64-apple-darwin.tar.gz": "arm123",
+        "ve-storage-uni-cli-x86_64-apple-darwin.tar.gz": "intel123",
+    }
+
+    text = homebrew.formula_text(
+        formula,
+        "1.0.0",
+        "https://github.com/volcengine/ve-storage-uni-cli",
+        sums,
+    )
+
+    assert "on_macos do" in text
+    assert "on_linux do" not in text
+    assert "ve-storage-uni-cli-aarch64-apple-darwin.tar.gz" in text
+    assert "ve-storage-uni-cli-x86_64-apple-darwin.tar.gz" in text
+    assert "unknown-linux" not in text
+
+
 def test_single_target_formula_requires_only_target_checksum():
     homebrew = load_homebrew_module()
     formula = {

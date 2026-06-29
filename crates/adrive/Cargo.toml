@@ -20,6 +20,10 @@ license = "Apache-2.0"
 description = "Core ADrive command surface used by ve-storage-uni-cli and ve-adrive-cli"
 homepage = "https://github.com/volcengine/ve-storage-uni-cli"
 repository = "https://github.com/volcengine/ve-storage-uni-cli"
+include = [
+    "/Cargo.toml",
+    "/src/**",
+]
 
 [lib]
 name = "ve_adrive_cli"

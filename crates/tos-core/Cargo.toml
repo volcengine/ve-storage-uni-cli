@@ -21,6 +21,11 @@ description = "Shared configuration, output, transfer, agent, and MCP utilities 
 homepage = "https://github.com/volcengine/ve-storage-uni-cli"
 repository = "https://github.com/volcengine/ve-storage-uni-cli"
 build = "build.rs"
+include = [
+    "/Cargo.toml",
+    "/build.rs",
+    "/src/**",
+]
 
 [dependencies]
 clap = { workspace = true }

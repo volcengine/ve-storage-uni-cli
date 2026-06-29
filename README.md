@@ -70,15 +70,16 @@ pip install ve-adrive-cli
 ```
 
 ```bash
-brew install volcengine/tap/ve-tos-cli
-brew install volcengine/tap/tos-cli
-brew install volcengine/tap/ve-adrive-cli
+brew tap volcengine/ve-storage-uni-cli https://github.com/volcengine/ve-storage-uni-cli
+brew install ve-tos-cli
+brew install tos-cli
+brew install ve-adrive-cli
 ```
 
 ```powershell
-winget install Volcengine.VeTosCli
-winget install Volcengine.TosCli
-winget install Volcengine.VeAdriveCli
+winget install ve-tos-cli
+winget install tos-cli
+winget install ve-adrive-cli
 ```
 
 Install all three CLIs with curl:

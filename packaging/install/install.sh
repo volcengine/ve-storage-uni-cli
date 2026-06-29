@@ -64,10 +64,9 @@ detect_libc() {
     return 0
   fi
   if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
-    printf '%s' "-musl"
-  else
-    printf '%s' "-gnu"
+    die "unsupported Linux libc: musl release archives are not published"
   fi
+  printf '%s' "-gnu"
 }
 
 target_triple() {
@@ -75,8 +74,18 @@ target_triple() {
   arch="$(normalize_arch)"
   case "$os" in
     apple-darwin) printf '%s' "$arch-apple-darwin" ;;
-    unknown-linux) printf '%s' "$arch-unknown-linux$(detect_libc)" ;;
-    pc-windows-msvc) printf '%s' "$arch-pc-windows-msvc" ;;
+    unknown-linux)
+      detect_libc >/dev/null
+      case "$arch" in
+        x86_64) printf '%s' "x86_64-unknown-linux-gnu.2.17" ;;
+        aarch64) printf '%s' "aarch64-unknown-linux-gnu.2.17" ;;
+        *) die "unsupported Linux architecture: $arch" ;;
+      esac
+      ;;
+    pc-windows-msvc)
+      [ "$arch" = "x86_64" ] || die "unsupported Windows architecture: $arch"
+      printf '%s' "x86_64-pc-windows-msvc"
+      ;;
     *) die "unsupported target OS: $os" ;;
   esac
 }
@@ -130,6 +139,9 @@ verify_checksum() {
 extract_archive() {
   archive_path="$1"
   dest_dir="$2"
+  # [Review Fix #InstallExtractDir] BSD tar fails when -C points at a
+  # directory that does not exist, which breaks curl installs on macOS.
+  mkdir -p "$dest_dir"
   case "$archive_path" in
     *.zip)
       need_command unzip

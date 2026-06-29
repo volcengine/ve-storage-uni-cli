@@ -31,11 +31,11 @@ function detectTarget() {
   if (os === 'darwin' && arch === 'x64') return 'x86_64-apple-darwin';
   if (os === 'darwin' && arch === 'arm64') return 'aarch64-apple-darwin';
   if (os === 'win32' && arch === 'x64') return 'x86_64-pc-windows-msvc';
-  if (os === 'win32' && arch === 'arm64') return 'aarch64-pc-windows-msvc';
   if (os === 'linux' && arch === 'x64') {
-    return isMusl() ? 'x86_64-unknown-linux-musl' : 'x86_64-unknown-linux-gnu';
+    if (isMusl()) throw new Error('unsupported platform: linux/x64 musl');
+    return 'x86_64-unknown-linux-gnu.2.17';
   }
-  if (os === 'linux' && arch === 'arm64') return 'aarch64-unknown-linux-gnu';
+  if (os === 'linux' && arch === 'arm64') return 'aarch64-unknown-linux-gnu.2.17';
   throw new Error(`unsupported platform: ${os}/${arch}`);
 }
 

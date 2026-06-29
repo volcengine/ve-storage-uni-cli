@@ -18,8 +18,9 @@ these installation methods:
 cargo install tos-cli
 npm install -g tos-cli
 pip install tos-cli
-brew install volcengine/tap/tos-cli
-winget install Volcengine.TosCli
+brew tap volcengine/ve-storage-uni-cli https://github.com/volcengine/ve-storage-uni-cli
+brew install tos-cli
+winget install tos-cli
 curl -fsSL https://github.com/volcengine/ve-storage-uni-cli/releases/latest/download/install.sh | sh -s -- tos-cli
 ```
 
