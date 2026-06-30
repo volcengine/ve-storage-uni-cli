@@ -99,7 +99,7 @@ cargo install cargo-xwin
 # apt-get install zig
 
 # Python packages used for wheel build and PyPI upload.
-python3 -m pip install --upgrade build twine
+python3 -m pip install --upgrade build twine setuptools wheel
 
 # Authenticate publish tools before running execute/upload flags.
 cargo login
@@ -120,7 +120,7 @@ can push to your `winget-pkgs` fork before opening the PR.
 | Archives and Cargo    | Rust toolchain, `cargo`, requested Rust targets | Install extra targets with `rustup target add <triple>` when cross-building. `release.py archives` selects the required backend tool for each target.             |
 | GitHub Release assets | GitHub CLI (`gh`)                               | `github-release --execute` runs `gh release create`, `gh release upload`, and in auto mode `gh release view`. Authenticate with `gh auth login` or `GITHUB_TOKEN`. |
 | npm packages          | Node.js, `npm`                                  | `npm --execute-publish` requires npm registry auth.                                                                                                                |
-| PyPI wheels           | Python 3, `build`, `twine`                      | Install with `python3 -m pip install --upgrade build twine`; upload uses Twine credentials or `TWINE_*` env vars.                                                  |
+| PyPI wheels           | Python 3, `build`, `twine`, `setuptools`, `wheel` | Install with `python3 -m pip install --upgrade build twine setuptools wheel`; upload uses Twine credentials or `TWINE_*` env vars.                                  |
 | Homebrew Formulae     | `git`, access to the source repository checkout | The generator writes Ruby formulae into `Formula/`; use `--tap-dir .` for this repository, and only add commit/push flags when this checkout should publish directly. |
 | WinGet manifests      | Python 3, `git`, GitHub CLI (`gh`)              | Manifest generation writes `dist/winget` and can run on macOS; publish by copying those files into a `winget-pkgs` fork and opening a PR.                         |
 
@@ -179,11 +179,17 @@ python3 packaging/scripts/release.py npm --version <version>
 
 Generate PyPI package trees and wheels from already-built CLI binaries. Pass
 the release target triple; the release script resolves the corresponding
-`packaging/cargo/*/target/<triple>/release` binary directories:
+`packaging/cargo/*/target/<triple>/release` binary directories and writes a
+platform-tagged wheel:
 
 ```bash
 python3 packaging/scripts/release.py pip --version <version> --target <triple> --build-wheel
 ```
+
+Run this command once per PyPI target. The `dist/pip/<package>` source tree is
+regenerated for each target, while release wheels accumulate under
+`dist/pip/wheels/*.whl`. Upload the wheel files, not the last regenerated source
+tree.
 
 For Linux PyPI wheels, use the `.2.17` target, for example
 `x86_64-unknown-linux-gnu.2.17` or `aarch64-unknown-linux-gnu.2.17`. Those
@@ -243,11 +249,24 @@ Publish npm packages:
 python3 packaging/scripts/release.py npm --version <version> --execute-publish
 ```
 
+If your npm account requires two-factor authentication for publishes, either
+pass the current one-time password:
+
+```bash
+python3 packaging/scripts/release.py npm --version <version> --execute-publish --otp <otp-code>
+```
+
+or publish with a granular npm access token that has bypass 2FA enabled.
+
 Publish PyPI wheels:
 
 ```bash
 python3 packaging/scripts/release.py pip --version <version> --target <triple> --build-wheel --upload
 ```
+
+For a multi-platform release, build every target first, then upload the
+accumulated `dist/pip/wheels/*.whl` set with Twine. Pip selects the matching
+wheel for the user's OS and architecture during `pip install`.
 
 Publish Homebrew Formulae into the source repository after `SHA256SUMS` exists.
 Homebrew formulae are macOS-only, so the generator reads only the

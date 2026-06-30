@@ -75,3 +75,27 @@ def test_pip_package_generation_declares_src_package_dir(tmp_path):
 
     assert "[tool.setuptools.package-dir]" in pyproject
     assert '"" = "src"' in pyproject
+
+
+def test_pip_setup_forces_py3_none_platform_wheel_tags(tmp_path):
+    pip = load_pip_module()
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    (binary_dir / "ve-tos-cli").write_text("#!/bin/sh\n", encoding="utf-8")
+
+    pip.generate_package(
+        tmp_path / "out",
+        {
+            "name": "ve-tos-cli",
+            "module": "ve_tos_cli_package",
+            "commands": ["ve-tos-cli"],
+            "description": "test package",
+        },
+        "1.2.3",
+        [binary_dir],
+    )
+
+    setup_py = (tmp_path / "out" / "ve-tos-cli" / "setup.py").read_text(encoding="utf-8")
+
+    assert 'return (python_tag, "none", platform_tag)' in setup_py
+    assert 'cmdclass={"bdist_wheel": PlatformWheel}' in setup_py

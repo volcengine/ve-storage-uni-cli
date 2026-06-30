@@ -196,7 +196,7 @@ def test_packaging_readme_documents_github_release_upload_and_release_phases():
     assert "## Prerequisites" in readme
     assert "cargo install cargo-zigbuild" in readme
     assert "cargo install cargo-xwin" in readme
-    assert "python3 -m pip install --upgrade build twine" in readme
+    assert "python3 -m pip install --upgrade build twine setuptools wheel" in readme
     assert "rustup target add" in readme
     assert "x86_64-unknown-linux-gnu.2.17" in readme
     assert "aarch64-unknown-linux-gnu.2.17" in readme
@@ -212,7 +212,12 @@ def test_packaging_readme_documents_github_release_upload_and_release_phases():
     assert "wingetcreate" not in readme
     assert "release.py checksums --out-dir dist" in readme
     assert "`--version <version>` expects `1.0.0`, not `v1.0.0`" in readme
+    assert "--execute-publish --otp <otp-code>" in readme
+    assert "granular npm access token that has bypass 2FA enabled" in readme
     assert "For Linux PyPI wheels, use the `.2.17` target" in readme
+    assert "Run this command once per PyPI target" in readme
+    assert "`dist/pip/wheels/*.whl`" in readme
+    assert "regenerated for each target" in readme
     wrapper_section = readme[
         readme.index("### 2. Build package wrappers") : readme.index(
             "### 3. Publish package registries"
@@ -792,6 +797,203 @@ def test_pip_linux_compat_target_uses_cargo_zigbuild_artifact_dirs(tmp_path, mon
         )
 
 
+def test_pip_build_wheel_uses_target_platform_tag(tmp_path, monkeypatch):
+    release = load_release_module()
+    commands = []
+
+    monkeypatch.setattr(
+        release,
+        "run_command",
+        lambda command, execute=True: commands.append(
+            (tuple(str(part) for part in command), execute)
+        ),
+    )
+    monkeypatch.setattr(release, "ensure_python_modules", lambda *_args: None, raising=False)
+
+    args = argparse.Namespace(
+        version="1.2.3",
+        binary_dir=[tmp_path / "bin"],
+        target="x86_64-pc-windows-msvc",
+        platform_tag=None,
+        out_dir=tmp_path / "pip",
+        build_wheel=True,
+        upload=False,
+    )
+
+    release.run_pip(args)
+
+    assert commands[1] == (
+        (
+            release.sys.executable,
+            "-m",
+            "build",
+            "--wheel",
+            "--no-isolation",
+            "--outdir",
+            str(tmp_path / "pip" / "wheels"),
+            "--config-setting=--build-option=--python-tag=py3",
+            "--config-setting=--build-option=--plat-name=win_amd64",
+            str(tmp_path / "pip" / "ve-tos-cli"),
+        ),
+        True,
+    )
+
+
+def test_pip_build_wheel_rejects_unknown_target_platform_tag(tmp_path, monkeypatch):
+    release = load_release_module()
+
+    monkeypatch.setattr(release, "run_command", lambda command, execute=True: None)
+    monkeypatch.setattr(release, "ensure_python_modules", lambda *_args: None, raising=False)
+
+    args = argparse.Namespace(
+        version="1.2.3",
+        binary_dir=[tmp_path / "bin"],
+        target="x86_64-unknown-linux-gnu",
+        platform_tag=None,
+        out_dir=tmp_path / "pip",
+        build_wheel=True,
+        upload=False,
+    )
+
+    with pytest.raises(SystemExit, match="unknown PyPI platform tag"):
+        release.run_pip(args)
+
+
+def test_pip_build_wheel_requires_platform_tag_with_manual_binary_dirs(tmp_path, monkeypatch):
+    release = load_release_module()
+
+    monkeypatch.setattr(release, "run_command", lambda command, execute=True: None)
+    monkeypatch.setattr(release, "ensure_python_modules", lambda *_args: None, raising=False)
+
+    args = argparse.Namespace(
+        version="1.2.3",
+        binary_dir=[tmp_path / "bin"],
+        target=None,
+        platform_tag=None,
+        out_dir=tmp_path / "pip",
+        build_wheel=True,
+        upload=False,
+    )
+
+    with pytest.raises(SystemExit, match="--platform-tag"):
+        release.run_pip(args)
+
+
+def test_pip_build_wheel_checks_no_isolation_build_modules(tmp_path, monkeypatch):
+    release = load_release_module()
+    commands = []
+
+    monkeypatch.setattr(release, "run_command", lambda command, execute=True: commands.append(command))
+    monkeypatch.setattr(
+        release,
+        "missing_python_modules",
+        lambda module_names: ("setuptools", "wheel"),
+        raising=False,
+    )
+
+    args = argparse.Namespace(
+        version="1.2.3",
+        binary_dir=[tmp_path / "bin"],
+        target="x86_64-pc-windows-msvc",
+        platform_tag=None,
+        out_dir=tmp_path / "pip",
+        build_wheel=True,
+        upload=False,
+    )
+
+    with pytest.raises(SystemExit, match="setuptools, wheel"):
+        release.run_pip(args)
+
+    assert commands == []
+
+
+def test_pip_upload_checks_twine_module(tmp_path, monkeypatch):
+    release = load_release_module()
+    commands = []
+
+    (tmp_path / "pip" / "wheels").mkdir(parents=True)
+    (tmp_path / "pip" / "wheels" / "ve_tos_cli-1.2.3-py3-none-any.whl").write_text(
+        "wheel",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(release, "run_command", lambda command, execute=True: commands.append(command))
+    monkeypatch.setattr(
+        release,
+        "missing_python_modules",
+        lambda module_names: ("twine",),
+        raising=False,
+    )
+
+    args = argparse.Namespace(
+        version="1.2.3",
+        binary_dir=[tmp_path / "bin"],
+        target=None,
+        platform_tag=None,
+        out_dir=tmp_path / "pip",
+        build_wheel=False,
+        upload=True,
+    )
+
+    with pytest.raises(SystemExit, match="twine"):
+        release.run_pip(args)
+
+    assert commands == []
+
+
+def test_pip_parser_accepts_explicit_platform_tag():
+    release = load_release_module()
+
+    args = release.build_parser().parse_args(
+        [
+            "pip",
+            "--version",
+            "1.2.3",
+            "--binary-dir",
+            "target/custom/release",
+            "--platform-tag",
+            "manylinux_2_17_x86_64",
+        ]
+    )
+
+    assert args.platform_tag == "manylinux_2_17_x86_64"
+
+
+def test_npm_publish_accepts_otp_for_two_factor_auth(tmp_path, monkeypatch):
+    release = load_release_module()
+    commands = []
+
+    monkeypatch.setattr(
+        release,
+        "run_command",
+        lambda command, execute=True: commands.append(
+            (tuple(str(part) for part in command), execute)
+        ),
+    )
+
+    args = argparse.Namespace(
+        version="1.2.3",
+        out_dir=tmp_path / "npm",
+        access="public",
+        tag="latest",
+        otp="123456",
+        execute_publish=True,
+    )
+
+    release.run_npm(args)
+
+    assert (
+        "npm",
+        "publish",
+        str(tmp_path / "npm" / "ve-tos-cli"),
+        "--access",
+        "public",
+        "--tag",
+        "latest",
+        "--otp",
+        "123456",
+    ) in [command for command, _execute in commands]
+
+
 def test_root_package_is_publishable_to_crates_io():
     root_manifest = (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8")
 
@@ -822,7 +1024,7 @@ def test_all_publish_enables_external_publish_steps(tmp_path, monkeypatch):
     monkeypatch.setattr(
         release,
         "run_npm",
-        lambda args: calls.append(("npm", args.execute_publish)),
+        lambda args: calls.append(("npm", args.execute_publish, args.otp)),
     )
     monkeypatch.setattr(
         release,
@@ -847,6 +1049,7 @@ def test_all_publish_enables_external_publish_steps(tmp_path, monkeypatch):
         pip_target=None,
         access="public",
         tag="latest",
+        npm_otp="123456",
         execute_publish=False,
         build_wheel=False,
         upload=False,
@@ -877,7 +1080,7 @@ def test_all_publish_enables_external_publish_steps(tmp_path, monkeypatch):
         ("archives", None),
         ("github-release", True, "auto"),
         ("cargo", True),
-        ("npm", True),
+        ("npm", True, "123456"),
         ("pip", True, True),
         ("homebrew", False, False),
         ("winget", False),

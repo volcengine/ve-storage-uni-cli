@@ -30,6 +30,7 @@ LAUNCHER_TEMPLATE = ROOT / "packaging" / "pip" / "launcher.py"
 SETUP_PY = r'''"""Build a platform-specific wheel because this package contains native binaries."""
 
 from setuptools import Distribution, setup
+from wheel.bdist_wheel import bdist_wheel
 
 
 class BinaryDistribution(Distribution):
@@ -37,7 +38,20 @@ class BinaryDistribution(Distribution):
         return True
 
 
-setup(distclass=BinaryDistribution)
+class PlatformWheel(bdist_wheel):
+    def finalize_options(self):
+        super().finalize_options()
+        # [Review Fix #PipPlatformWheel] The wheel contains platform-specific
+        # CLI binaries, but no Python ABI-specific extension module.
+        self.root_is_pure = False
+
+    def get_tag(self):
+        _python_tag, _abi_tag, platform_tag = super().get_tag()
+        python_tag = self.python_tag or "py3"
+        return (python_tag, "none", platform_tag)
+
+
+setup(distclass=BinaryDistribution, cmdclass={"bdist_wheel": PlatformWheel})
 '''
 
 
