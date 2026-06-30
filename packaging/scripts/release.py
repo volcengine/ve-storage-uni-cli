@@ -21,6 +21,7 @@ import argparse
 import email.utils
 import glob
 import hashlib
+import importlib.util
 import math
 import re
 import shlex
@@ -41,6 +42,15 @@ CARGO_RATE_LIMIT_RETRY_BUFFER_SECONDS = 5
 CARGO_RATE_LIMIT_RETRY_AFTER_PATTERN = re.compile(
     r"Please try again after (?P<retry_after>.+? GMT)"
 )
+PIP_PLATFORM_TAGS = {
+    "x86_64-apple-darwin": "macosx_10_13_x86_64",
+    "aarch64-apple-darwin": "macosx_11_0_arm64",
+    "x86_64-pc-windows-msvc": "win_amd64",
+    "x86_64-unknown-linux-gnu.2.17": "manylinux_2_17_x86_64",
+    "aarch64-unknown-linux-gnu.2.17": "manylinux_2_17_aarch64",
+}
+PYPI_BUILD_MODULES = ("build", "setuptools", "wheel")
+PYPI_UPLOAD_MODULES = ("twine",)
 CARGO_PUBLISH_STEPS = (
     ("tos-core", ("cargo", "publish", "-p", "tos-core")),
     ("ve-tos-cli-core", ("cargo", "publish", "-p", "ve-tos-cli-core")),
@@ -320,6 +330,9 @@ def run_npm(args: argparse.Namespace) -> None:
             "--tag",
             args.tag,
         ]
+        otp = getattr(args, "otp", None)
+        if otp:
+            command.extend(["--otp", otp])
         run_command(command, execute=args.execute_publish)
 
 
@@ -332,7 +345,81 @@ def pip_binary_dirs(args: argparse.Namespace) -> list[Path]:
     raise SystemExit("pip requires --target or at least one --binary-dir")
 
 
+def pip_platform_tag(args: argparse.Namespace) -> str | None:
+    explicit_tag = getattr(args, "platform_tag", None)
+    if explicit_tag:
+        return explicit_tag
+    target = getattr(args, "target", None)
+    if not target:
+        if getattr(args, "build_wheel", False):
+            raise SystemExit("--build-wheel with --binary-dir requires --platform-tag")
+        return None
+    platform_tag = PIP_PLATFORM_TAGS.get(target)
+    if platform_tag is None and getattr(args, "build_wheel", False):
+        raise SystemExit(
+            f"unknown PyPI platform tag for {target}; use a .2.17 Linux target "
+            "or pass --platform-tag"
+        )
+    return platform_tag
+
+
+def missing_python_modules(module_names: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        module_name
+        for module_name in module_names
+        if importlib.util.find_spec(module_name) is None
+    )
+
+
+def ensure_python_modules(module_names: tuple[str, ...], action: str) -> None:
+    missing_modules = missing_python_modules(module_names)
+    if not missing_modules:
+        return
+    missing_text = ", ".join(missing_modules)
+    install_command = (
+        f"{sys.executable} -m pip install --upgrade build twine setuptools wheel"
+    )
+    raise SystemExit(
+        f"missing Python package(s) for {action}: {missing_text}. "
+        f"Install with: {install_command}"
+    )
+
+
+def build_wheel_command(source_dir: Path, wheel_dir: Path, platform_tag: str | None) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "build",
+        "--wheel",
+        # [Review Fix #PipBuildNoIsolation] Release machines preinstall build
+        # dependencies, so wheel builds should not try to download them for
+        # every platform-specific package.
+        "--no-isolation",
+        "--outdir",
+        str(wheel_dir),
+    ]
+    if platform_tag:
+        command.extend(
+            [
+                # [Review Fix #PipBuildConfigArgv] python -m build treats a
+                # separate value beginning with "--" as another option, so the
+                # config-setting key and value must stay in one argv item.
+                "--config-setting=--build-option=--python-tag=py3",
+                f"--config-setting=--build-option=--plat-name={platform_tag}",
+            ]
+        )
+    command.append(str(source_dir))
+    return command
+
+
 def run_pip(args: argparse.Namespace) -> None:
+    platform_tag = None
+    if args.build_wheel:
+        platform_tag = pip_platform_tag(args)
+        ensure_python_modules(PYPI_BUILD_MODULES, "PyPI wheel build")
+    if args.upload:
+        ensure_python_modules(PYPI_UPLOAD_MODULES, "PyPI upload")
+
     package_args = ["--version", args.version, "--out-dir", str(args.out_dir)]
     for binary_dir in pip_binary_dirs(args):
         package_args.extend(["--binary-dir", str(binary_dir)])
@@ -341,17 +428,7 @@ def run_pip(args: argparse.Namespace) -> None:
     if args.build_wheel:
         wheel_dir = args.out_dir / "wheels"
         for package_name in PUBLIC_PACKAGES:
-            run_command(
-                [
-                    sys.executable,
-                    "-m",
-                    "build",
-                    "--wheel",
-                    "--outdir",
-                    str(wheel_dir),
-                    str(args.out_dir / package_name),
-                ]
-            )
+            run_command(build_wheel_command(args.out_dir / package_name, wheel_dir, platform_tag))
 
     wheel_files = sorted(glob.glob(str(args.out_dir / "wheels" / "*.whl")))
     if args.upload:
@@ -591,12 +668,21 @@ def run_all(args: argparse.Namespace) -> None:
             allow_dirty=args.allow_dirty,
         )
     )
-    run_npm(with_args(args, out_dir=Path("dist/npm"), execute_publish=execute_npm_publish))
+    run_npm(
+        with_args(
+            args,
+            out_dir=Path("dist/npm"),
+            execute_publish=execute_npm_publish,
+            otp=getattr(args, "npm_otp", None),
+        )
+    )
     pip_target = args.pip_target or args.target[0]
     run_pip(
         with_args(
             args,
             binary_dir=binary_dirs_for_target(pip_target, args.target_dir),
+            target=pip_target,
+            platform_tag=getattr(args, "pip_platform_tag", None),
             out_dir=Path("dist/pip"),
             build_wheel=build_pip_wheel,
             upload=upload_pip,
@@ -689,6 +775,7 @@ def build_parser() -> argparse.ArgumentParser:
     npm.add_argument("--out-dir", default=Path("dist/npm"), type=Path)
     npm.add_argument("--access", default="public")
     npm.add_argument("--tag", default="latest")
+    npm.add_argument("--otp", help="One-time password for npm publish with 2FA")
     npm.add_argument("--execute-publish", action="store_true", help="Run npm publish")
     npm.set_defaults(func=run_npm)
 
@@ -702,6 +789,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pip.add_argument("--out-dir", default=Path("dist/pip"), type=Path)
     pip.add_argument("--build-wheel", action="store_true")
+    pip.add_argument("--platform-tag", help="Override the wheel platform tag")
     pip.add_argument("--upload", action="store_true", help="Upload wheels with twine")
     pip.set_defaults(func=run_pip)
 
@@ -744,8 +832,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_archive_options(all_channels)
     add_checksum_options(all_channels)
     all_channels.add_argument("--pip-target", help="Target whose binaries seed PyPI wheels")
+    all_channels.add_argument("--pip-platform-tag", help="Override the PyPI wheel platform tag")
     all_channels.add_argument("--access", default="public")
     all_channels.add_argument("--tag", default="latest")
+    all_channels.add_argument("--npm-otp", help="One-time password for npm publish with 2FA")
     all_channels.add_argument("--execute-publish", action="store_true", help="Run npm publish")
     all_channels.add_argument("--build-wheel", action="store_true")
     all_channels.add_argument("--upload", action="store_true", help="Upload wheels with twine")
