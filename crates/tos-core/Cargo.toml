@@ -14,7 +14,7 @@
 
 [package]
 name = "tos-core"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Shared configuration, output, transfer, agent, and MCP utilities for Volcengine storage CLIs"

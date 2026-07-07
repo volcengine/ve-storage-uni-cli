@@ -14,7 +14,7 @@
 
 [package]
 name = "ve-tos-cli-core"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Core TOS command surface used by ve-storage-uni-cli and ve-tos-cli"
@@ -30,7 +30,7 @@ name = "ve_tos_cli"
 path = "src/lib.rs"
 
 [dependencies]
-tos-core = { version = "1.0.0", path = "../tos-core" }
+tos-core = { version = "1.0.1", path = "../tos-core" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

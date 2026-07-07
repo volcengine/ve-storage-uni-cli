@@ -14,7 +14,7 @@
 
 [package]
 name = "ve-adrive-cli"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Dedicated ADrive command-line installer for the Volcengine storage unified CLI"
@@ -28,7 +28,7 @@ include = [
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-ve-storage-uni-cli = { version = "1.0.0", path = "../../.." }
+ve-storage-uni-cli = { version = "1.0.1", path = "../../.." }
 
 [[bin]]
 name = "ve-adrive-cli"

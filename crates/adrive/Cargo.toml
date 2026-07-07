@@ -14,7 +14,7 @@
 
 [package]
 name = "ve-adrive-cli-core"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Core ADrive command surface used by ve-storage-uni-cli and ve-adrive-cli"
@@ -30,7 +30,7 @@ name = "ve_adrive_cli"
 path = "src/lib.rs"
 
 [dependencies]
-tos-core = { version = "1.0.0", path = "../tos-core" }
+tos-core = { version = "1.0.1", path = "../tos-core" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
