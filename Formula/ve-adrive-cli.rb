@@ -1,16 +1,16 @@
 class VeAdriveCli < Formula
   desc "Dedicated ADrive command-line interface for Volcengine storage services"
   homepage "https://github.com/volcengine/ve-storage-uni-cli"
-  version "1.0.0"
+  version "1.0.1"
   license "Apache-2.0"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/volcengine/ve-storage-uni-cli/releases/download/v1.0.0/ve-storage-uni-cli-aarch64-apple-darwin.tar.gz"
-      sha256 "a5968225c619f7e94a1e055c299c38c93338c2220c1e582eb2b8235e05f22740"
+      url "https://github.com/volcengine/ve-storage-uni-cli/releases/download/v1.0.1/ve-storage-uni-cli-aarch64-apple-darwin.tar.gz"
+      sha256 "4cc4c7c2b685135bca5667dd547dad74c498ce40d6d2448e8c7e3f604c15c555"
     else
-      url "https://github.com/volcengine/ve-storage-uni-cli/releases/download/v1.0.0/ve-storage-uni-cli-x86_64-apple-darwin.tar.gz"
-      sha256 "2ef4d30381b089ca239cc98e0cd795729b73cf70ae6fea11da852a8cbc6b3c3d"
+      url "https://github.com/volcengine/ve-storage-uni-cli/releases/download/v1.0.1/ve-storage-uni-cli-x86_64-apple-darwin.tar.gz"
+      sha256 "064ca6cff25ba0eb31d4209d1daf69cac43c5499f92349a550ee72fe737fd8e4"
     end
   end
 
