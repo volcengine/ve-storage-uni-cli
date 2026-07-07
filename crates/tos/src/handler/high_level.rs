@@ -5898,13 +5898,12 @@ async fn upload_local_to_tos(
     // [Review Fix #8] Simple upload streams hash/CRC/body instead of buffering the file.
     let payload_hash = file_sha256(source)?;
     let local_crc64 = file_crc64(source)?;
-    let mut headers = options.write_options.headers(false);
-    headers.insert("x-hash-crc64ecma".to_string(), local_crc64.to_string());
-    // [Review Fix #NoClobber] Only set if-none-match when --no-clobber is specified.
-    // Default behavior: overwrite existing objects (aligned with aws s3 cp).
-    if options.overwrite_strategy == EffectiveOverwriteStrategy::NoClobber {
-        headers.insert("if-none-match".to_string(), "*".to_string());
-    }
+    let headers = cp_simple_upload_headers(
+        &options.write_options,
+        local_crc64,
+        file_size,
+        options.overwrite_strategy,
+    );
     // [Review Fix #Progress-PartGranular] simple PUT 没有 part 维度，所以仅在
     // 请求结束时一次性推到 file_size。indicatif 在非 TTY/--no-progress/--quiet
     // 下自动降级为 NoOp。
@@ -6210,7 +6209,7 @@ async fn upload_tos_multipart_part(
         bucket,
         key,
         multipart_part_query(upload_id, part_number),
-        BTreeMap::from([("x-hash-crc64ecma".to_string(), local_crc64.to_string())]),
+        cp_multipart_upload_part_headers(local_crc64, current_size),
         file_part_sha256(source, offset, current_size)?,
         file_part_stream_body(source, offset, current_size).await?,
     )
@@ -6239,6 +6238,37 @@ async fn upload_tos_multipart_part(
         },
         current_size,
     ))
+}
+
+fn cp_simple_upload_headers(
+    write_options: &ObjectWriteOptions,
+    local_crc64: u64,
+    file_size: u64,
+    overwrite_strategy: EffectiveOverwriteStrategy,
+) -> BTreeMap<String, String> {
+    let mut headers = write_options.headers(false);
+    // [Review Fix #1] PSM-backed ByteTOS rejects transfer-chunk bodies, so
+    // high-level cp must send fixed-length PutObject requests like object upload.
+    headers.insert("content-length".to_string(), file_size.to_string());
+    headers.insert("x-hash-crc64ecma".to_string(), local_crc64.to_string());
+    // [Review Fix #NoClobber] Only set if-none-match when --no-clobber is specified.
+    // Default behavior: overwrite existing objects (aligned with aws s3 cp).
+    if overwrite_strategy == EffectiveOverwriteStrategy::NoClobber {
+        headers.insert("if-none-match".to_string(), "*".to_string());
+    }
+    headers
+}
+
+fn cp_multipart_upload_part_headers(
+    local_crc64: u64,
+    current_size: u64,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        // [Review Fix #2] UploadPart uses a bounded file slice, so pass its
+        // exact length to avoid chunked transfer on PSM-backed ByteTOS.
+        ("content-length".to_string(), current_size.to_string()),
+        ("x-hash-crc64ecma".to_string(), local_crc64.to_string()),
+    ])
 }
 
 async fn download_tos_to_local(
@@ -16869,6 +16899,39 @@ mod tests {
             Some("REPLACE_NEW")
         );
         assert!(!copy_headers.contains_key("x-metadata-directive"));
+    }
+
+    #[test]
+    fn test_tos_cp_simple_upload_headers_include_content_length() {
+        let headers = cp_simple_upload_headers(
+            &ObjectWriteOptions::default(),
+            12345,
+            42,
+            EffectiveOverwriteStrategy::Force,
+        );
+
+        assert_eq!(
+            headers.get("content-length").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            headers.get("x-hash-crc64ecma").map(String::as_str),
+            Some("12345")
+        );
+    }
+
+    #[test]
+    fn test_tos_cp_multipart_part_headers_include_content_length() {
+        let headers = cp_multipart_upload_part_headers(12345, 64);
+
+        assert_eq!(
+            headers.get("content-length").map(String::as_str),
+            Some("64")
+        );
+        assert_eq!(
+            headers.get("x-hash-crc64ecma").map(String::as_str),
+            Some("12345")
+        );
     }
 
     #[test]

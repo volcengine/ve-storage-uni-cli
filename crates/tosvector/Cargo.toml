@@ -14,7 +14,7 @@
 
 [package]
 name = "tosvector-cli"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Scaffolded TOS Vector command model for the Volcengine storage unified CLI"
@@ -22,6 +22,6 @@ homepage = "https://github.com/volcengine/ve-storage-uni-cli"
 repository = "https://github.com/volcengine/ve-storage-uni-cli"
 
 [dependencies]
-tos-core = { version = "1.0.0", path = "../tos-core" }
+tos-core = { version = "1.0.1", path = "../tos-core" }
 clap = { workspace = true }
 tokio = { workspace = true }
