@@ -40,8 +40,10 @@ use tos_core::agent::error::CliError;
 use tos_core::agent::global_args::GlobalArgs;
 use tos_core::agent::output::OutputFormat;
 use tos_core::infra::config::{
-    has_only_sibling_tos_namespace, redact_effective, Binary, ConfigFile, EffectiveProfile,
+    has_only_sibling_tos_namespace, overlay_effective_credentials, redact_effective, Binary,
+    ConfigFile, EffectiveProfile,
 };
+use tos_core::infra::credentials::{CredentialSection, CredentialsFile};
 
 /// Handle `ve-tos config <action>`.
 pub async fn handle_config_command(
@@ -323,13 +325,24 @@ fn handle_dry_run(global: &GlobalArgs, action: &ConfigAction) -> Result<i32, Cli
             validation_config.set_by_path(&segs_ref, value)?;
             // [Review Fix #17] Never echo config secrets in dry-run plans or confirm commands.
             let redacted_value = redact_config_value(key, value);
-            let plan_line = match segs.len() {
-                2 => format!("SET [{}].{} = '{}'", segs[0], segs[1], redacted_value),
-                3 => format!(
-                    "SET [{}.{}].{} = '{}'",
-                    segs[0], segs[1], segs[2], redacted_value
-                ),
-                _ => format!("SET {} = '{}'", key, redacted_value),
+            let plan_line = if is_sensitive_key(key) {
+                let section = credential_section_for_tos_path(&segs)?;
+                format!(
+                    "SET {}.{} in '{}' = '{}'",
+                    credential_section_path(&segs[0], section),
+                    segs.last().unwrap_or(key),
+                    global.credentials_path().display(),
+                    redacted_value
+                )
+            } else {
+                match segs.len() {
+                    2 => format!("SET [{}].{} = '{}'", segs[0], segs[1], redacted_value),
+                    3 => format!(
+                        "SET [{}.{}].{} = '{}'",
+                        segs[0], segs[1], segs[2], redacted_value
+                    ),
+                    _ => format!("SET {} = '{}'", key, redacted_value),
+                }
             };
             DryRunResult {
                 action: "config set".to_string(),
@@ -482,6 +495,7 @@ async fn handle_init(global: &GlobalArgs, profile: Option<&str>) -> Result<i32, 
 #[derive(serde::Serialize)]
 struct ConfigShowData {
     config_path: String,
+    credentials_path: String,
     profiles: Vec<EffectiveProfile>,
 }
 
@@ -489,8 +503,12 @@ async fn handle_show(global: &GlobalArgs) -> Result<i32, CliError> {
     let path = global.config_path();
     let config_dir = ConfigFile::config_dir_from_path(&path);
     let config = ConfigFile::load_from(&path)?;
+    // [Review Fix #9] An explicit missing credentials path must not be
+    // silently treated as an empty store by inspection commands.
+    let credentials_path = global.existing_runtime_credentials_path()?;
+    let credentials = CredentialsFile::load_from(&credentials_path)?;
 
-    if config.profiles.is_empty() {
+    if config.profiles.is_empty() && credentials.profile_names().is_empty() {
         return Err(CliError::ConfigMissing(format!(
             "No config file found at {}. Run '{}' to create one.",
             path.display(),
@@ -502,19 +520,38 @@ async fn handle_show(global: &GlobalArgs) -> Result<i32, CliError> {
     // `ve-tos-cli` 使用 [profile.ve-tos]。
     let binary = active_tos_config_binary();
 
+    let mut display_config = config.clone();
+    for profile_name in credentials.profile_names() {
+        display_config.get_or_insert_profile(&profile_name);
+    }
+
     let mut effective: Vec<EffectiveProfile> = Vec::new();
-    for (profile_name, profile) in &config.profiles {
-        if has_only_sibling_tos_namespace(profile, binary) {
+    for (profile_name, profile) in &display_config.profiles {
+        let stored = credentials.effective_aksk(
+            profile_name,
+            credential_section_for_binary(binary),
+            &credentials_path,
+        )?;
+        if !config.profiles.contains_key(profile_name) && stored.is_empty() {
             continue;
         }
-        let eff = config.get_effective_profile_in_dir(profile_name, binary, &config_dir)?;
+        if has_only_sibling_tos_namespace(profile, binary) && stored.is_empty() {
+            continue;
+        }
+        let mut eff =
+            display_config.get_effective_profile_in_dir(profile_name, binary, &config_dir)?;
+        overlay_effective_credentials(&mut eff, &stored);
         effective.push(redact_effective(eff));
     }
 
     let format = global.output.unwrap_or_else(OutputFormat::auto_detect);
     match format {
         OutputFormat::Table => {
-            println!("Config file: {}\n", path.display());
+            println!(
+                "Config file: {}\nCredentials file: {}\n",
+                path.display(),
+                credentials_path.display()
+            );
             let headers = &["PROFILE", "FIELD", "VALUE", "SOURCE"];
             let mut rows: Vec<Vec<String>> = Vec::new();
             for eff in &effective {
@@ -554,6 +591,7 @@ async fn handle_show(global: &GlobalArgs) -> Result<i32, CliError> {
         _ => {
             let show_data = ConfigShowData {
                 config_path: path.display().to_string(),
+                credentials_path: credentials_path.display().to_string(),
                 profiles: effective,
             };
             let envelope =
@@ -562,6 +600,15 @@ async fn handle_show(global: &GlobalArgs) -> Result<i32, CliError> {
         }
     }
     Ok(0)
+}
+
+fn credential_section_for_binary(binary: Binary) -> CredentialSection {
+    match binary {
+        Binary::Tos => CredentialSection::Tos,
+        Binary::VeTos => CredentialSection::VeTos,
+        Binary::Adrive => CredentialSection::ADrive,
+        Binary::TosVector | Binary::TosTable => CredentialSection::Shared,
+    }
 }
 
 fn push_traced_row(
@@ -622,6 +669,9 @@ fn push_traced_value_row<T>(
 
 async fn handle_set(global: &GlobalArgs, key: &str, value: &str) -> Result<i32, CliError> {
     let segs = parse_key_path_for_tos(key, &global.profile)?;
+    if is_sensitive_key(key) {
+        return handle_credential_set(global, value, &segs);
+    }
     let segs_ref: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
 
     let path = global.config_path();
@@ -654,6 +704,63 @@ async fn handle_set(global: &GlobalArgs, key: &str, value: &str) -> Result<i32, 
     let envelope = Envelope::success(public_config_command("ve-tos config set"), data);
     output_envelope(global, &envelope)?;
     Ok(0)
+}
+
+fn handle_credential_set(
+    global: &GlobalArgs,
+    value: &str,
+    segments: &[String],
+) -> Result<i32, CliError> {
+    let profile_name = segments
+        .first()
+        .ok_or_else(|| CliError::ValidationError("missing credential profile".to_string()))?;
+    let field = segments
+        .last()
+        .ok_or_else(|| CliError::ValidationError("missing credential field".to_string()))?;
+    let section = credential_section_for_tos_path(segments)?;
+    let credentials_path = global.credentials_path();
+    let mut credentials = CredentialsFile::load_from(&credentials_path)?;
+    credentials.set_aksk_field(profile_name, section, field, value)?;
+    credentials.save_to_path(&credentials_path)?;
+
+    let data = serde_json::json!({
+        "section": credential_section_path(profile_name, section),
+        "field": field,
+        "value": "ENC:****",
+        "encrypted": true,
+        "config_path": global.config_path().display().to_string(),
+        "credentials_path": credentials_path.display().to_string(),
+        "message": format!("Saved {field} to credentials"),
+    });
+    let envelope = Envelope::success(public_config_command("ve-tos config set"), data);
+    output_envelope(global, &envelope)?;
+    Ok(0)
+}
+
+fn credential_section_for_tos_path(path: &[String]) -> Result<CredentialSection, CliError> {
+    match path {
+        [_profile, _field] => Ok(CredentialSection::Shared),
+        [_profile, binary, _field] => match Binary::parse(binary) {
+            Some(Binary::Tos) => Ok(CredentialSection::Tos),
+            Some(Binary::VeTos) => Ok(CredentialSection::VeTos),
+            Some(Binary::Adrive) => Ok(CredentialSection::ADrive),
+            _ => Err(CliError::ValidationError(format!(
+                "unsupported credential namespace '{binary}'"
+            ))),
+        },
+        _ => Err(CliError::ValidationError(
+            "invalid credential key path".to_string(),
+        )),
+    }
+}
+
+fn credential_section_path(profile_name: &str, section: CredentialSection) -> String {
+    match section {
+        CredentialSection::Shared => format!("[{profile_name}]"),
+        CredentialSection::Tos => format!("[{profile_name}.tos]"),
+        CredentialSection::VeTos => format!("[{profile_name}.ve-tos]"),
+        CredentialSection::ADrive => format!("[{profile_name}.adrive]"),
+    }
 }
 
 // =====================================================================
@@ -720,7 +827,21 @@ fn parse_key_path_for_tos(key: &str, active_profile: &str) -> Result<Vec<String>
     };
     reject_unsupported_tos_control_endpoint(&routed)?;
     reject_unsupported_psm_config_fields(&routed)?;
+    reject_non_adrive_auth_mode(&routed)?;
     Ok(routed)
+}
+
+fn reject_non_adrive_auth_mode(path: &[String]) -> Result<(), CliError> {
+    // [Review Fix #18] The shared config parser understands ADrive sections,
+    // but auth-mode ownership remains exclusive to the ADrive CLI surface.
+    if path.len() == 3 && Binary::parse(&path[1]) == Some(Binary::Adrive) && path[2] == "auth_mode"
+    {
+        return Err(CliError::ValidationError(
+            "auth_mode is only supported by ve-adrive; use `ve-adrive config set auth_mode <aksk|oauth>`"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn reject_unsupported_tos_control_endpoint(path: &[String]) -> Result<(), CliError> {

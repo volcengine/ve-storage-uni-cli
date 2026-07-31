@@ -305,18 +305,19 @@ async fn handle_upload(
             // [Review Fix #1] PutObject rejects chunked streaming in this
             // path; send a fixed Content-Length just like append.
             headers.insert("content-length".to_string(), len.to_string());
-            let payload_hash = crate::handler::high_level::file_sha256(&path_str)?;
-            let body = crate::handler::high_level::file_stream_body(&path_str).await?;
-            let result = core::execute_object_streaming_request(
+            let payload_hash = crate::handler::high_level::file_sha256(&path_str).await?;
+            let result = core::execute_object_replayable_streaming_request(
                 client,
-                "ve-tos object upload",
-                Method::PUT,
-                &bucket,
-                &key,
-                BTreeMap::new(),
-                headers,
-                payload_hash,
-                body,
+                core::ReplayableObjectRequest {
+                    command: "ve-tos object upload",
+                    method: Method::PUT,
+                    bucket: &bucket,
+                    key: &key,
+                    query: BTreeMap::new(),
+                    headers,
+                    payload_hash,
+                },
+                || crate::handler::high_level::file_stream_body(&path_str),
             )
             .await?;
             output_result(global, &result)
@@ -1202,7 +1203,7 @@ async fn handle_append(
             let path_str = path.to_string_lossy().to_string();
             // [Review Fix] TOS requires Content-Length for streaming append bodies
             headers.insert("content-length".to_string(), len.to_string());
-            let payload_hash = crate::handler::high_level::file_sha256(&path_str)?;
+            let payload_hash = crate::handler::high_level::file_sha256(&path_str).await?;
             let body = crate::handler::high_level::file_stream_body(&path_str).await?;
             let result = core::execute_object_streaming_request(
                 client,
@@ -1314,7 +1315,7 @@ async fn handle_modify(
             // [Review Fix #HNS-MODIFY-1] ModifyObject rejects chunked streaming;
             // send the same fixed Content-Length used by append/upload streams.
             headers.insert("content-length".to_string(), len.to_string());
-            let payload_hash = crate::handler::high_level::file_sha256(&path_str)?;
+            let payload_hash = crate::handler::high_level::file_sha256(&path_str).await?;
             let body = crate::handler::high_level::file_stream_body(&path_str).await?;
             let result = core::execute_object_streaming_request(
                 client,

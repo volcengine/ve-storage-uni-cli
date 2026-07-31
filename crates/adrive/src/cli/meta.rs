@@ -128,7 +128,7 @@ pub enum ConfigAction {
     Show,
     /// Set a configuration value
     #[command(
-        after_help = "Supported KEY values:\n  region / endpoint / access_key_id / secret_access_key / security_token\n  account_id / default_instance / default_space\n  checkpoint_dir / batch_report_dir / batch_report_format / progress_enabled\n  max_retry_count / requesttimeout / connecttimeout / maxconnections\n\nExamples:\n  ve-adrive-cli config set region cn-beijing\n  ve-adrive-cli config set endpoint https://ids-cn-beijing.volces.com\n  ve-adrive-cli config set max_retry_count 3\n  ve-adrive-cli config set requesttimeout 60"
+        after_help = "Supported KEY values:\n  auth_mode / region / endpoint / access_key_id / secret_access_key / security_token\n  account_id / default_instance / default_space\n  checkpoint_dir / batch_report_dir / batch_report_format / progress_enabled\n  max_retry_count / requesttimeout / connecttimeout / maxconnections\n\nExamples:\n  ve-adrive-cli config set auth_mode oauth\n  ve-adrive-cli config set region cn-beijing\n  ve-adrive-cli config set endpoint https://ids-cn-beijing.volces.com\n  ve-adrive-cli config set max_retry_count 3\n  ve-adrive-cli config set requesttimeout 60"
     )]
     Set { key: String, value: String },
 }

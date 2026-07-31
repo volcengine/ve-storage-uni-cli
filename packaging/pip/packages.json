@@ -18,6 +18,14 @@
       "description": "Dedicated ByteCloud TOS command-line interface"
     },
     {
+      "name": "byted-tos-cli",
+      "module": "byted_tos_cli_package",
+      "commands": [
+        "tos-cli"
+      ],
+      "description": "Compatibility package for the ByteCloud TOS command-line interface"
+    },
+    {
       "name": "ve-adrive-cli",
       "module": "ve_adrive_cli_package",
       "commands": [

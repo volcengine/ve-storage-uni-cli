@@ -321,10 +321,9 @@ fn test_non_tos_help_hides_psm_globals() {
         ["ve-tos", "find", "--help"],
         ["ve-adrive", "find", "--help"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-            .args(args)
-            .output()
-            .expect("Failed to execute");
+        // [Review Fix #19] CLI integration tests must not consume the
+        // developer's real config or credentials files.
+        let output = cli_with_empty_home("non-tos-help", &args);
         assert!(output.status.success(), "args={args:?}");
         let stdout = String::from_utf8_lossy(&output.stdout);
         for flag in ["--psm", "--idc", "--cluster", "--addr-family"] {
@@ -400,10 +399,7 @@ fn test_find_accepts_space_separated_negative_filters() {
             "--dry-run",
         ],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-            .args(args)
-            .output()
-            .expect("Failed to execute");
+        let output = cli_with_empty_home("find-negative-filters", &args);
         assert!(
             output.status.success(),
             "args={args:?}, stdout={}, stderr={}",
@@ -437,10 +433,7 @@ fn test_tos_find_accepts_bare_mtime_filter() {
             "--dry-run",
         ],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-            .args(args)
-            .output()
-            .expect("Failed to execute");
+        let output = cli_with_empty_home("find-bare-mtime-filter", &args);
         assert!(
             output.status.success(),
             "args={args:?}, stdout={}, stderr={}",
@@ -918,10 +911,7 @@ fn test_byted_tos_api_is_guarded_utility_only() {
 
 #[test]
 fn test_byted_tos_rejects_unsupported_recursive_modes_before_network() {
-    let help = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args(["tos", "rm", "--help"])
-        .output()
-        .expect("Failed to execute");
+    let help = cli_with_empty_home("tos-unsupported-recursive-help", &["tos", "rm", "--help"]);
     assert!(help.status.success());
     let help_stdout = String::from_utf8_lossy(&help.stdout);
     assert!(
@@ -929,8 +919,9 @@ fn test_byted_tos_rejects_unsupported_recursive_modes_before_network() {
         "tos rm help must not document ve-tos-only recursive delete mode"
     );
 
-    let list_mode = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args([
+    let list_mode = cli_with_empty_home(
+        "tos-unsupported-recursive-list",
+        &[
             "--output",
             "json",
             "tos",
@@ -942,9 +933,8 @@ fn test_byted_tos_rejects_unsupported_recursive_modes_before_network() {
             "--force",
             "--confirm",
             "tos://bucket/prefix/",
-        ])
-        .output()
-        .expect("Failed to execute");
+        ],
+    );
     assert!(!list_mode.status.success());
     let list_stderr = String::from_utf8_lossy(&list_mode.stderr);
     assert!(
@@ -952,8 +942,9 @@ fn test_byted_tos_rejects_unsupported_recursive_modes_before_network() {
         "stderr={list_stderr}"
     );
 
-    let delete_mode = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args([
+    let delete_mode = cli_with_empty_home(
+        "tos-unsupported-recursive-delete",
+        &[
             "--output",
             "json",
             "tos",
@@ -965,9 +956,8 @@ fn test_byted_tos_rejects_unsupported_recursive_modes_before_network() {
             "--force",
             "--confirm",
             "tos://bucket/prefix/",
-        ])
-        .output()
-        .expect("Failed to execute");
+        ],
+    );
     assert!(!delete_mode.status.success());
     let delete_stderr = String::from_utf8_lossy(&delete_mode.stderr);
     assert!(
@@ -975,8 +965,9 @@ fn test_byted_tos_rejects_unsupported_recursive_modes_before_network() {
         "stderr={delete_stderr}"
     );
 
-    let dry_run = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args([
+    let dry_run = cli_with_empty_home(
+        "tos-supported-recursive-dry-run",
+        &[
             "--dry-run",
             "--output",
             "json",
@@ -987,9 +978,8 @@ fn test_byted_tos_rejects_unsupported_recursive_modes_before_network() {
             "--force",
             "--confirm",
             "tos://bucket/",
-        ])
-        .output()
-        .expect("Failed to execute");
+        ],
+    );
     assert!(
         dry_run.status.success(),
         "stderr={}",
@@ -2027,6 +2017,19 @@ fn test_adrive_help() {
 }
 
 #[test]
+fn test_public_help_lists_credentials_path() {
+    for surface in ["tos", "ve-tos", "ve-adrive"] {
+        let output = cli_with_empty_home("credentials-path-help", &[surface, "--help"]);
+        assert!(output.status.success(), "surface={surface}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("--credentials-path"),
+            "surface={surface}, stdout={stdout}"
+        );
+    }
+}
+
+#[test]
 fn test_adrive_rejects_control_plane_global_flags() {
     for (flag, value) in [
         ("--control-endpoint", "https://tos-control.example.com"),
@@ -2263,8 +2266,9 @@ fn test_single_file_remote_directory_destination_uses_source_file_name() {
         "stderr={stderr}"
     );
 
-    let adrive_cp = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args([
+    let adrive_cp = cli_with_empty_home(
+        "single-file-adrive-cp",
+        &[
             "--dry-run",
             "--output",
             "json",
@@ -2272,9 +2276,8 @@ fn test_single_file_remote_directory_destination_uses_source_file_name() {
             "cp",
             "folder/1.txt",
             "adrive://inst/space",
-        ])
-        .output()
-        .expect("Failed to execute");
+        ],
+    );
     assert!(adrive_cp.status.success());
     let stdout = String::from_utf8_lossy(&adrive_cp.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
@@ -2284,8 +2287,9 @@ fn test_single_file_remote_directory_destination_uses_source_file_name() {
         .unwrap_or_default()
         .contains("adrive://inst/space/1.txt"));
 
-    let adrive_mv = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args([
+    let adrive_mv = cli_with_empty_home(
+        "single-file-adrive-mv",
+        &[
             "--dry-run",
             "--output",
             "json",
@@ -2293,9 +2297,8 @@ fn test_single_file_remote_directory_destination_uses_source_file_name() {
             "mv",
             "adrive://inst/space/folder/1.txt",
             "adrive://inst/space/docs/",
-        ])
-        .output()
-        .expect("Failed to execute");
+        ],
+    );
     assert!(adrive_mv.status.success());
     let stdout = String::from_utf8_lossy(&adrive_mv.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
@@ -2305,8 +2308,9 @@ fn test_single_file_remote_directory_destination_uses_source_file_name() {
         .unwrap_or_default()
         .contains("adrive://inst/space/docs/1.txt"));
 
-    let adrive_same_file = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args([
+    let adrive_same_file = cli_with_empty_home(
+        "single-file-adrive-same-file",
+        &[
             "--dry-run",
             "--output",
             "json",
@@ -2314,9 +2318,8 @@ fn test_single_file_remote_directory_destination_uses_source_file_name() {
             "mv",
             "adrive://inst/space/docs/1.txt",
             "adrive://inst/space/docs/",
-        ])
-        .output()
-        .expect("Failed to execute");
+        ],
+    );
     assert!(!adrive_same_file.status.success());
     let stderr = String::from_utf8_lossy(&adrive_same_file.stderr);
     assert!(
@@ -3130,20 +3133,20 @@ fn test_adrive_recursive_transfer_help_exposes_include_parent() {
 fn test_adrive_critical_delete_requires_exact_confirm_after_force() {
     let target = "adrive://inst/space/docs/a.txt";
 
-    let dry_run = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args(["--dry-run", "--output", "json", "ve-adrive", "rm", target])
-        .output()
-        .expect("Failed to execute");
+    let dry_run = cli_with_empty_home(
+        "adrive-critical-delete-dry-run",
+        &["--dry-run", "--output", "json", "ve-adrive", "rm", target],
+    );
     assert!(
         dry_run.status.success(),
         "dry-run should not require force/confirm: stderr={}",
         String::from_utf8_lossy(&dry_run.stderr)
     );
 
-    let forced = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args(["--output", "json", "ve-adrive", "rm", target, "--force"])
-        .output()
-        .expect("Failed to execute");
+    let forced = cli_with_empty_home(
+        "adrive-critical-delete-force",
+        &["--output", "json", "ve-adrive", "rm", target, "--force"],
+    );
     assert!(!forced.status.success());
     let stderr = String::from_utf8_lossy(&forced.stderr);
     let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).expect("valid json");
@@ -3158,8 +3161,9 @@ fn test_adrive_critical_delete_requires_exact_confirm_after_force() {
         .contains("--confirm adrive://inst/space/docs/a.txt"));
 
     // [Review Fix #2] Wrong confirmation must fail before credentials or network are touched.
-    let wrong_confirm = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args([
+    let wrong_confirm = cli_with_empty_home(
+        "adrive-critical-delete-wrong-confirm",
+        &[
             "--output",
             "json",
             "--confirm",
@@ -3168,9 +3172,8 @@ fn test_adrive_critical_delete_requires_exact_confirm_after_force() {
             "rm",
             target,
             "--force",
-        ])
-        .output()
-        .expect("Failed to execute");
+        ],
+    );
     assert!(!wrong_confirm.status.success());
     let stderr = String::from_utf8_lossy(&wrong_confirm.stderr);
     let parsed: serde_json::Value = serde_json::from_str(stderr.trim()).expect("valid json");
@@ -3227,18 +3230,19 @@ fn test_adrive_mv_requires_source_confirm_after_force() {
 
 #[test]
 fn test_adrive_rm_recursive_delete_mode_is_described_and_planned() {
-    let help = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args(["ve-adrive", "rm", "--help"])
-        .output()
-        .expect("Failed to execute");
+    let help = cli_with_empty_home(
+        "adrive-recursive-delete-help",
+        &["ve-adrive", "rm", "--help"],
+    );
     assert!(help.status.success());
     let stdout = String::from_utf8_lossy(&help.stdout);
     assert!(stdout.contains("--recursive-delete-mode"));
     assert!(stdout.contains("--include-uploads"));
     assert!(stdout.contains("--checkpoint-dir"));
 
-    let dry_run = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args([
+    let dry_run = cli_with_empty_home(
+        "adrive-recursive-delete-dry-run",
+        &[
             "--dry-run",
             "--output",
             "json",
@@ -3249,9 +3253,8 @@ fn test_adrive_rm_recursive_delete_mode_is_described_and_planned() {
             "--include-uploads",
             "--checkpoint-dir",
             "/tmp/adrive-upload-checkpoints",
-        ])
-        .output()
-        .expect("Failed to execute");
+        ],
+    );
     assert!(
         dry_run.status.success(),
         "stderr={}",
@@ -3277,8 +3280,9 @@ fn test_adrive_rm_recursive_delete_mode_is_described_and_planned() {
         "/tmp/adrive-upload-checkpoints"
     );
 
-    let root_dry_run = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args([
+    let root_dry_run = cli_with_empty_home(
+        "adrive-recursive-root-dry-run",
+        &[
             "--dry-run",
             "--output",
             "json",
@@ -3286,9 +3290,8 @@ fn test_adrive_rm_recursive_delete_mode_is_described_and_planned() {
             "rm",
             "adrive://inst/space",
             "--recursive",
-        ])
-        .output()
-        .expect("Failed to execute");
+        ],
+    );
     assert!(
         root_dry_run.status.success(),
         "stderr={}",
@@ -3300,23 +3303,24 @@ fn test_adrive_rm_recursive_delete_mode_is_described_and_planned() {
     assert_eq!(payload["description"], "Delete adrive://inst/space");
     assert_eq!(payload["summary"]["recursive"], true);
 
-    let non_recursive_root = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args([
+    let non_recursive_root = cli_with_empty_home(
+        "adrive-non-recursive-root",
+        &[
             "--dry-run",
             "--output",
             "json",
             "ve-adrive",
             "rm",
             "adrive://inst/space",
-        ])
-        .output()
-        .expect("Failed to execute");
+        ],
+    );
     assert!(!non_recursive_root.status.success());
     let stderr = String::from_utf8_lossy(&non_recursive_root.stderr);
     assert!(stderr.contains("add --recursive to clear a space"));
 
-    let direct_root = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args([
+    let direct_root = cli_with_empty_home(
+        "adrive-direct-recursive-root",
+        &[
             "--dry-run",
             "--output",
             "json",
@@ -3326,9 +3330,8 @@ fn test_adrive_rm_recursive_delete_mode_is_described_and_planned() {
             "--recursive",
             "--recursive-delete-mode",
             "direct",
-        ])
-        .output()
-        .expect("Failed to execute");
+        ],
+    );
     assert!(!direct_root.status.success());
     let stderr = String::from_utf8_lossy(&direct_root.stderr);
     assert!(stderr.contains("cannot target a space root"));
@@ -4078,10 +4081,10 @@ fn test_tos_redundancy_transition_command_parse() {
 
 #[test]
 fn test_tos_doctor_command_parse() {
-    let output = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args(["--output", "json", "ve-tos", "doctor"])
-        .output()
-        .expect("Failed to execute");
+    let output = cli_with_empty_home(
+        "tos-doctor-command-parse",
+        &["--output", "json", "ve-tos", "doctor"],
+    );
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid doctor json");

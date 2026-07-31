@@ -28,6 +28,7 @@ use tos_core::agent::error::CliError;
 use tos_core::agent::global_args::GlobalArgs;
 use tos_core::infra::client::storage_user_agent;
 use tos_core::infra::config::{merge_tos_runtime_profile, Binary, ConfigFile, Profile};
+use tos_core::infra::credentials::{CredentialSection, CredentialsFile};
 
 use crate::cli::meta::{
     ApiArgs, CapabilitiesArgs, CompletionArgs, ConfigCommand, DoctorArgs, DocumentationLanguage,
@@ -1624,17 +1625,26 @@ fn effective_tos_profile(global: &GlobalArgs) -> Result<Profile, CliError> {
     let config_dir = ConfigFile::config_dir_from_path(&config_path);
     let config = ConfigFile::load_from(&config_path)?;
     let env_profile = Profile::from_byte_tos_env();
-    let config_profile = if config.profiles.is_empty() && global.profile == "default" {
+    let credentials_path = global.existing_runtime_credentials_path()?;
+    let stored_credentials = CredentialsFile::load_from(&credentials_path)?.effective_aksk(
+        &global.profile,
+        CredentialSection::Tos,
+        &credentials_path,
+    )?;
+    let mut config_profile = if config.profiles.is_empty() && global.profile == "default" {
         Profile::default()
     } else {
         match config.get_effective_profile_in_dir(&global.profile, Binary::Tos, &config_dir) {
             Ok(effective) => effective.into_flat_profile(),
-            Err(CliError::ConfigMissing(_)) if has_profile_values(&env_profile) => {
+            Err(CliError::ConfigMissing(_))
+                if has_profile_values(&env_profile) || !stored_credentials.is_empty() =>
+            {
                 Profile::default()
             }
             Err(err) => return Err(err),
         }
     };
+    stored_credentials.apply_to_profile(&mut config_profile);
 
     let mut cli_profile = Profile::default();
     cli_profile.region = global.region.clone();

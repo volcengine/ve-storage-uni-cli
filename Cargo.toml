@@ -51,7 +51,7 @@ crc64fast = "1"
 
 [package]
 name = "ve-storage-uni-cli"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 license = "Apache-2.0"
 description = "Unified command-line interface for Volcengine storage services"
@@ -67,10 +67,10 @@ include = [
 ]
 
 [dependencies]
-tos-core = { version = "1.0.0", path = "crates/tos-core" }
-ve-tos-cli = { package = "ve-tos-cli-core", version = "1.0.0", path = "crates/tos" }
-tos-cli = { package = "tos-cli-core", version = "1.0.0", path = "crates/toscli" }
-ve-adrive-cli = { package = "ve-adrive-cli-core", version = "1.0.0", path = "crates/adrive" }
+tos-core = { version = "1.0.2", path = "crates/tos-core" }
+ve-tos-cli = { package = "ve-tos-cli-core", version = "1.0.2", path = "crates/tos" }
+tos-cli = { package = "tos-cli-core", version = "1.0.2", path = "crates/toscli" }
+ve-adrive-cli = { package = "ve-adrive-cli-core", version = "1.0.2", path = "crates/adrive" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

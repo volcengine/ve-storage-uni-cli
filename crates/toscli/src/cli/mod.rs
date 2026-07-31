@@ -246,6 +246,8 @@ TOS Target Syntax:
 
 Global Options:
   -P, --profile <PROFILE>          Configuration profile name
+      --config-path <PATH>         Path to config TOML (env: TOS_CONFIG_PATH)
+      --credentials-path <PATH>    Path to credentials TOML (env: TOS_CREDENTIALS_PATH)
   -r, --region <REGION>            Region
   -e, --endpoint <ENDPOINT>        Custom endpoint
       --psm <PSM>                  PSM service name for BNS discovery

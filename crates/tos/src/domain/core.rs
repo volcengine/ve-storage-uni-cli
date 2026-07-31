@@ -15,13 +15,14 @@
  */
 
 use std::collections::BTreeMap;
+use std::future::Future;
 
 use reqwest::{Body, Method, Response};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tos_core::agent::envelope::Envelope;
 use tos_core::agent::error::CliError;
-use tos_core::infra::client::TosClient;
+use tos_core::infra::client::{ReplayableStreamingRequest, TosClient};
 
 const MAX_RAW_RESPONSE_BODY_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -44,6 +45,24 @@ pub struct DownloadResult {
     pub output: String,
     pub bytes_written: u64,
     pub headers: BTreeMap<String, String>,
+}
+
+/// Object request metadata for a replayable streaming upload.
+pub struct ReplayableObjectRequest<'a> {
+    /// Command name written to the response envelope.
+    pub command: &'a str,
+    /// HTTP method used for the upload.
+    pub method: Method,
+    /// Destination bucket.
+    pub bucket: &'a str,
+    /// Destination object key.
+    pub key: &'a str,
+    /// Signed query parameters.
+    pub query: BTreeMap<String, String>,
+    /// Signed request headers.
+    pub headers: BTreeMap<String, String>,
+    /// Precomputed SHA256 payload hash.
+    pub payload_hash: String,
 }
 
 /// Execute a bucket-scoped request whose path is `/{bucket}`.
@@ -140,6 +159,47 @@ pub async fn execute_object_streaming_request(
     let resp = client
         .send_streaming_request(method, &url, &path, query, headers, payload_hash, body)
         .await?;
+    streaming_response_envelope(client, command, resp).await
+}
+
+/// Execute a replayable object upload and return a structured response.
+///
+/// The body factory is invoked for every retry attempt. Callers should only use
+/// this function when the source can be reopened, such as a local file or file
+/// slice.
+pub async fn execute_object_replayable_streaming_request<F, Fut>(
+    client: &TosClient,
+    request: ReplayableObjectRequest<'_>,
+    body_factory: F,
+) -> Result<Envelope<RawResponseData>, CliError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Body, CliError>>,
+{
+    let url = client.object_endpoint(request.bucket, request.key)?;
+    let path = client.object_request_path(request.bucket, request.key)?;
+    let command = request.command;
+    let response = client
+        .send_replayable_streaming_request(
+            ReplayableStreamingRequest {
+                method: request.method,
+                url,
+                path,
+                query_params: request.query,
+                extra_headers: request.headers,
+                payload_hash: request.payload_hash,
+            },
+            body_factory,
+        )
+        .await?;
+    streaming_response_envelope(client, command, response).await
+}
+
+async fn streaming_response_envelope(
+    client: &TosClient,
+    command: &str,
+    resp: Response,
+) -> Result<Envelope<RawResponseData>, CliError> {
     let request_id = extract_request_id(&resp);
     let status_code = resp.status().as_u16();
     let headers = extract_headers(&resp);

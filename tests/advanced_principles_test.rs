@@ -14,10 +14,28 @@
  * limitations under the License.
  */
 
-use std::process::{Command, Output};
+use std::{
+    fs,
+    path::PathBuf,
+    process::{Command, Output},
+};
+
+fn isolated_home() -> PathBuf {
+    let thread = format!("{:?}", std::thread::current().id());
+    let safe_thread = thread.replace(|character: char| !character.is_ascii_alphanumeric(), "_");
+    let home = std::env::temp_dir().join(format!(
+        "ve-storage-advanced-principles-{}-{safe_thread}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&home).expect("create isolated HOME");
+    home
+}
 
 fn cli(args: &[&str]) -> Output {
+    // [Review Fix #21] The canonical credentials parser intentionally rejects
+    // the old private schema, so tests must not inherit a developer's HOME.
     Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
+        .env("HOME", isolated_home())
         .args(args)
         .output()
         .expect("failed to execute ve-storage-uni-cli")
@@ -25,7 +43,7 @@ fn cli(args: &[&str]) -> Output {
 
 fn cli_with_env(args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"));
-    command.args(args);
+    command.env("HOME", isolated_home()).args(args);
     for (key, value) in envs {
         command.env(key, value);
     }

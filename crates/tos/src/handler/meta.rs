@@ -3752,6 +3752,7 @@ mod tests {
         GlobalArgs {
             profile: "default".to_string(),
             config_path: None,
+            credentials_path: None,
             region: None,
             endpoint: None,
             psm: None,

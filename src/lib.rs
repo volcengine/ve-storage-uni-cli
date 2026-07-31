@@ -85,6 +85,8 @@ enum ToolCommand {
     /// A-Drive commands (high-level + utilities)
     #[command(name = "ve-adrive")]
     ADrive {
+        #[command(flatten)]
+        auth: ve_adrive_cli::ADriveAuthArgs,
         #[command(subcommand)]
         command: ve_adrive_cli::ADriveCommand,
     },
@@ -1849,8 +1851,8 @@ async fn run_with_args(args: Vec<String>, invocation_surface: InvocationSurface)
         ToolCommand::Tos { command } => {
             handle_tos(cli.global, command).await;
         }
-        ToolCommand::ADrive { command } => {
-            handle_adrive(cli.global, command).await;
+        ToolCommand::ADrive { auth, command } => {
+            handle_adrive(cli.global, auth, command).await;
         }
     }
 }
@@ -3013,14 +3015,18 @@ fn suggest_fix(err: &tos_core::agent::error::CliError) -> Option<String> {
     }
 }
 
-async fn handle_adrive(global: GlobalArgs, command: ve_adrive_cli::ADriveCommand) {
+async fn handle_adrive(
+    global: GlobalArgs,
+    auth: ve_adrive_cli::ADriveAuthArgs,
+    command: ve_adrive_cli::ADriveCommand,
+) {
     use tos_core::agent::envelope::{Envelope, ErrorDetail, ErrorKind};
     use tos_core::agent::error::ExitCode;
 
     let exit_code = match async {
         reject_control_plane_globals(&global, "ve-adrive")?;
         reject_psm_globals(&global, "ve-adrive")?;
-        handle_adrive_inner(&global, &command).await
+        handle_adrive_inner(&global, &auth, &command).await
     }
     .await
     {
@@ -3101,6 +3107,7 @@ fn suggest_adrive_fix(
 
 async fn handle_adrive_inner(
     global: &GlobalArgs,
+    auth: &ve_adrive_cli::ADriveAuthArgs,
     command: &ve_adrive_cli::ADriveCommand,
 ) -> Result<i32, tos_core::agent::error::CliError> {
     match command {
@@ -3117,7 +3124,8 @@ async fn handle_adrive_inner(
         | ve_adrive_cli::ADriveCommand::Cat(_)
         | ve_adrive_cli::ADriveCommand::Put(_)
         | ve_adrive_cli::ADriveCommand::Mkdir(_) => {
-            ve_adrive_cli::handler::high_level::handle_high_level_command(global, command).await
+            ve_adrive_cli::handler::high_level::handle_high_level_command(global, auth, command)
+                .await
         }
         ve_adrive_cli::ADriveCommand::Capabilities(args) => {
             ve_adrive_cli::handler::meta::handle_capabilities_command(global, args).await
@@ -3135,10 +3143,13 @@ async fn handle_adrive_inner(
             ve_adrive_cli::handler::meta::handle_serve_command(global, args).await
         }
         ve_adrive_cli::ADriveCommand::Doctor(args) => {
-            ve_adrive_cli::handler::meta::handle_doctor_command(global, args).await
+            ve_adrive_cli::handler::meta::handle_doctor_command(global, auth, args).await
         }
         ve_adrive_cli::ADriveCommand::Skill(cmd) => {
             ve_adrive_cli::handler::meta::handle_skill_command(global, cmd).await
+        }
+        ve_adrive_cli::ADriveCommand::Auth(command) => {
+            ve_adrive_cli::handler::auth::handle_auth_command(global, auth, command).await
         }
     }
 }

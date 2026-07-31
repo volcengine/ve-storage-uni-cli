@@ -22,6 +22,7 @@ import email.utils
 import glob
 import hashlib
 import importlib.util
+import json
 import math
 import re
 import shlex
@@ -37,6 +38,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
 PUBLIC_PACKAGES = ("ve-tos-cli", "tos-cli", "ve-adrive-cli")
 ENTRY_CRATES = PUBLIC_PACKAGES
+PIP_PACKAGES_CONFIG = ROOT / "packaging" / "pip" / "packages.json"
 CARGO_PUBLISH_RETRY_DELAYS = (15, 30, 60, 120)
 CARGO_RATE_LIMIT_RETRY_BUFFER_SECONDS = 5
 CARGO_RATE_LIMIT_RETRY_AFTER_PATTERN = re.compile(
@@ -412,6 +414,11 @@ def build_wheel_command(source_dir: Path, wheel_dir: Path, platform_tag: str | N
     return command
 
 
+def pip_package_names(config_path: Path = PIP_PACKAGES_CONFIG) -> tuple[str, ...]:
+    package_config = json.loads(config_path.read_text(encoding="utf-8"))
+    return tuple(str(package["name"]) for package in package_config["packages"])
+
+
 def run_pip(args: argparse.Namespace) -> None:
     platform_tag = None
     if args.build_wheel:
@@ -427,7 +434,7 @@ def run_pip(args: argparse.Namespace) -> None:
 
     if args.build_wheel:
         wheel_dir = args.out_dir / "wheels"
-        for package_name in PUBLIC_PACKAGES:
+        for package_name in pip_package_names():
             run_command(build_wheel_command(args.out_dir / package_name, wheel_dir, platform_tag))
 
     wheel_files = sorted(glob.glob(str(args.out_dir / "wheels" / "*.whl")))

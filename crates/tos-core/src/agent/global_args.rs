@@ -29,6 +29,7 @@ use crate::infra::config::ConfigFile;
 pub const GROUPED_HELP_GLOBAL_OPTIONS: &str = r#"Global Options:
   -P, --profile <PROFILE>          Configuration profile name
       --config-path <PATH>         Path to the config TOML file (env: TOS_CONFIG_PATH)
+      --credentials-path <PATH>    Path to the credentials TOML file (env: TOS_CREDENTIALS_PATH)
   -r, --region <REGION>            Region
   -e, --endpoint <ENDPOINT>        Custom Data Plane endpoint
       --psm <PSM>                  ByteCloud TOS PSM service name (tos only)
@@ -67,6 +68,12 @@ pub struct GlobalArgs {
     /// is also used for the local encryption key that protects stored secrets.
     #[arg(long, env = "TOS_CONFIG_PATH", value_name = "PATH", global = true)]
     pub config_path: Option<PathBuf>,
+
+    /// Path to the encrypted credentials TOML file.
+    ///
+    /// Defaults to `credentials.toml` beside the effective config file.
+    #[arg(long, env = "TOS_CREDENTIALS_PATH", value_name = "PATH", global = true)]
+    pub credentials_path: Option<PathBuf>,
 
     /// Region
     ///
@@ -184,6 +191,7 @@ impl Default for GlobalArgs {
         Self {
             profile: "default".to_string(),
             config_path: None,
+            credentials_path: None,
             region: None,
             endpoint: None,
             psm: None,
@@ -214,6 +222,26 @@ impl GlobalArgs {
     /// the default `$HOME/.tos/config.toml` path.
     pub fn config_path(&self) -> PathBuf {
         ConfigFile::config_path_from(self.config_path.as_deref())
+    }
+
+    /// Return the effective credentials file path for this invocation.
+    pub fn credentials_path(&self) -> PathBuf {
+        crate::infra::credentials::CredentialsFile::path_from(
+            &self.config_path(),
+            self.credentials_path.as_deref(),
+        )
+    }
+
+    /// Return the credentials path and validate an explicit runtime override.
+    pub fn existing_runtime_credentials_path(&self) -> Result<PathBuf, CliError> {
+        let path = self.credentials_path();
+        if self.credentials_path.is_some() && !path.exists() {
+            return Err(CliError::ConfigMissing(format!(
+                "No credentials file found at {}",
+                path.display()
+            )));
+        }
+        Ok(path)
     }
 
     /// Return the effective config path for runtime commands.

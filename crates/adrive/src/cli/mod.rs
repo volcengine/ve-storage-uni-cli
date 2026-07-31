@@ -14,10 +14,13 @@
  * limitations under the License.
  */
 
+pub mod auth;
 pub mod high_level;
 pub mod meta;
 
 use clap::Subcommand;
+
+pub use auth::ADriveAuthArgs;
 
 const ADRIVE_EXAMPLE_PREFIX_ENV: &str = "VE_STORAGE_UNI_ADRIVE_EXAMPLE_PREFIX";
 
@@ -66,6 +69,8 @@ pub enum ADriveCommand {
     Skill(meta::SkillCommand),
     /// Environment diagnostics
     Doctor(meta::DoctorArgs),
+    /// Inspect or manage ADrive authentication
+    Auth(auth::AuthCommand),
 }
 
 /// Stable, debug-syntax-free command path used by error envelopes.
@@ -93,10 +98,23 @@ pub fn command_path(command: &ADriveCommand) -> String {
         ADriveCommand::Serve(_) => "serve",
         ADriveCommand::Skill(cmd) => return skill_command_path(cmd),
         ADriveCommand::Doctor(_) => "doctor",
+        ADriveCommand::Auth(cmd) => return auth_command_path(cmd),
     };
     // [Review Fix #11] `command_path` feeds envelopes and describe recovery,
     // so it must use the actual public top-level command directly.
     format!("ve-adrive {suffix}")
+}
+
+fn auth_command_path(cmd: &auth::AuthCommand) -> String {
+    let Some(action) = cmd.action else {
+        return "ve-adrive auth".to_string();
+    };
+    let action = match action {
+        auth::AuthAction::Status => "status",
+        auth::AuthAction::Login => "login",
+        auth::AuthAction::Logout => "logout",
+    };
+    format!("ve-adrive auth {action}")
 }
 
 fn skill_command_path(cmd: &meta::SkillCommand) -> String {
@@ -146,6 +164,7 @@ Capabilities / Utilities:
   serve         Start MCP server
   skill         Manage/export skill metadata
   doctor        Environment diagnostics
+  auth          Inspect or manage ADrive authentication
 
 ADrive Target Syntax:
   URI:     adrive://<instance>/<space>/<folder>/<file>
@@ -154,6 +173,9 @@ ADrive Target Syntax:
 
 Global Options:
   -P, --profile <PROFILE>          Configuration profile name
+      --config-path <PATH>         Path to config TOML (env: TOS_CONFIG_PATH)
+      --credentials-path <PATH>    Path to credentials TOML (env: TOS_CREDENTIALS_PATH)
+      --auth-mode <MODE>           ADrive authentication mode (aksk or oauth)
   -r, --region <REGION>            Region
   -e, --endpoint <ENDPOINT>        Custom ADrive endpoint
   -o, --output <FORMAT>            Output format (json, table, csv, yaml, markdown)

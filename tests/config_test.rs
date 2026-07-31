@@ -55,6 +55,7 @@ fn cli_with_home_and_env(
         "TOS_REGION",
         "TOS_ENDPOINT",
         "TOS_CONFIG_PATH",
+        "TOS_CREDENTIALS_PATH",
         "TOS_CONTROL_ENDPOINT",
         "TOS_ACCESS_KEY",
         "TOS_SECRET_KEY",
@@ -100,6 +101,9 @@ fn cli_with_home_and_env(
         "ADRIVE_SECRET_KEY",
         "ADRIVE_SECURITY_TOKEN",
         "ADRIVE_ACCOUNT_ID",
+        "ADRIVE_AUTH_MODE",
+        "ADRIVE_ACCESS_TOKEN",
+        "ADRIVE_REFRESH_TOKEN",
     ] {
         command.env_remove(key);
     }
@@ -506,6 +510,7 @@ fn test_adrive_config_set_dry_run_routes_bare_key_and_redacts_secret() {
     assert_eq!(json["dry_run"], true);
     let plan_str = serde_json::to_string(&json["plan"]).unwrap();
     assert!(plan_str.contains("[dev.adrive]"), "plan={plan_str}");
+    assert!(plan_str.contains("credentials.toml"), "plan={plan_str}");
     assert!(plan_str.contains("****"), "plan={plan_str}");
     assert!(
         !tmp.join(".tos").join("config.toml").exists(),
@@ -2030,7 +2035,8 @@ fn test_config_secret_is_encrypted_on_disk() {
         ],
     );
     assert!(out.status.success());
-    let content = std::fs::read_to_string(tmp.join(".tos").join("config.toml")).unwrap();
+    let config_content = std::fs::read_to_string(tmp.join(".tos").join("config.toml")).unwrap();
+    let content = std::fs::read_to_string(tmp.join(".tos").join("credentials.toml")).unwrap();
     // Raw disk must not contain plaintext AK; must contain ENC:
     assert!(
         !content.contains("AKTPREALSECRET1234"),
@@ -2039,8 +2045,12 @@ fn test_config_secret_is_encrypted_on_disk() {
     );
     assert!(
         content.contains("ENC:"),
-        "Expected ENC: prefix in config file: {}",
+        "Expected ENC: prefix in credentials file: {}",
         content
+    );
+    assert!(
+        !config_content.contains("AKTPREALSECRET1234"),
+        "config.toml must not receive new AK/SK writes: {config_content}"
     );
     // Master key file exists with 0600 on unix
     let key_path = tmp.join(".tos").join(".key");
@@ -2328,6 +2338,453 @@ fn test_config_set_dry_run_redacts_secret_value() {
             .contains("***REDACTED***"),
         "dry-run should show a redaction placeholder: {data}"
     );
+}
+
+#[test]
+fn test_adrive_auth_mode_can_be_configured_and_inspected() {
+    let home = tempdir();
+    let set = cli_with_home(
+        &home,
+        &[
+            "--output",
+            "json",
+            "ve-adrive",
+            "config",
+            "set",
+            "auth_mode",
+            "oauth",
+        ],
+    );
+    assert!(
+        set.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+
+    let status = cli_with_home(&home, &["--output", "json", "ve-adrive", "auth", "status"]);
+    assert!(
+        status.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let json = parse_json(&status);
+    assert_eq!(json["data"]["mode"], "oauth");
+    assert_eq!(json["data"]["source"], "config");
+}
+
+#[test]
+fn test_adrive_auth_mode_precedence_is_cli_then_config_then_env() {
+    let home = tempdir();
+    let set = cli_with_home(
+        &home,
+        &[
+            "--output",
+            "json",
+            "ve-adrive",
+            "config",
+            "set",
+            "auth_mode",
+            "oauth",
+        ],
+    );
+    assert!(set.status.success());
+
+    let from_env = cli_with_home_and_env(
+        &home,
+        &["--output", "json", "ve-adrive", "auth", "status"],
+        &[("ADRIVE_AUTH_MODE", std::ffi::OsStr::new("aksk"))],
+    );
+    assert!(from_env.status.success());
+    let env_json = parse_json(&from_env);
+    assert_eq!(env_json["data"]["mode"], "oauth");
+    assert_eq!(env_json["data"]["source"], "config");
+
+    let from_cli = cli_with_home_and_env(
+        &home,
+        &[
+            "--output",
+            "json",
+            "ve-adrive",
+            "--auth-mode",
+            "aksk",
+            "auth",
+            "status",
+        ],
+        &[("ADRIVE_AUTH_MODE", std::ffi::OsStr::new("aksk"))],
+    );
+    assert!(
+        from_cli.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&from_cli.stderr)
+    );
+    let cli_json = parse_json(&from_cli);
+    assert_eq!(cli_json["data"]["mode"], "aksk");
+    assert_eq!(cli_json["data"]["source"], "command_line");
+}
+
+#[test]
+fn test_auth_mode_option_is_scoped_to_adrive() {
+    let output = cli(&[
+        "--output",
+        "json",
+        "ve-tos",
+        "--auth-mode",
+        "oauth",
+        "doctor",
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected argument '--auth-mode'"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_oauth_mode_does_not_fall_back_to_configured_aksk() {
+    let home = tempdir();
+    let output = cli_with_home_and_env(
+        &home,
+        &[
+            "--output",
+            "json",
+            "ve-adrive",
+            "--auth-mode",
+            "oauth",
+            "ls",
+        ],
+        &[
+            ("ADRIVE_REGION", std::ffi::OsStr::new("cn-beijing")),
+            ("ADRIVE_ACCESS_KEY", std::ffi::OsStr::new("ak")),
+            ("ADRIVE_SECRET_KEY", std::ffi::OsStr::new("sk")),
+        ],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("OAuth resource authentication is not implemented"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn test_adrive_auth_mode_defaults_to_legacy_aksk() {
+    let home = tempdir();
+    let status = cli_with_home(&home, &["--output", "json", "ve-adrive", "auth", "status"]);
+    assert!(
+        status.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let json = parse_json(&status);
+    assert_eq!(json["command"], "ve-adrive auth status");
+    assert_eq!(json["data"]["mode"], "aksk");
+    assert_eq!(json["data"]["source"], "compatibility_default");
+}
+
+#[test]
+fn test_adrive_config_rejects_invalid_auth_mode() {
+    let home = tempdir();
+    let output = cli_with_home(
+        &home,
+        &[
+            "--output",
+            "json",
+            "ve-adrive",
+            "config",
+            "set",
+            "auth_mode",
+            "automatic",
+        ],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("expected aksk or oauth"), "stderr={stderr}");
+}
+
+#[test]
+fn test_adrive_rejects_invalid_auth_mode_from_environment() {
+    let home = tempdir();
+    let output = cli_with_home_and_env(
+        &home,
+        &["--output", "json", "ve-adrive", "auth", "status"],
+        &[("ADRIVE_AUTH_MODE", std::ffi::OsStr::new("automatic"))],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ADRIVE_AUTH_MODE"), "stderr={stderr}");
+    assert!(stderr.contains("expected aksk or oauth"), "stderr={stderr}");
+}
+
+#[test]
+fn test_adrive_auth_mode_uses_the_same_values_in_every_source() {
+    let home = tempdir();
+    let output = cli_with_home_and_env(
+        &home,
+        &["--output", "json", "ve-adrive", "auth", "status"],
+        &[("ADRIVE_AUTH_MODE", std::ffi::OsStr::new("ak/sk"))],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("expected aksk or oauth"), "stderr={stderr}");
+}
+
+#[test]
+fn test_adrive_auth_login_is_mode_strict_and_does_not_call_server() {
+    let home = tempdir();
+    let aksk = cli_with_home(
+        &home,
+        &[
+            "--output",
+            "json",
+            "ve-adrive",
+            "--auth-mode",
+            "aksk",
+            "auth",
+            "login",
+        ],
+    );
+    assert!(!aksk.status.success());
+    let aksk_json = parse_json(&aksk);
+    assert_eq!(aksk_json["command"], "ve-adrive auth login");
+    assert!(aksk_json["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("requires OAuth mode"));
+
+    let oauth = cli_with_home(
+        &home,
+        &[
+            "--output",
+            "json",
+            "ve-adrive",
+            "--auth-mode",
+            "oauth",
+            "auth",
+            "login",
+        ],
+    );
+    assert!(!oauth.status.success());
+    let oauth_json = parse_json(&oauth);
+    assert_eq!(oauth_json["command"], "ve-adrive auth login");
+    assert!(oauth_json["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("not implemented"));
+}
+
+#[test]
+fn test_adrive_auth_status_reports_tokens_without_exposing_them() {
+    let home = tempdir();
+    let output = cli_with_home_and_env(
+        &home,
+        &[
+            "--output",
+            "json",
+            "ve-adrive",
+            "--auth-mode",
+            "oauth",
+            "auth",
+            "status",
+        ],
+        &[
+            (
+                "ADRIVE_ACCESS_TOKEN",
+                std::ffi::OsStr::new("ACCESS_TOKEN_MUST_NOT_LEAK"),
+            ),
+            (
+                "ADRIVE_REFRESH_TOKEN",
+                std::ffi::OsStr::new("REFRESH_TOKEN_MUST_NOT_LEAK"),
+            ),
+            ("ADRIVE_ACCESS_KEY", std::ffi::OsStr::new("IGNORED_AK")),
+            ("ADRIVE_SECRET_KEY", std::ffi::OsStr::new("IGNORED_SK")),
+        ],
+    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("ACCESS_TOKEN_MUST_NOT_LEAK"),
+        "stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("REFRESH_TOKEN_MUST_NOT_LEAK"),
+        "stdout={stdout}"
+    );
+    let json = parse_json(&output);
+    assert_eq!(json["data"]["has_access_key"], serde_json::Value::Null);
+    assert_eq!(json["data"]["has_secret_key"], serde_json::Value::Null);
+    assert_eq!(json["data"]["has_access_token"], true);
+    assert_eq!(json["data"]["has_refresh_token"], true);
+}
+
+#[test]
+fn test_adrive_oauth_blank_tokens_are_not_reported_as_credentials() {
+    let home = tempdir();
+    let output = cli_with_home_and_env(
+        &home,
+        &[
+            "--output",
+            "json",
+            "ve-adrive",
+            "--auth-mode",
+            "oauth",
+            "auth",
+            "status",
+        ],
+        &[
+            ("ADRIVE_ACCESS_TOKEN", std::ffi::OsStr::new("   ")),
+            ("ADRIVE_REFRESH_TOKEN", std::ffi::OsStr::new("")),
+        ],
+    );
+    assert!(output.status.success());
+    let json = parse_json(&output);
+    assert_eq!(json["data"]["has_access_token"], false);
+    assert_eq!(json["data"]["has_refresh_token"], false);
+}
+
+#[test]
+fn test_adrive_capabilities_registers_auth_framework() {
+    let home = tempdir();
+    let output = cli_with_home(
+        &home,
+        &[
+            "--output",
+            "json",
+            "ve-adrive",
+            "capabilities",
+            "--view",
+            "full",
+        ],
+    );
+    assert!(output.status.success());
+    let json = parse_json(&output);
+    let capabilities = json["data"]["capabilities"]
+        .as_array()
+        .expect("capabilities array");
+    assert!(
+        capabilities
+            .iter()
+            .any(|row| row["command"] == "ve-adrive auth"),
+        "json={json}"
+    );
+}
+
+#[test]
+fn test_adrive_auth_mode_can_follow_the_leaf_command() {
+    let home = tempdir();
+    let output = cli_with_home(
+        &home,
+        &[
+            "--output",
+            "json",
+            "ve-adrive",
+            "auth",
+            "status",
+            "--auth-mode",
+            "oauth",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_json(&output);
+    assert_eq!(json["data"]["mode"], "oauth");
+    assert_eq!(json["data"]["source"], "command_line");
+}
+
+#[test]
+fn test_adrive_auth_without_action_defaults_to_status() {
+    let home = tempdir();
+    let output = cli_with_home(&home, &["--output", "json", "ve-adrive", "auth"]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_json(&output);
+    assert_eq!(json["command"], "ve-adrive auth");
+    assert_eq!(json["data"]["mode"], "aksk");
+}
+
+#[test]
+fn test_adrive_doctor_keeps_unimplemented_oauth_as_warning() {
+    let home = tempdir();
+    let output = cli_with_home_and_env(
+        &home,
+        &[
+            "--output",
+            "json",
+            "ve-adrive",
+            "--auth-mode",
+            "oauth",
+            "doctor",
+            "--check",
+            "auth",
+        ],
+        &[
+            (
+                "ADRIVE_ACCESS_TOKEN",
+                std::ffi::OsStr::new("PROCESS_SCOPED_TOKEN"),
+            ),
+            ("ADRIVE_ACCESS_KEY", std::ffi::OsStr::new("IGNORED_AK")),
+            ("ADRIVE_SECRET_KEY", std::ffi::OsStr::new("IGNORED_SK")),
+        ],
+    );
+    assert!(output.status.success());
+    let json = parse_json(&output);
+    assert_eq!(json["data"]["checks"][0]["status"], "warning");
+    assert_eq!(
+        json["data"]["checks"][0]["details"]["has_access_key"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        json["data"]["checks"][0]["details"]["oauth_service_integration"],
+        "not_implemented"
+    );
+    assert_eq!(json["data"]["summary"]["passed"], 0);
+}
+
+#[test]
+fn test_adrive_auth_logout_is_mode_strict_and_offline() {
+    let home = tempdir();
+    let aksk = cli_with_home(
+        &home,
+        &[
+            "--output",
+            "json",
+            "ve-adrive",
+            "--auth-mode",
+            "aksk",
+            "auth",
+            "logout",
+        ],
+    );
+    assert!(aksk.status.success());
+    let aksk_json = parse_json(&aksk);
+    assert_eq!(aksk_json["data"]["status"], "not_applicable");
+    assert_eq!(aksk_json["data"]["mode"], "aksk");
+
+    let oauth = cli_with_home(
+        &home,
+        &[
+            "--output",
+            "json",
+            "ve-adrive",
+            "--auth-mode",
+            "oauth",
+            "auth",
+            "logout",
+        ],
+    );
+    assert!(!oauth.status.success());
+    let oauth_json = parse_json(&oauth);
+    assert_eq!(oauth_json["command"], "ve-adrive auth logout");
+    assert!(oauth_json["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("not implemented"));
 }
 
 // ==========================================================================

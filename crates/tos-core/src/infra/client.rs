@@ -28,12 +28,17 @@ use crate::infra::discovery::{PsmDiscoveryConfig, PsmResolver};
 use reqwest::{Body, Client, Method, Response, StatusCode};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub const USER_AGENT_NAME_ENV: &str = "VE_STORAGE_UNI_USER_AGENT_NAME";
 const TOS_CONFIG_BINARY_ENV: &str = "VE_STORAGE_UNI_TOS_CONFIG_BINARY";
+
+fn encoded_object_key_path(key: &str) -> String {
+    url_encode_with_safe(key, "/")
+}
 
 /// Build the canonical HTTP User-Agent string for the active top-level binary.
 pub fn storage_user_agent() -> String {
@@ -234,6 +239,23 @@ pub struct TosClient {
     account_id: Option<String>,
     service: String,
     max_retry_count: u32,
+}
+
+/// Owned metadata for an HTTP request whose streaming body can be rebuilt.
+#[derive(Debug, Clone)]
+pub struct ReplayableStreamingRequest {
+    /// HTTP method used for every attempt.
+    pub method: Method,
+    /// Logical object URL before optional PSM resolution.
+    pub url: String,
+    /// Canonical signing path.
+    pub path: String,
+    /// Signed query parameters.
+    pub query_params: BTreeMap<String, String>,
+    /// Additional signed request headers.
+    pub extra_headers: BTreeMap<String, String>,
+    /// SHA256 payload hash used by the request signer.
+    pub payload_hash: String,
 }
 
 impl TosClient {
@@ -438,7 +460,11 @@ impl TosClient {
     /// Returns a URL suitable for object-level requests. Returns a
     /// `ValidationError` when the bucket name is invalid.
     pub fn object_endpoint(&self, bucket: &str, key: &str) -> Result<String, CliError> {
-        Ok(format!("{}/{}", self.bucket_endpoint(bucket)?, key))
+        Ok(format!(
+            "{}/{}",
+            self.bucket_endpoint(bucket)?,
+            encoded_object_key_path(key)
+        ))
     }
 
     /// 获取对象级别签名路径。
@@ -448,7 +474,7 @@ impl TosClient {
     pub fn object_request_path(&self, bucket: &str, key: &str) -> Result<String, CliError> {
         validate_bucket_name(bucket)?;
         if self.sign_algorithm == TosSignAlgorithm::ByteTosV1 {
-            return Ok(format!("/{}/{}", bucket, key));
+            return Ok(format!("/{}/{}", bucket, encoded_object_key_path(key)));
         }
         let is_path_style = self
             .endpoint
@@ -639,6 +665,54 @@ impl TosClient {
             Some(body),
         )
         .await
+    }
+
+    /// Send a signed streaming request using the normal HTTP retry policy.
+    ///
+    /// The body factory is invoked once per attempt, so an already-consumed
+    /// file stream is never reused. Factory errors and non-retryable responses
+    /// are returned immediately.
+    pub async fn send_replayable_streaming_request<F, Fut>(
+        &self,
+        request: ReplayableStreamingRequest,
+        mut body_factory: F,
+    ) -> Result<Response, CliError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<Body, CliError>>,
+    {
+        for attempt in 0..=self.max_retry_count {
+            let body = body_factory().await?;
+            let result = self
+                .send_signed_request_once(
+                    request.method.clone(),
+                    &request.url,
+                    &request.path,
+                    request.query_params.clone(),
+                    request.extra_headers.clone(),
+                    request.payload_hash.clone(),
+                    Some(body),
+                )
+                .await;
+            match result {
+                Ok(response)
+                    if should_retry_response(response.status())
+                        && attempt < self.max_retry_count =>
+                {
+                    sleep_before_retry(attempt).await;
+                }
+                Ok(response) => return Ok(response),
+                Err(CliError::Http(error))
+                    if should_retry_reqwest_error(&error) && attempt < self.max_retry_count =>
+                {
+                    sleep_before_retry(attempt).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(CliError::TransferFailed(
+            "HTTP retry loop exhausted".to_string(),
+        ))
     }
 
     async fn send_signed_request(
@@ -1092,13 +1166,13 @@ fn add_copy_source_signature(
 mod tests {
     use super::{
         add_copy_source_signature, derive_region_from_endpoint, storage_user_agent_for_name,
-        TosClient, TosSignAlgorithm, TosSigner,
+        ReplayableStreamingRequest, TosClient, TosSignAlgorithm, TosSigner,
     };
     use crate::infra::config::Profile;
     use reqwest::Method;
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::{mpsc, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -1119,6 +1193,106 @@ mod tests {
             std::env::remove_var("TEST_TOSAPI_ADDR");
         }
         result
+    }
+
+    fn endpoint_test_client(sign_algorithm: TosSignAlgorithm) -> TosClient {
+        TosClient::new_with_sign_algorithm(
+            &Profile {
+                region: Some("cn-beijing".to_string()),
+                access_key_id: Some("ak".to_string()),
+                secret_access_key: Some("sk".to_string()),
+                endpoint: Some("tos-cn-beijing.volces.com".to_string()),
+                ..Default::default()
+            },
+            "tos",
+            sign_algorithm,
+        )
+        .expect("client")
+    }
+
+    fn read_request_body(stream: &mut TcpStream) -> Vec<u8> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        let header_end = loop {
+            let bytes_read = stream.read(&mut buffer).expect("read request");
+            assert!(bytes_read > 0, "connection closed before request headers");
+            request.extend_from_slice(&buffer[..bytes_read]);
+            if let Some(offset) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break offset + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("content length"))
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let bytes_read = stream.read(&mut buffer).expect("read request body");
+            assert!(bytes_read > 0, "connection closed before request body");
+            request.extend_from_slice(&buffer[..bytes_read]);
+        }
+        request[header_end..header_end + content_length].to_vec()
+    }
+
+    fn spawn_streaming_response_server(
+        statuses: Vec<&'static str>,
+    ) -> (String, thread::JoinHandle<Vec<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let server = thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for status in statuses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                bodies.push(read_request_body(&mut stream));
+                let response =
+                    format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+            bodies
+        });
+        (endpoint, server)
+    }
+
+    fn streaming_test_client(endpoint: String, max_retry_count: u32) -> TosClient {
+        TosClient::new_with_sign_algorithm(
+            &Profile {
+                region: Some("cn-beijing".to_string()),
+                access_key_id: Some("ak".to_string()),
+                secret_access_key: Some("sk".to_string()),
+                endpoint: Some(endpoint),
+                max_retry_count: Some(max_retry_count),
+                requesttimeout: Some(5),
+                connecttimeout: Some(5),
+                ..Default::default()
+            },
+            "tos",
+            TosSignAlgorithm::Tos4,
+        )
+        .expect("client")
+    }
+
+    fn replayable_test_request(client: &TosClient) -> ReplayableStreamingRequest {
+        ReplayableStreamingRequest {
+            method: Method::PUT,
+            url: client
+                .object_endpoint("bucket", "retry.bin")
+                .expect("object endpoint"),
+            path: client
+                .object_request_path("bucket", "retry.bin")
+                .expect("object path"),
+            query_params: BTreeMap::new(),
+            extra_headers: BTreeMap::from([("content-length".to_string(), "6".to_string())]),
+            payload_hash: "payload-hash".to_string(),
+        }
     }
 
     #[test]
@@ -1290,6 +1464,41 @@ mod tests {
     }
 
     #[test]
+    fn object_endpoint_percent_encodes_key_segments_once() {
+        let client = endpoint_test_client(TosSignAlgorithm::ByteTosV1);
+        assert!(client
+            .object_endpoint("bucket", "dir/create_topic_with_%DLQ%_test.py")
+            .expect("object endpoint")
+            .ends_with("/dir/create_topic_with_%25DLQ%25_test.py"));
+        assert!(client
+            .object_endpoint("bucket", "literal-%25/a b/plus+sign/中文?#.txt")
+            .expect("object endpoint")
+            .ends_with("/literal-%2525/a%20b/plus%2Bsign/%E4%B8%AD%E6%96%87%3F%23.txt"));
+    }
+
+    #[test]
+    fn bytetos_v1_signs_the_encoded_wire_path() {
+        let client = endpoint_test_client(TosSignAlgorithm::ByteTosV1);
+        assert_eq!(
+            client
+                .object_request_path("bucket", "dir/%DLQ%")
+                .expect("object path"),
+            "/bucket/dir/%25DLQ%25"
+        );
+    }
+
+    #[test]
+    fn tos4_keeps_raw_path_for_single_canonical_encoding() {
+        let client = endpoint_test_client(TosSignAlgorithm::Tos4);
+        assert_eq!(
+            client
+                .object_request_path("bucket", "dir/%DLQ%")
+                .expect("object path"),
+            "/dir/%DLQ%"
+        );
+    }
+
+    #[test]
     fn bucket_endpoint_rejects_invalid_virtual_hosted_bucket_names() {
         let client = TosClient::new_with_sign_algorithm(
             &Profile {
@@ -1367,6 +1576,116 @@ mod tests {
             .expect("captured request line");
         server.join().expect("server thread");
         assert_eq!(request_line, "GET /bucket HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn bytetos_v1_wire_path_escapes_literal_percent() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (line_tx, line_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buffer = [0u8; 4096];
+            let bytes_read = stream.read(&mut buffer).expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+            line_tx
+                .send(request.lines().next().unwrap_or_default().to_string())
+                .expect("send request line");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .expect("write response");
+        });
+        let client = TosClient::new_with_sign_algorithm(
+            &Profile {
+                region: Some("cn-boe".to_string()),
+                access_key_id: Some("ak".to_string()),
+                secret_access_key: Some("sk".to_string()),
+                endpoint: Some(endpoint),
+                max_retry_count: Some(0),
+                ..Default::default()
+            },
+            "tos",
+            TosSignAlgorithm::ByteTosV1,
+        )
+        .expect("client");
+        let key = "dir/create_topic_with_%DLQ%_test.py";
+
+        client
+            .send_request(
+                Method::GET,
+                &client.object_endpoint("bucket", key).expect("endpoint"),
+                &client.object_request_path("bucket", key).expect("path"),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                None,
+            )
+            .await
+            .expect("send request");
+
+        let request_line = line_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured request line");
+        server.join().expect("server thread");
+        assert_eq!(
+            request_line,
+            "GET /bucket/dir/create_topic_with_%25DLQ%25_test.py HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn replayable_streaming_request_rebuilds_body_after_500() {
+        let (endpoint, server) =
+            spawn_streaming_response_server(vec!["500 Internal Server Error", "200 OK"]);
+        let client = streaming_test_client(endpoint, 1);
+        let response = client
+            .send_replayable_streaming_request(replayable_test_request(&client), || async {
+                Ok(reqwest::Body::from("replay"))
+            })
+            .await
+            .expect("replayed request");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            server.join().expect("server thread"),
+            vec![b"replay".to_vec(), b"replay".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn replayable_streaming_request_does_not_retry_400() {
+        let (endpoint, server) = spawn_streaming_response_server(vec!["400 Bad Request"]);
+        let client = streaming_test_client(endpoint, 2);
+        let response = client
+            .send_replayable_streaming_request(replayable_test_request(&client), || async {
+                Ok(reqwest::Body::from("replay"))
+            })
+            .await
+            .expect("non-retryable response");
+
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(server.join().expect("server thread").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replayable_streaming_request_stops_after_retry_limit() {
+        let (endpoint, server) = spawn_streaming_response_server(vec![
+            "500 Internal Server Error",
+            "500 Internal Server Error",
+            "500 Internal Server Error",
+        ]);
+        let client = streaming_test_client(endpoint, 2);
+        let response = client
+            .send_replayable_streaming_request(replayable_test_request(&client), || async {
+                Ok(reqwest::Body::from("replay"))
+            })
+            .await
+            .expect("last retry response");
+
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(server.join().expect("server thread").len(), 3);
     }
 
     #[tokio::test]
