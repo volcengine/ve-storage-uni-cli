@@ -110,6 +110,18 @@ const SECRET_FIELDS: &[&str] = &[
     "session_token",
     "sessiontoken",
     "session-token",
+    "access_token",
+    "accesstoken",
+    "access-token",
+    "refresh_token",
+    "refreshtoken",
+    "refresh-token",
+    "client_secret",
+    "clientsecret",
+    "client-secret",
+    "device_code",
+    "devicecode",
+    "device-code",
     "password",
     "passwd",
     "x-amz-signature",
@@ -250,6 +262,8 @@ pub struct TosTableOverride {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdriveOverride {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -564,6 +578,9 @@ pub enum FieldSource {
     BinaryOverride,
     /// 根据 data endpoint 自动推导。
     Derived,
+    /// 来自独立的 credentials.toml。
+    #[serde(rename = "credentials_file")]
+    CredentialsFile,
     /// 未配置。
     Unset,
 }
@@ -575,6 +592,7 @@ impl FieldSource {
             FieldSource::Shared => format!("[{}]", profile_name),
             FieldSource::BinaryOverride => format!("[{}.{}]", profile_name, binary),
             FieldSource::Derived => "derived from endpoint".to_string(),
+            FieldSource::CredentialsFile => "credentials_file".to_string(),
             FieldSource::Unset => "-".to_string(),
         }
     }
@@ -647,6 +665,15 @@ pub struct EffectiveProfile {
     pub access_key_id: TracedField<String>,
     pub secret_access_key: TracedField<String>,
     pub security_token: TracedField<String>,
+    /// adrive 专属：认证策略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<TracedField<String>>,
+    /// adrive 专属：OAuth access token，仅用于脱敏配置检查。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<TracedField<String>>,
+    /// adrive 专属：OAuth refresh token，仅用于脱敏配置检查。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<TracedField<String>>,
     /// adrive 专属：账号 ID。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<TracedField<String>>,
@@ -656,6 +683,52 @@ pub struct EffectiveProfile {
     /// adrive 专属：默认空间。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_space: Option<TracedField<String>>,
+}
+
+/// Overlay credentials-file fields onto an effective profile for inspection.
+pub fn overlay_effective_credentials(
+    effective: &mut EffectiveProfile,
+    credentials: &crate::infra::credentials::StoredAkskCredentials,
+) {
+    if let Some(value) = credentials.access_key_id.as_ref() {
+        effective.access_key_id = TracedField {
+            value: Some(value.clone()),
+            source: FieldSource::CredentialsFile,
+        };
+    }
+    if let Some(value) = credentials.secret_access_key.as_ref() {
+        effective.secret_access_key = TracedField {
+            value: Some(value.clone()),
+            source: FieldSource::CredentialsFile,
+        };
+    }
+    if let Some(value) = credentials.security_token.as_ref() {
+        effective.security_token = TracedField {
+            value: Some(value.clone()),
+            source: FieldSource::CredentialsFile,
+        };
+    }
+}
+
+/// Overlay ADrive OAuth fields for redacted configuration inspection.
+pub fn overlay_effective_oauth_credentials(
+    effective: &mut EffectiveProfile,
+    credentials: &crate::infra::credentials::StoredOAuthCredentials,
+) {
+    // [Review Fix #14] Keep OAuth credentials visible to config inspection
+    // without folding them into the legacy SDK profile consumed at runtime.
+    if let Some(value) = credentials.access_token.as_ref() {
+        effective.access_token = Some(TracedField {
+            value: Some(value.clone()),
+            source: FieldSource::CredentialsFile,
+        });
+    }
+    if let Some(value) = credentials.refresh_token.as_ref() {
+        effective.refresh_token = Some(TracedField {
+            value: Some(value.clone()),
+            source: FieldSource::CredentialsFile,
+        });
+    }
 }
 
 impl EffectiveProfile {
@@ -926,6 +999,7 @@ impl ConfigFile {
         let mut account_id: Option<TracedField<String>> = None;
         let mut default_instance: Option<TracedField<String>> = None;
         let mut default_space: Option<TracedField<String>> = None;
+        let mut auth_mode: Option<TracedField<String>> = None;
 
         // 2) 按 binary 覆盖
         match binary {
@@ -1025,6 +1099,14 @@ impl ConfigFile {
             }
             Binary::Adrive => {
                 if let Some(o) = &profile.adrive {
+                    auth_mode = Some(TracedField {
+                        source: if o.auth_mode.is_some() {
+                            FieldSource::BinaryOverride
+                        } else {
+                            FieldSource::Unset
+                        },
+                        value: o.auth_mode.clone(),
+                    });
                     region = TracedField::override_with(region, o.region.clone());
                     endpoint = TracedField::override_with(endpoint, o.endpoint.clone());
                     checkpoint_dir =
@@ -1091,6 +1173,10 @@ impl ConfigFile {
                         value: o.default_space.clone(),
                     });
                 } else {
+                    auth_mode = Some(TracedField {
+                        value: None,
+                        source: FieldSource::Unset,
+                    });
                     account_id = Some(TracedField {
                         value: None,
                         source: FieldSource::Unset,
@@ -1212,6 +1298,9 @@ impl ConfigFile {
             access_key_id,
             secret_access_key,
             security_token,
+            auth_mode,
+            access_token: None,
+            refresh_token: None,
             account_id,
             default_instance,
             default_space,
@@ -1683,6 +1772,16 @@ fn set_tostable_override(o: &mut TosTableOverride, key: &str, value: &str) -> Re
 
 fn set_adrive_override(o: &mut AdriveOverride, key: &str, value: &str) -> Result<(), CliError> {
     match canonical_config_key(key) {
+        "auth_mode" => {
+            let normalized = value.trim().to_ascii_lowercase();
+            if !matches!(normalized.as_str(), "aksk" | "oauth") {
+                return Err(CliError::ValidationError(format!(
+                    "invalid ADrive auth_mode '{}': expected aksk or oauth",
+                    value
+                )));
+            }
+            o.auth_mode = Some(normalized);
+        }
         "region" => o.region = Some(value.into()),
         "endpoint" => o.endpoint = Some(value.into()),
         "access_key_id" => o.access_key_id = Some(value.into()),
@@ -1936,5 +2035,17 @@ mod tests {
         assert_eq!(mask_secret("AKTPxxxxxxxx1234"), "****1234");
         assert_eq!(mask_secret("abc"), "****");
         assert_eq!(mask_secret("ENC:abcdefghij"), "ENC:****");
+    }
+
+    #[test]
+    fn oauth_credential_fields_are_sensitive() {
+        for field in [
+            "access_token",
+            "refresh_token",
+            "oauth_client_secret",
+            "device_code",
+        ] {
+            assert!(is_sensitive_field(field), "field={field}");
+        }
     }
 }

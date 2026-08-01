@@ -141,7 +141,7 @@ async fn handle_append(
             let path_str = path.to_string_lossy().to_string();
             // [Review Fix] TOS requires Content-Length for streaming turbo append bodies
             headers.insert("content-length".to_string(), len.to_string());
-            let payload_hash = crate::handler::high_level::file_sha256(&path_str)?;
+            let payload_hash = crate::handler::high_level::file_sha256(&path_str).await?;
             let body = crate::handler::high_level::file_stream_body(&path_str).await?;
             let result = core::execute_object_streaming_request(
                 client,

@@ -16,6 +16,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RELEASE_SCRIPT = REPO_ROOT / "packaging" / "scripts" / "release.py"
 PUBLIC_CLI_PACKAGES = ("ve-tos-cli", "tos-cli", "ve-adrive-cli")
+PIP_PACKAGES = ("ve-tos-cli", "tos-cli", "byted-tos-cli", "ve-adrive-cli")
 
 
 def load_release_module():
@@ -172,7 +173,9 @@ def test_release_metadata_and_channel_configs_use_public_cli_packages():
     pip_config = json.loads(
         (REPO_ROOT / "packaging" / "pip" / "packages.json").read_text(encoding="utf-8")
     )
-    assert tuple(package["name"] for package in pip_config["packages"]) == PUBLIC_CLI_PACKAGES
+    pip_packages = {package["name"]: package for package in pip_config["packages"]}
+    assert tuple(package["name"] for package in pip_config["packages"]) == PIP_PACKAGES
+    assert pip_packages["byted-tos-cli"]["commands"] == ["tos-cli"]
 
     homebrew_config = json.loads(
         (REPO_ROOT / "packaging" / "homebrew" / "formulae.json").read_text(encoding="utf-8")
@@ -836,6 +839,42 @@ def test_pip_build_wheel_uses_target_platform_tag(tmp_path, monkeypatch):
             str(tmp_path / "pip" / "ve-tos-cli"),
         ),
         True,
+    )
+
+
+def test_pip_build_wheel_uses_pip_package_config(tmp_path, monkeypatch):
+    release = load_release_module()
+    commands = []
+
+    monkeypatch.setattr(
+        release,
+        "run_command",
+        lambda command, execute=True: commands.append(
+            (tuple(str(part) for part in command), execute)
+        ),
+    )
+    monkeypatch.setattr(release, "ensure_python_modules", lambda *_args: None, raising=False)
+
+    args = argparse.Namespace(
+        version="1.2.3",
+        binary_dir=[tmp_path / "bin"],
+        target="x86_64-pc-windows-msvc",
+        platform_tag=None,
+        out_dir=tmp_path / "pip",
+        build_wheel=True,
+        upload=False,
+    )
+
+    release.run_pip(args)
+
+    build_package_dirs = tuple(
+        command[-1]
+        for command, _execute in commands
+        if command[:3] == (release.sys.executable, "-m", "build")
+    )
+
+    assert build_package_dirs == tuple(
+        str(tmp_path / "pip" / package_name) for package_name in PIP_PACKAGES
     )
 
 

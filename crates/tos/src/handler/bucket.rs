@@ -934,6 +934,9 @@ mod tests {
         let global = GlobalArgs {
             profile: "staging".to_string(),
             config_path: None,
+            // [Review Fix #16] Keep handwritten test arguments aligned with
+            // the new optional credentials path without changing defaults.
+            credentials_path: None,
             region: Some("cli-region".to_string()),
             endpoint: None,
             psm: None,
@@ -1000,6 +1003,7 @@ mod tests {
         let global = GlobalArgs {
             profile: "default".to_string(),
             config_path: None,
+            credentials_path: None,
             region: Some("cli-region".to_string()),
             endpoint: Some("https://tos-cn-beijing.volces.com".to_string()),
             psm: None,

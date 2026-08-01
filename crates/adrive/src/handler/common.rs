@@ -21,7 +21,12 @@ use tos_core::agent::error::CliError;
 use tos_core::agent::global_args::GlobalArgs;
 use tos_core::agent::output::{format_markdown, format_table, format_xml, OutputFormat};
 use tos_core::infra::config::{Binary, ConfigFile, FieldSource, Profile};
+use tos_core::infra::credentials::{CredentialSection, CredentialsFile};
 
+use crate::domain::auth::{
+    AkskAuthProvider, AuthMode, AuthModeSource, AuthProvider, CredentialAvailability,
+    OAuthCredentials, ResolvedAuthMode,
+};
 use crate::domain::client::{Client as IdsClient, ClientOptions, Error as IdsError};
 
 /// Build the effective runtime profile for ADrive commands.
@@ -45,11 +50,31 @@ pub(crate) fn build_profile(global: &GlobalArgs) -> Result<Profile, CliError> {
     let config_path = global.existing_runtime_config_path()?;
     let config_dir = ConfigFile::config_dir_from_path(&config_path);
     let config = ConfigFile::load_from(&config_path)?;
-    let config_profile = if config.profiles.is_empty() && global.profile == "default" {
+    let credentials_path = global.existing_runtime_credentials_path()?;
+    let credentials = CredentialsFile::load_from(&credentials_path)?;
+    let stored_credentials = credentials.effective_aksk(
+        &global.profile,
+        CredentialSection::ADrive,
+        &credentials_path,
+    )?;
+    let mut config_profile = if config.profiles.is_empty() && global.profile == "default" {
         Profile::default()
     } else {
         let effective =
-            config.get_effective_profile_in_dir(&global.profile, Binary::Adrive, &config_dir)?;
+            match config.get_effective_profile_in_dir(&global.profile, Binary::Adrive, &config_dir)
+            {
+                Ok(effective) => effective,
+                Err(CliError::ConfigMissing(_)) if !stored_credentials.is_empty() => {
+                    let mut credentials_only_config = ConfigFile::default();
+                    credentials_only_config.get_or_insert_profile(&global.profile);
+                    credentials_only_config.get_effective_profile_in_dir(
+                        &global.profile,
+                        Binary::Adrive,
+                        &config_dir,
+                    )?
+                }
+                Err(error) => return Err(error),
+            };
         let mut flat = effective.into_flat_profile();
         // [Review Fix #6] ADrive must not inherit shared TOS network settings.
         if effective.region.source == FieldSource::Shared {
@@ -73,6 +98,7 @@ pub(crate) fn build_profile(global: &GlobalArgs) -> Result<Profile, CliError> {
         }
         flat
     };
+    stored_credentials.apply_to_profile(&mut config_profile);
 
     let env_profile = Profile {
         region: std::env::var("ADRIVE_REGION").ok(),
@@ -151,8 +177,58 @@ pub(crate) fn build_profile(global: &GlobalArgs) -> Result<Profile, CliError> {
     Ok(env_profile.merge(&config_profile).merge(&cli_profile))
 }
 
-/// Build a real IDS REST client for ADrive operations.
-pub(crate) fn build_ids_client(global: &GlobalArgs) -> Result<IdsClient, CliError> {
+/// Resolve the effective ADrive auth mode without changing any credential state.
+pub(crate) fn resolve_auth_mode(
+    global: &GlobalArgs,
+    command_line_mode: Option<AuthMode>,
+) -> Result<ResolvedAuthMode, CliError> {
+    if let Some(mode) = command_line_mode {
+        return Ok(ResolvedAuthMode {
+            mode,
+            source: AuthModeSource::CommandLine,
+        });
+    }
+    if global.profile.is_empty() {
+        return Err(CliError::ValidationError(
+            "Invalid profile name: profile must not be empty".to_string(),
+        ));
+    }
+    let config_path = global.existing_runtime_config_path()?;
+    let config_dir = ConfigFile::config_dir_from_path(&config_path);
+    let config = ConfigFile::load_from(&config_path)?;
+    if config.profiles.contains_key(&global.profile) {
+        let effective =
+            config.get_effective_profile_in_dir(&global.profile, Binary::Adrive, &config_dir)?;
+        if let Some(value) = effective.auth_mode.and_then(|field| field.value) {
+            return Ok(ResolvedAuthMode {
+                mode: AuthMode::parse(&value, "profile config")?,
+                source: AuthModeSource::Config,
+            });
+        }
+    }
+    if let Ok(value) = std::env::var("ADRIVE_AUTH_MODE") {
+        return Ok(ResolvedAuthMode {
+            mode: AuthMode::parse(&value, "ADRIVE_AUTH_MODE")?,
+            source: AuthModeSource::Environment,
+        });
+    }
+
+    Ok(ResolvedAuthMode {
+        mode: AuthMode::Aksk,
+        source: AuthModeSource::CompatibilityDefault,
+    })
+}
+
+/// Resolve credentials strictly within the selected ADrive auth mode.
+pub(crate) fn build_auth_provider(
+    global: &GlobalArgs,
+    command_line_mode: Option<AuthMode>,
+) -> Result<AuthProvider, CliError> {
+    let resolved = resolve_auth_mode(global, command_line_mode)?;
+    if resolved.mode == AuthMode::Oauth {
+        return Ok(AuthProvider::OAuth(resolve_oauth_credentials(global)?));
+    }
+
     let profile = build_profile(global)?;
     let access_key = profile
         .access_key_id
@@ -161,18 +237,96 @@ pub(crate) fn build_ids_client(global: &GlobalArgs) -> Result<IdsClient, CliErro
         .secret_access_key
         .ok_or_else(|| CliError::ConfigMissing("ADRIVE_SECRET_KEY is required".to_string()))?;
 
-    IdsClient::new(
+    Ok(AuthProvider::Aksk(AkskAuthProvider {
         access_key,
         secret_key,
-        profile.security_token,
-        profile.endpoint,
-        profile.region,
-        ClientOptions {
+        security_token: profile.security_token,
+        endpoint: profile.endpoint,
+        region: profile.region,
+        client_options: ClientOptions {
             max_retry_count: profile.max_retry_count,
             requesttimeout: profile.requesttimeout,
             connecttimeout: profile.connecttimeout,
             maxconnections: profile.maxconnections,
         },
+    }))
+}
+
+/// Inspect only the credential family selected for this invocation.
+pub(crate) fn inspect_selected_credentials(
+    global: &GlobalArgs,
+    mode: AuthMode,
+) -> Result<CredentialAvailability, CliError> {
+    // [Review Fix #6] Strict mode selection also applies to diagnostics: an
+    // OAuth check must not parse or depend on legacy AK/SK profile values.
+    if mode == AuthMode::Oauth {
+        let (oauth, credential_source) = resolve_oauth_credentials_with_source(global)?;
+        return Ok(CredentialAvailability {
+            has_access_key: None,
+            has_secret_key: None,
+            has_security_token: None,
+            has_access_token: Some(oauth.has_access_token()),
+            has_refresh_token: Some(oauth.has_refresh_token()),
+            oauth_service_integration: "not_implemented",
+            credential_source,
+        });
+    }
+
+    let profile = build_profile(global)?;
+    Ok(CredentialAvailability {
+        has_access_key: Some(profile.access_key_id.is_some()),
+        has_secret_key: Some(profile.secret_access_key.is_some()),
+        has_security_token: Some(profile.security_token.is_some()),
+        has_access_token: None,
+        has_refresh_token: None,
+        oauth_service_integration: "not_applicable",
+        credential_source: "resolved_profile",
+    })
+}
+
+fn resolve_oauth_credentials(global: &GlobalArgs) -> Result<OAuthCredentials, CliError> {
+    resolve_oauth_credentials_with_source(global).map(|(credentials, _source)| credentials)
+}
+
+fn resolve_oauth_credentials_with_source(
+    global: &GlobalArgs,
+) -> Result<(OAuthCredentials, &'static str), CliError> {
+    let credentials_path = global.existing_runtime_credentials_path()?;
+    let stored = CredentialsFile::load_from(&credentials_path)?
+        .adrive_oauth(&global.profile, &credentials_path)?;
+    let has_stored_token = !stored.is_empty();
+    let credentials = OAuthCredentials::from_stored(stored);
+    let source = if has_stored_token {
+        "credentials_file"
+    } else if credentials.has_access_token() || credentials.has_refresh_token() {
+        "environment"
+    } else {
+        "none"
+    };
+    Ok((credentials, source))
+}
+
+/// Build a real IDS REST client for ADrive operations.
+pub(crate) fn build_ids_client(
+    global: &GlobalArgs,
+    command_line_mode: Option<AuthMode>,
+) -> Result<IdsClient, CliError> {
+    let provider = build_auth_provider(global, command_line_mode)?;
+    let AuthProvider::Aksk(credentials) = provider else {
+        return Err(CliError::ValidationError(
+            "OAuth resource authentication is not implemented yet".to_string(),
+        ));
+    };
+
+    // [Review Fix #4] The AK/SK provider carries the already-resolved runtime
+    // inputs so the legacy profile is loaded exactly once per client build.
+    IdsClient::new(
+        credentials.access_key,
+        credentials.secret_key,
+        credentials.security_token,
+        credentials.endpoint,
+        credentials.region,
+        credentials.client_options,
     )
     .map_err(|err| match err {
         IdsError::Client(message) if message.contains("ADRIVE_REGION") => {

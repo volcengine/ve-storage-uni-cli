@@ -652,15 +652,14 @@ pub const CAPABILITIES: &[CapabilityEntry] = &[
         supports_output_formats: SUPPORTED_OUTPUT_FORMATS,
         parameters: TRANSFER_PARAMETERS,
         body_contract: None,
-        // [Review Fix #s3 / #X1] Guard wording is now aligned with the post-M1/M3
-        // implementation: streaming via tokio::io::copy, atomic .tos-partial-<pid>
-        // persistence, dual SHA256+CRC64 prehashing for upload, and native x-tos-*
+        // Guard wording is aligned with streaming I/O, atomic
+        // .tos-partial-<pid> persistence, SHA256 signing, and native x-tos-*
         // copy headers. Source ETag (x-tos-copy-source-if-match) and destination
         // ETag (if-match) are kept as separate guards because they target different
         // sides of CopyObject.
         consistency_guards: &[
             "download: GetObject streams via tokio::io::copy into .tos-partial-<pid> then renames atomically; honors If-Match/version_id",
-            "upload: file body is stream-hashed (SHA256 + CRC64) once, sent via Body::wrap_stream, and verified against the response x-tos-hash-crc64ecma",
+            "upload: SHA256 is computed with asynchronous file reads; retryable requests reopen the local file and rebuild Body::wrap_stream",
             "copy: CopyObject sends native x-tos-copy-source-if-match for the source ETag; if-match guards the destination ETag",
         ],
         examples: &["ve-tos cp ./file.txt tos://bucket/file.txt", "ve-tos cp tos://bucket/prefix ./dir --recursive"],
@@ -707,8 +706,8 @@ pub const CAPABILITIES: &[CapabilityEntry] = &[
         parameters: SYNC_PARAMETERS,
         body_contract: None,
         consistency_guards: &[
-            "manifest diff partitions entries into skip/copy/delete based on size + ETag (and mtime when available)",
-            "transfer phase reuses cp guards: streaming I/O, dual SHA256+CRC64 prehash, and atomic .tos-partial-<pid> persistence",
+            "in-memory inventory diff partitions entries into skip/copy/delete based on size + ETag (and mtime when available); manifest files are audit output only",
+            "transfer phase reuses cp guards: streaming I/O, asynchronous SHA256 signing, replayable file retries, and atomic .tos-partial-<pid> persistence",
             "delete phase requires --force and propagates the discovered ETag to make deletes target the snapshotted version",
             "dry-run computes scanned_count/preview_truncated; impact preview is capped to MAX_PREVIEW_OBJECTS",
         ],
@@ -942,7 +941,7 @@ pub const CAPABILITIES: &[CapabilityEntry] = &[
         consistency_guards: &[
             "interactive stdin is submitted with EOF, not Ctrl+C",
             "stdin is read in bounded chunks and never fully buffered for multipart-sized input",
-            "each uploaded part carries CRC64 and the completed object CRC64 is checked when returned",
+            "each uploaded part carries a signed SHA256 payload hash and completion records the returned ETag",
         ],
         examples: &["ve-tos cat tos://src/key | gzip | ve-tos put tos://dst/key.gz"],
         related_commands: &["ve-tos cat", "ve-tos object upload", "ve-tos multipart upload"],
@@ -1216,9 +1215,9 @@ pub const CAPABILITIES: &[CapabilityEntry] = &[
         parameters: OBJECT_UPLOAD_PARAMETERS,
         body_contract: Some("--body accepts file paths, file://, '-' (stdin), or inline strings; file inputs are stream-uploaded."),
         consistency_guards: &[
-            "file --body is stream-hashed (SHA256 + CRC64) once before signing and sent via Body::wrap_stream",
+            "file --body is SHA256-hashed with asynchronous reads before signing and sent via Body::wrap_stream",
             "stdin/inline payloads stay buffered for V4 signing and capped at the safe inline limit",
-            "response x-tos-hash-crc64ecma is verified when the client computed CRC64",
+            "retryable PutObject file bodies are reopened and re-signed for every HTTP attempt",
         ],
         examples: &[
             "ve-tos object upload tos://bucket/key --body ./payload.bin",

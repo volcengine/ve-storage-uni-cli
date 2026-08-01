@@ -191,6 +191,9 @@ regenerated for each target, while release wheels accumulate under
 `dist/pip/wheels/*.whl`. Upload the wheel files, not the last regenerated source
 tree.
 
+The PyPI channel also generates a `byted-tos-cli` compatibility distribution
+that packages the same `tos-cli` command binary.
+
 For Linux PyPI wheels, use the `.2.17` target, for example
 `x86_64-unknown-linux-gnu.2.17` or `aarch64-unknown-linux-gnu.2.17`. Those
 wheels carry the older-glibc-compatible binaries while the release script hides

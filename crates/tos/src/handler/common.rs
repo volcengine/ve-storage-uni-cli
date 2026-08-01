@@ -26,6 +26,7 @@ use tos_core::agent::error::CliError;
 use tos_core::agent::global_args::GlobalArgs;
 use tos_core::agent::output::{format_markdown, format_table, format_xml, OutputFormat};
 use tos_core::infra::config::{merge_tos_runtime_profile, Binary, ConfigFile, Profile};
+use tos_core::infra::credentials::{CredentialSection, CredentialsFile};
 
 const TOS_CONFIG_BINARY_ENV: &str = "VE_STORAGE_UNI_TOS_CONFIG_BINARY";
 
@@ -56,12 +57,22 @@ pub(crate) fn build_profile(global: &GlobalArgs) -> Result<Profile, CliError> {
         Binary::Tos => Profile::from_byte_tos_env(),
         _ => Profile::from_env(),
     };
-    let config_profile = if config.profiles.is_empty() && global.profile == "default" {
+    let credentials_path = global.existing_runtime_credentials_path()?;
+    let credentials = CredentialsFile::load_from(&credentials_path)?;
+    let credential_section = match active_binary {
+        Binary::Tos => CredentialSection::Tos,
+        _ => CredentialSection::VeTos,
+    };
+    let stored_credentials =
+        credentials.effective_aksk(&global.profile, credential_section, &credentials_path)?;
+    let mut config_profile = if config.profiles.is_empty() && global.profile == "default" {
         Profile::default()
     } else {
         match config.get_effective_profile_in_dir(&global.profile, active_binary, &config_dir) {
             Ok(effective) => effective.into_flat_profile(),
-            Err(CliError::ConfigMissing(_)) if has_tos_env_profile_values(&env_profile) => {
+            Err(CliError::ConfigMissing(_))
+                if has_tos_env_profile_values(&env_profile) || !stored_credentials.is_empty() =>
+            {
                 // [Review Fix #10] Keep runtime env-only profiles working for
                 // the active surface: `ve-tos` consumes TOS_* while the new
                 // ByteCloud `tos` consumes BYTE_TOS_*. Config-file namespaces
@@ -71,6 +82,7 @@ pub(crate) fn build_profile(global: &GlobalArgs) -> Result<Profile, CliError> {
             Err(err) => return Err(err),
         }
     };
+    stored_credentials.apply_to_profile(&mut config_profile);
 
     let cli_profile = Profile {
         region: global.region.clone(),

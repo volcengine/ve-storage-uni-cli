@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
-use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::io::{Read as IoRead, Seek, SeekFrom, Write as IoWrite};
+use std::io::{Read as IoRead, SeekFrom, Write as IoWrite};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
@@ -30,6 +30,7 @@ use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use reqwest::{Body, Method, Response};
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 use tos_core::agent::describe::{
@@ -41,7 +42,7 @@ use tos_core::agent::envelope::{Envelope, PaginationInfo};
 use tos_core::agent::error::CliError;
 use tos_core::agent::global_args::GlobalArgs;
 use tos_core::agent::output::OutputFormat;
-use tos_core::infra::auth::{hash_payload, hash_reader};
+use tos_core::infra::auth::hash_payload;
 use tos_core::infra::client::TosClient;
 use tos_core::infra::config::{
     Binary, DEFAULT_BATCH_CONCURRENCY, DEFAULT_LIST_CONCURRENCY, DEFAULT_MULTIPART_CONCURRENCY,
@@ -74,6 +75,7 @@ const DU_CATEGORY_BUCKET_LIMIT: usize = 1024;
 const DU_REQUEST_ID_LIMIT: usize = 1024;
 const DU_OVERFLOW_BUCKET: &str = "(other)";
 const DEFAULT_BATCH_FILE_ROLLOVER_BYTES: u64 = 50 * 1024 * 1024;
+const TRANSFER_REPORT_SCHEMA_VERSION: u8 = 2;
 const TOS_OBJECT_STORAGE_CLASS_VALUES: &[&str] = &[
     "STANDARD",
     "IA",
@@ -176,12 +178,16 @@ struct PlanSample {
     destination: Option<String>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Serialize)]
 struct BatchReport {
     summary: BatchSummary,
     succeeded: Vec<BatchItemResult>,
     failed: Vec<BatchItemResult>,
     skipped: Vec<BatchItemResult>,
+    #[serde(skip)]
+    streaming_sink: Option<StreamingReportSink>,
+    #[serde(skip)]
+    is_streaming: bool,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -196,17 +202,8 @@ type TosDeleteFuture<'a> = Pin<Box<dyn Future<Output = (String, Result<(), CliEr
 type TosObjectActionFuture<'a> = Pin<Box<dyn Future<Output = (String, Result<(), CliError>)> + 'a>>;
 type TosCopyFuture<'a> =
     Pin<Box<dyn Future<Output = (String, String, u64, Result<CopyTransferResult, CliError>)> + 'a>>;
-type TosMoveFuture<'a> = Pin<
-    Box<
-        dyn Future<
-                Output = (
-                    TransferPlanItem,
-                    Result<CopyTransferResult, CliError>,
-                    Option<Result<(), CliError>>,
-                ),
-            > + 'a,
-    >,
->;
+type TosMoveFuture<'a> =
+    Pin<Box<dyn Future<Output = (TransferPlanItem, Result<CopyTransferResult, CliError>)> + 'a>>;
 
 #[derive(Debug, Serialize)]
 struct BatchItemResult {
@@ -231,14 +228,40 @@ impl BatchReport {
                 planned,
                 ..BatchSummary::default()
             },
-            ..Self::default()
+            succeeded: Vec::new(),
+            failed: Vec::new(),
+            skipped: Vec::new(),
+            streaming_sink: None,
+            is_streaming: false,
         }
+    }
+
+    fn new_streaming(
+        planned: u64,
+        report_path: Option<&str>,
+        command: &str,
+        failures_only: bool,
+        manifest: Option<&TransferManifest>,
+    ) -> Result<Self, CliError> {
+        let streaming_sink = report_path
+            .map(|path| StreamingReportSink::new(path, command, failures_only, manifest))
+            .transpose()?;
+        Ok(Self {
+            summary: BatchSummary {
+                planned,
+                ..BatchSummary::default()
+            },
+            succeeded: Vec::new(),
+            failed: Vec::new(),
+            skipped: Vec::new(),
+            streaming_sink,
+            is_streaming: true,
+        })
     }
 
     fn record_success(&mut self, operation: &str, source: &str, destination: Option<&str>) {
         self.summary.succeeded += 1;
-        self.succeeded
-            .push(BatchItemResult::success(operation, source, destination));
+        self.record_item(BatchItemResult::success(operation, source, destination));
     }
 
     fn record_failure(
@@ -249,7 +272,7 @@ impl BatchReport {
         err: &CliError,
     ) {
         self.summary.failed += 1;
-        self.failed.push(BatchItemResult::failure(
+        self.record_item(BatchItemResult::failure(
             operation,
             source,
             destination,
@@ -259,8 +282,33 @@ impl BatchReport {
 
     fn record_skipped(&mut self, operation: &str, source: &str, destination: Option<&str>) {
         self.summary.skipped += 1;
-        self.skipped
-            .push(BatchItemResult::skipped(operation, source, destination));
+        self.record_item(BatchItemResult::skipped(operation, source, destination));
+    }
+
+    fn record_item(&mut self, item: BatchItemResult) {
+        if let Some(sink) = self.streaming_sink.as_mut() {
+            sink.write_item(&item);
+            return;
+        }
+        if self.is_streaming {
+            return;
+        }
+        match item.status {
+            "succeeded" => self.succeeded.push(item),
+            "failed" => self.failed.push(item),
+            "skipped" => self.skipped.push(item),
+            _ => unreachable!("batch item status is defined by constructors"),
+        }
+    }
+
+    fn reporting_failed(&self) -> bool {
+        self.streaming_sink
+            .as_ref()
+            .is_some_and(StreamingReportSink::has_error)
+    }
+
+    fn has_failures(&self) -> bool {
+        self.summary.failed > 0 || self.reporting_failed()
     }
 }
 
@@ -564,6 +612,15 @@ struct TransferRuntimeConfig {
 struct TosRecursiveListOptions {
     use_hierarchical_listing: bool,
     list_concurrency: usize,
+}
+
+// [Review Fix #1] Group recursive mapping controls so adding scan
+// observability does not keep expanding already complex function signatures.
+struct RecursiveMappingOptions<'a> {
+    include_parent: bool,
+    recursive_list_mode: Option<RecursiveListMode>,
+    list_concurrency: usize,
+    scan_progress: Option<&'a mut RemoteScanProgress>,
 }
 
 impl TransferRuntimeConfig {
@@ -870,6 +927,10 @@ struct TransferManifestItem {
     crc64: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_modified: Option<String>,
+    schema_version: u8,
+    action_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depends_on_action_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -880,7 +941,11 @@ struct TransferManifest {
 }
 
 impl TransferManifest {
-    fn from_items(items: Vec<TransferManifestItem>) -> Self {
+    fn from_items(mut items: Vec<TransferManifestItem>) -> Self {
+        for (index, item) in items.iter_mut().enumerate() {
+            item.schema_version = TRANSFER_REPORT_SCHEMA_VERSION;
+            item.action_id = index as u64 + 1;
+        }
         Self {
             object_count: items.len() as u64,
             total_size: items.iter().map(|item| item.size).sum(),
@@ -927,9 +992,9 @@ struct TransferPlanItem {
 }
 
 impl TransferPlanItem {
-    fn manifest_item(&self) -> TransferManifestItem {
+    fn manifest_item(&self, operation: &'static str) -> TransferManifestItem {
         TransferManifestItem {
-            operation: "copy",
+            operation,
             relative_key: self.relative_key.clone(),
             source: self.source.clone(),
             destination: Some(self.destination.clone()),
@@ -937,32 +1002,95 @@ impl TransferPlanItem {
             etag: self.etag.clone(),
             crc64: self.crc64,
             last_modified: self.last_modified.clone(),
+            schema_version: TRANSFER_REPORT_SCHEMA_VERSION,
+            action_id: 0,
+            depends_on_action_id: None,
         }
     }
 }
 
 fn build_transfer_manifest(items: &[TransferPlanItem]) -> TransferManifest {
-    TransferManifest::from_items(items.iter().map(TransferPlanItem::manifest_item).collect())
+    build_transfer_manifest_for_operation(items, "copy")
+}
+
+fn build_transfer_manifest_for_operation(
+    items: &[TransferPlanItem],
+    operation: &'static str,
+) -> TransferManifest {
+    TransferManifest::from_items(
+        items
+            .iter()
+            .map(|item| item.manifest_item(operation))
+            .collect(),
+    )
 }
 
 fn build_move_transfer_manifest(items: &[TransferPlanItem]) -> TransferManifest {
-    let mut manifest_items = items
-        .iter()
-        .map(TransferPlanItem::manifest_item)
-        .collect::<Vec<_>>();
-    // [Review Fix #MoveManifest] Recursive move has two planned stages. The
-    // manifest records both so the later report can be reconciled item-for-item.
-    manifest_items.extend(items.iter().map(|item| TransferManifestItem {
-        operation: "delete-source",
-        relative_key: item.relative_key.clone(),
-        source: item.source.clone(),
-        destination: None,
-        size: item.size,
-        etag: item.etag.clone(),
-        crc64: item.crc64,
-        last_modified: item.last_modified.clone(),
-    }));
+    let mut manifest_items = Vec::with_capacity(items.len().saturating_mul(2));
+    for item in items {
+        let copy_action_id = manifest_items.len() as u64 + 1;
+        manifest_items.push(item.manifest_item("copy"));
+        manifest_items.push(TransferManifestItem {
+            operation: "delete-source",
+            relative_key: item.relative_key.clone(),
+            source: item.source.clone(),
+            destination: None,
+            size: item.size,
+            etag: item.etag.clone(),
+            crc64: item.crc64,
+            last_modified: item.last_modified.clone(),
+            schema_version: TRANSFER_REPORT_SCHEMA_VERSION,
+            action_id: 0,
+            depends_on_action_id: Some(copy_action_id),
+        });
+    }
     TransferManifest::from_items(manifest_items)
+}
+
+fn append_move_source_root_action(
+    manifest: TransferManifest,
+    args: &MvArgs,
+    planned: &[TransferPlanItem],
+    use_hns_bottom_up: bool,
+) -> TransferManifest {
+    if !use_hns_bottom_up {
+        return manifest;
+    }
+    let Some((_, key, source_uri)) = tos_recursive_move_source_root(args) else {
+        return manifest;
+    };
+    if planned.iter().any(|item| item.source == source_uri) {
+        return manifest;
+    }
+    let mut items = manifest.items;
+    items.push(TransferManifestItem {
+        operation: "delete-source",
+        relative_key: key,
+        source: source_uri,
+        destination: None,
+        size: 0,
+        etag: None,
+        crc64: None,
+        last_modified: None,
+        schema_version: TRANSFER_REPORT_SCHEMA_VERSION,
+        action_id: 0,
+        depends_on_action_id: None,
+    });
+    TransferManifest::from_items(items)
+}
+
+fn record_manifest_actions_skipped(
+    report: &mut BatchReport,
+    manifest: &TransferManifest,
+    operation: &str,
+) {
+    for item in manifest
+        .items
+        .iter()
+        .filter(|item| item.operation == operation)
+    {
+        report.record_skipped(operation, &item.source, item.destination.as_deref());
+    }
 }
 
 /// Handle High-Level TOS commands.
@@ -3377,9 +3505,12 @@ async fn execute_mv_recursive_tos(
         client,
         &args.source,
         &args.destination,
-        args.include_parent,
-        args.recursive_list_mode,
-        runtime.list_concurrency,
+        RecursiveMappingOptions {
+            include_parent: args.include_parent,
+            recursive_list_mode: args.recursive_list_mode,
+            list_concurrency: runtime.list_concurrency,
+            scan_progress: Some(&mut scan_progress),
+        },
     )
     .await?
     .into_iter()
@@ -3400,7 +3531,18 @@ async fn execute_mv_recursive_tos(
         &planned,
     )?;
     scan_progress.finish_with_count(planned.len() as u64, "item(s)");
-    let manifest = build_move_transfer_manifest(&planned);
+    let use_hns_bottom_up = if args.source.starts_with("tos://") {
+        let source = parse_tos_uri(&args.source, true)?;
+        bucket_is_hns(client, &source.bucket).await?
+    } else {
+        false
+    };
+    let manifest = append_move_source_root_action(
+        build_move_transfer_manifest(&planned),
+        args,
+        &planned,
+        use_hns_bottom_up,
+    );
     write_manifest_file(manifest_path.as_deref(), "ve-tos mv", &manifest)?;
 
     let total_files = planned.len() as u64;
@@ -3409,7 +3551,13 @@ async fn execute_mv_recursive_tos(
         .iter()
         .map(|item| progress_units_for_size(item.size, runtime, true))
         .sum();
-    let mut report = BatchReport::new(manifest.object_count);
+    let mut report = BatchReport::new_streaming(
+        manifest.object_count,
+        report_path.as_deref(),
+        "ve-tos mv",
+        args.report_failures_only,
+        Some(&manifest),
+    )?;
     let mut summary = BatchProgressSummary::new(
         "ve-tos mv",
         &args.source,
@@ -3476,10 +3624,10 @@ async fn execute_mv_recursive_tos(
         bar.finish();
     }
 
-    if report.summary.failed > 0 {
-        for item in &planned {
-            report.record_skipped("delete-source", &item.source, None);
-        }
+    if report.has_failures() {
+        // [Review Fix #3] HNS fallback may add a separate source-root action
+        // beyond the listed objects; every planned delete must be accounted for.
+        record_manifest_actions_skipped(&mut report, &manifest, "delete-source");
         write_tos_batch_report(
             report_path.as_deref(),
             "ve-tos mv",
@@ -3504,6 +3652,7 @@ async fn execute_mv_recursive_tos(
         &planned,
         runtime.batch_concurrency,
         progress_enabled,
+        use_hns_bottom_up,
         &mut report,
     )
     .await?;
@@ -3619,6 +3768,16 @@ async fn execute_tos_hns_recursive_rename(
     let manifest = build_tos_recursive_rename_manifest(&plan);
     write_manifest_file(manifest_path.as_deref(), "ve-tos mv", &manifest)?;
 
+    // [Review Fix #6] Open the streaming report before issuing the atomic
+    // rename. A report initialization failure must not leave an unreported
+    // destructive operation behind.
+    let mut report = BatchReport::new_streaming(
+        1,
+        report_path.as_deref(),
+        "ve-tos mv",
+        args.report_failures_only,
+        Some(&manifest),
+    )?;
     let rename_result = core::execute_object_request(
         client,
         "ve-tos mv recursive rename",
@@ -3631,7 +3790,6 @@ async fn execute_tos_hns_recursive_rename(
     )
     .await;
 
-    let mut report = BatchReport::new(1);
     match rename_result {
         Ok(result) => finish_tos_recursive_rename_success(
             global,
@@ -3721,6 +3879,9 @@ fn build_tos_recursive_rename_manifest(plan: &TosRecursiveRenamePlan) -> Transfe
         etag: None,
         crc64: None,
         last_modified: None,
+        schema_version: TRANSFER_REPORT_SCHEMA_VERSION,
+        action_id: 0,
+        depends_on_action_id: None,
     }])
 }
 
@@ -3777,8 +3938,19 @@ async fn execute_mv_recursive_streaming_no_manifest(
     progress_enabled: bool,
 ) -> Result<i32, CliError> {
     let progress = streaming_batch_progress(progress_enabled, "ve-tos mv");
-    let mut report = BatchReport::new(0);
-    let stream_result = {
+    let mut report = BatchReport::new_streaming(
+        0,
+        report_path.as_deref(),
+        "ve-tos mv",
+        args.report_failures_only,
+        None,
+    )?;
+    let source_root = args
+        .source
+        .starts_with("tos://")
+        .then(|| tos_recursive_move_source_root(args))
+        .flatten();
+    let (stream_result, source_is_hns, deferred_directory_deletes) = {
         let mut context = TosStreamMoveContext {
             global,
             client,
@@ -3786,10 +3958,11 @@ async fn execute_mv_recursive_streaming_no_manifest(
             runtime,
             write_options,
             progress: &progress,
-            report_path: report_path.as_deref(),
             report: &mut report,
             in_flight: FuturesUnordered::new(),
             limit: runtime.batch_concurrency.max(1),
+            source_is_hns: false,
+            deferred_directory_deletes: Vec::new(),
         };
         let result = if args.source.starts_with("tos://") {
             stream_mv_tos_source_no_manifest(&mut context).await
@@ -3797,9 +3970,29 @@ async fn execute_mv_recursive_streaming_no_manifest(
             stream_mv_local_source_no_manifest(&mut context).await
         };
         context.drain_all().await;
-        result
+        (
+            result,
+            context.source_is_hns,
+            context.deferred_directory_deletes,
+        )
     };
-    let prune_result = if stream_result.is_ok() && !args.source.starts_with("tos://") {
+    finish_unmanifested_hns_move_directories(
+        client,
+        &progress,
+        &mut report,
+        source_root,
+        source_is_hns,
+        stream_result.is_ok(),
+        deferred_directory_deletes,
+    )
+    .await;
+    // [Review Fix #7] A report write failure closes the destructive-action
+    // gate, including removal of now-empty local directories.
+    let prune_result = if should_prune_move_source(
+        !args.source.starts_with("tos://"),
+        stream_result.is_ok(),
+        &report,
+    ) {
         prune_empty_directories(Path::new(&args.source))
     } else {
         Ok(())
@@ -3837,10 +4030,11 @@ struct TosStreamMoveContext<'a> {
     runtime: TransferRuntimeConfig,
     write_options: ObjectWriteOptions,
     progress: &'a Option<ProgressBar>,
-    report_path: Option<&'a str>,
     report: &'a mut BatchReport,
     in_flight: FuturesUnordered<TosMoveFuture<'a>>,
     limit: usize,
+    source_is_hns: bool,
+    deferred_directory_deletes: Vec<(TransferPlanItem, bool)>,
 }
 
 impl<'a> TosStreamMoveContext<'a> {
@@ -3854,8 +4048,6 @@ impl<'a> TosStreamMoveContext<'a> {
         let runtime = self.runtime;
         let global = self.global;
         let client = self.client;
-        let report_path = self.report_path;
-        let report_failures_only = self.args.report_failures_only;
         let checkpoint_dir = self.args.checkpoint_dir.as_deref();
         let write_options = self.write_options.clone();
         self.in_flight.push(Box::pin(async move {
@@ -3867,8 +4059,8 @@ impl<'a> TosStreamMoveContext<'a> {
                 &source,
                 &destination,
                 runtime.copy_options(
-                    report_path,
-                    report_failures_only,
+                    None,
+                    false,
                     true,
                     checkpoint_dir,
                     write_options,
@@ -3878,20 +4070,29 @@ impl<'a> TosStreamMoveContext<'a> {
                 ),
             )
             .await;
-            let delete_result = if copy_result.is_ok() {
-                Some(delete_move_source_item(client, &item).await)
-            } else {
-                None
-            };
-            (item, copy_result, delete_result)
+            (item, copy_result)
         }));
     }
 
     async fn drain_one(&mut self) -> bool {
-        let Some((item, copy_result, delete_result)) = self.in_flight.next().await else {
+        let Some((item, copy_result)) = self.in_flight.next().await else {
             return false;
         };
-        record_tos_stream_move_result(self.progress, self.report, item, copy_result, delete_result);
+        let should_delete =
+            record_tos_stream_move_copy_result(self.progress, self.report, &item, copy_result);
+        // [Review Fix #10] Every HNS directory marker must wait for all
+        // descendants, not only the source root. Defer directory deletes and
+        // execute them bottom-up after the discovery/copy phase drains.
+        if self.source_is_hns && tos_delete_key_is_directory(&tos_move_delete_sort_key(&item)) {
+            self.deferred_directory_deletes.push((item, should_delete));
+            return true;
+        }
+        let delete_result = if should_delete && !self.report.reporting_failed() {
+            Some(delete_move_source_item(self.client, &item).await)
+        } else {
+            None
+        };
+        record_tos_stream_move_delete_result(self.progress, self.report, &item, delete_result);
         true
     }
 
@@ -3959,6 +4160,7 @@ async fn stream_mv_tos_source_no_manifest(
     let parent_prefix =
         recursive_source_parent_prefix(&context.args.source, context.args.include_parent)?;
     let source_is_hns = bucket_is_hns(context.client, &source_target.bucket).await?;
+    context.source_is_hns = source_is_hns;
     if resolve_tos_recursive_list_mode(source_is_hns, context.args.recursive_list_mode) {
         stream_mv_tos_hierarchical_source(
             context,
@@ -4113,17 +4315,16 @@ async fn delete_move_source_item(
     }
 }
 
-fn record_tos_stream_move_result(
+fn record_tos_stream_move_copy_result(
     progress: &Option<ProgressBar>,
     report: &mut BatchReport,
-    item: TransferPlanItem,
+    item: &TransferPlanItem,
     copy_result: Result<CopyTransferResult, CliError>,
-    delete_result: Option<Result<(), CliError>>,
-) {
+) -> bool {
     if let Some(progress) = progress {
         progress.inc(1);
     }
-    let copy_ok = match copy_result {
+    match copy_result {
         Ok(result) if result.is_skipped() => {
             report.record_skipped("copy", &item.source, Some(&item.destination));
             true
@@ -4140,25 +4341,124 @@ fn record_tos_stream_move_result(
             );
             false
         }
-    };
-    if !copy_ok {
-        report.record_skipped("delete-source", &item.source, None);
-        if let Some(progress) = progress {
-            progress.inc(1);
-        }
-        return;
     }
+}
+
+fn record_tos_stream_move_delete_result(
+    progress: &Option<ProgressBar>,
+    report: &mut BatchReport,
+    item: &TransferPlanItem,
+    delete_result: Option<Result<(), CliError>>,
+) {
+    record_tos_stream_move_delete_action(progress, report, &item.source, delete_result);
+}
+
+fn record_tos_stream_move_delete_action(
+    progress: &Option<ProgressBar>,
+    report: &mut BatchReport,
+    source: &str,
+    delete_result: Option<Result<(), CliError>>,
+) {
     match delete_result {
-        Some(Ok(())) => report.record_success("delete-source", &item.source, None),
+        Some(Ok(())) => report.record_success("delete-source", source, None),
         Some(Err(ref err)) => {
-            report.record_failure("delete-source", &item.source, None, err);
-            eprintln!("warn: failed to delete source {}: {}", item.source, err);
+            report.record_failure("delete-source", source, None, err);
+            eprintln!("warn: failed to delete source {}: {}", source, err);
         }
-        None => report.record_skipped("delete-source", &item.source, None),
+        None => report.record_skipped("delete-source", source, None),
     }
     if let Some(progress) = progress {
         progress.inc(1);
     }
+}
+
+async fn finish_unmanifested_hns_move_directories(
+    client: &TosClient,
+    progress: &Option<ProgressBar>,
+    report: &mut BatchReport,
+    source_root: Option<(String, String, String)>,
+    source_is_hns: bool,
+    stream_succeeded: bool,
+    mut deferred_directory_deletes: Vec<(TransferPlanItem, bool)>,
+) {
+    if !source_is_hns {
+        return;
+    }
+    let source_root_was_listed = source_root.as_ref().is_some_and(|(_, _, source_uri)| {
+        deferred_directory_deletes
+            .iter()
+            .any(|(item, _)| item.source == *source_uri)
+    });
+    sort_unmanifested_hns_directory_deletes_bottom_up(&mut deferred_directory_deletes);
+    let mut can_delete_directory = stream_succeeded && !report.has_failures();
+    for (item, copy_succeeded) in deferred_directory_deletes {
+        let delete_result = if can_delete_directory && copy_succeeded && !report.reporting_failed()
+        {
+            Some(delete_move_source_item(client, &item).await)
+        } else {
+            None
+        };
+        let delete_failed = delete_result.as_ref().is_some_and(Result::is_err);
+        record_tos_stream_move_delete_result(progress, report, &item, delete_result);
+        if delete_failed || report.reporting_failed() {
+            can_delete_directory = false;
+        }
+    }
+    let Some((bucket, key, source_uri)) =
+        plan_unlisted_hns_move_root_action(report, source_root, source_root_was_listed)
+    else {
+        return;
+    };
+
+    // [Review Fix #11] HNS listings may omit the source directory marker.
+    // The root is nevertheless a known action: traversal failure records it
+    // as skipped instead of silently changing the action set.
+    let delete_result = if can_delete_directory
+        && stream_succeeded
+        && !report.has_failures()
+        && !report.reporting_failed()
+    {
+        Some(
+            delete_tos_object(client, "ve-tos mv delete-source", &bucket, &key, None)
+                .await
+                .map(|_| ()),
+        )
+    } else {
+        None
+    };
+    record_tos_stream_move_delete_action(progress, report, &source_uri, delete_result);
+}
+
+fn plan_unlisted_hns_move_root_action(
+    report: &mut BatchReport,
+    source_root: Option<(String, String, String)>,
+    source_root_was_listed: bool,
+) -> Option<(String, String, String)> {
+    if source_root_was_listed {
+        return None;
+    }
+    let source_root = source_root?;
+    report.summary.planned += 1;
+    Some(source_root)
+}
+
+fn sort_unmanifested_hns_directory_deletes_bottom_up(items: &mut [(TransferPlanItem, bool)]) {
+    items.sort_by(|(left, _), (right, _)| {
+        let left_key = tos_move_delete_sort_key(left);
+        let right_key = tos_move_delete_sort_key(right);
+        key_depth(&right_key)
+            .cmp(&key_depth(&left_key))
+            .then_with(|| right_key.len().cmp(&left_key.len()))
+            .then_with(|| left_key.cmp(&right_key))
+    });
+}
+
+fn should_prune_move_source(
+    source_is_local: bool,
+    operation_succeeded: bool,
+    report: &BatchReport,
+) -> bool {
+    source_is_local && operation_succeeded && !report.reporting_failed()
 }
 
 fn execute_mv_recursive_local(
@@ -4191,7 +4491,13 @@ fn execute_mv_recursive_local(
     )?;
     let manifest = build_move_transfer_manifest(&planned);
     write_manifest_file(manifest_path, "ve-tos mv", &manifest)?;
-    let mut report = BatchReport::new(manifest.object_count);
+    let mut report = BatchReport::new_streaming(
+        manifest.object_count,
+        report_path,
+        "ve-tos mv",
+        args.report_failures_only,
+        Some(&manifest),
+    )?;
 
     for item in &planned {
         match copy_local_to_local(
@@ -4223,12 +4529,20 @@ fn execute_mv_recursive_local(
         }
     }
 
-    if report.summary.failed > 0 {
+    if report.has_failures() {
         for item in &planned {
             report.record_skipped("delete-source", &item.source, None);
         }
     } else {
-        for item in &planned {
+        let mut pending_deletes = planned.iter();
+        while let Some(item) = pending_deletes.next() {
+            if report.reporting_failed() {
+                report.record_skipped("delete-source", &item.source, None);
+                for pending in pending_deletes {
+                    report.record_skipped("delete-source", &pending.source, None);
+                }
+                break;
+            }
             match fs::remove_file(&item.source) {
                 Ok(()) => report.record_success("delete-source", &item.source, None),
                 Err(err) => {
@@ -4237,7 +4551,11 @@ fn execute_mv_recursive_local(
                 }
             }
         }
-        prune_empty_directories(Path::new(&args.source))?;
+        // [Review Fix #7] Do not perform the final directory deletion after
+        // losing the durable report stream.
+        if should_prune_move_source(true, true, &report) {
+            prune_empty_directories(Path::new(&args.source))?;
+        }
     }
     write_tos_batch_report(report_path, "ve-tos mv", &report, args.report_failures_only)?;
     output_tos_batch_envelope(
@@ -4329,14 +4647,9 @@ async fn delete_recursive_move_sources_tos(
     planned: &[TransferPlanItem],
     batch_concurrency: usize,
     progress_enabled: bool,
+    use_hns_bottom_up: bool,
     report: &mut BatchReport,
 ) -> Result<(), CliError> {
-    let use_hns_bottom_up = if args.source.starts_with("tos://") {
-        let source = parse_tos_uri(&args.source, true)?;
-        bucket_is_hns(client, &source.bucket).await?
-    } else {
-        false
-    };
     let delete_items = ordered_recursive_move_delete_items(planned, use_hns_bottom_up);
     let del_bar = if progress_enabled && !planned.is_empty() {
         let pb = ProgressBar::new(planned.len() as u64);
@@ -4367,7 +4680,9 @@ async fn delete_recursive_move_sources_tos(
         delete_move_source_item_group(client, &delete_items, batch_concurrency, &del_bar, report)
             .await;
     }
-    if !args.source.starts_with("tos://") {
+    // [Review Fix #7] The report is the durable record of destructive move
+    // actions; a failed stream blocks subsequent directory pruning.
+    if should_prune_move_source(!args.source.starts_with("tos://"), true, report) {
         prune_empty_directories(Path::new(&args.source))?;
     }
     if let Some(bar) = del_bar {
@@ -4427,7 +4742,7 @@ async fn delete_move_source_item_group(
     let mut in_flight = FuturesUnordered::new();
     let limit = batch_concurrency.max(1);
     loop {
-        while in_flight.len() < limit {
+        while in_flight.len() < limit && !report.reporting_failed() {
             let Some(item) = pending.next() else {
                 break;
             };
@@ -4450,6 +4765,12 @@ async fn delete_move_source_item_group(
             bar.inc(1);
         }
     }
+    for item in pending {
+        report.record_skipped("delete-source", &item.source, None);
+        if let Some(bar) = progress {
+            bar.inc(1);
+        }
+    }
 }
 
 async fn delete_tos_recursive_move_source_root(
@@ -4465,6 +4786,10 @@ async fn delete_tos_recursive_move_source_root(
     // marker as a planned item; deleting it twice turns an already-successful
     // move into a false partial failure.
     if planned.iter().any(|item| item.source == source_uri) {
+        return;
+    }
+    if report.reporting_failed() {
+        report.record_skipped("delete-source", &source_uri, None);
         return;
     }
     match delete_tos_object(client, "ve-tos mv delete-source", &bucket, &key, None).await {
@@ -4749,12 +5074,17 @@ async fn execute_sync_local_to_tos(
     let mut scan_progress =
         RemoteScanProgress::new(list_echo_enabled, "ve-tos sync plan", &args.destination);
     let files = collect_local_files(source_root)?;
-    let destination_manifest =
-        list_object_entries_for_bucket(client, &destination.bucket, Some(&destination_prefix))
-            .await?
-            .into_iter()
-            .map(|entry| (entry.key.clone(), entry))
-            .collect::<HashMap<_, _>>();
+    let destination_manifest = list_object_entries_for_bucket_with_progress(
+        client,
+        &destination.bucket,
+        Some(&destination_prefix),
+        runtime.list_concurrency,
+        Some(&mut scan_progress),
+    )
+    .await?
+    .into_iter()
+    .map(|entry| (entry.key.clone(), entry))
+    .collect::<HashMap<_, _>>();
     let mut desired_keys = HashSet::new();
 
     let planned: Vec<_> = files
@@ -4808,7 +5138,7 @@ async fn execute_sync_local_to_tos(
     let mut manifest_items = planned
         .iter()
         .map(|(file, key, size)| TransferManifestItem {
-            operation: "copy",
+            operation: "sync-copy",
             relative_key: strip_tos_prefix(key, &destination_prefix).to_string(),
             source: file.to_string_lossy().into_owned(),
             destination: Some(format!("tos://{}/{}", destination.bucket, key)),
@@ -4816,6 +5146,9 @@ async fn execute_sync_local_to_tos(
             etag: None,
             crc64: None,
             last_modified: None,
+            schema_version: TRANSFER_REPORT_SCHEMA_VERSION,
+            action_id: 0,
+            depends_on_action_id: None,
         })
         .collect::<Vec<_>>();
     manifest_items.extend(extras.iter().map(|entry| TransferManifestItem {
@@ -4827,14 +5160,22 @@ async fn execute_sync_local_to_tos(
         etag: entry.etag.clone(),
         crc64: None,
         last_modified: entry.last_modified.clone(),
+        schema_version: TRANSFER_REPORT_SCHEMA_VERSION,
+        action_id: 0,
+        depends_on_action_id: None,
     }));
-    let manifest = TransferManifest {
-        object_count: manifest_items.len() as u64,
-        total_size: total_bytes,
-        items: manifest_items,
-    };
+    let mut manifest = TransferManifest::from_items(manifest_items);
+    // [Review Fix #4] Keep the existing local-to-TOS sync total-size meaning:
+    // bytes considered for upload, excluding destination-only delete actions.
+    manifest.total_size = total_bytes;
     write_manifest_file(manifest_path, "ve-tos sync", &manifest)?;
-    let mut report = BatchReport::new(manifest.object_count);
+    let mut report = BatchReport::new_streaming(
+        manifest.object_count,
+        report_path,
+        "ve-tos sync",
+        args.report_failures_only,
+        Some(&manifest),
+    )?;
     let mut summary = BatchProgressSummary::new(
         "ve-tos sync",
         &args.source,
@@ -4850,60 +5191,70 @@ async fn execute_sync_local_to_tos(
     let mut uploaded = 0_u64;
     let mut skipped = 0_u64;
     let write_options = sync_write_options(args)?;
-
-    for (file, key, local_size) in &planned {
-        if remote_sync_should_skip(*local_size, destination_manifest.get(key), args) {
-            skipped += 1;
-            summary.record_skip();
-            summary.add_bytes(*local_size);
-            report.record_skipped(
-                "sync-copy",
-                &file.to_string_lossy(),
-                Some(&format!("tos://{}/{}", destination.bucket, key)),
-            );
-            continue;
+    let overall_bar_owned = summary.overall.clone();
+    let overall_bar_ref = overall_bar_owned.as_ref();
+    let mut pending = planned.into_iter();
+    let mut in_flight = FuturesUnordered::new();
+    let max_in_flight = runtime.batch_concurrency.max(1);
+    loop {
+        while in_flight.len() < max_in_flight {
+            let Some((file, key, local_size)) = pending.next() else {
+                break;
+            };
+            let source = file.to_string_lossy().into_owned();
+            let target = format!("tos://{}/{}", destination.bucket, key);
+            if remote_sync_should_skip(local_size, destination_manifest.get(&key), args) {
+                skipped += 1;
+                summary.record_skip();
+                summary.add_bytes(local_size);
+                report.record_skipped("sync-copy", &source, Some(&target));
+                continue;
+            }
+            summary.set_current_file(&source);
+            let checkpoint_dir = args.checkpoint_dir.as_deref();
+            let write_options = write_options.clone();
+            in_flight.push(async move {
+                let result = copy_one(
+                    global,
+                    client,
+                    &source,
+                    &target,
+                    runtime.copy_options(
+                        None,
+                        false,
+                        true,
+                        checkpoint_dir,
+                        write_options,
+                        progress_enabled,
+                        true,
+                        overall_bar_ref,
+                    ),
+                )
+                .await;
+                (source, target, local_size, result)
+            });
         }
-        let target = format!("tos://{}/{}", destination.bucket, key);
-        summary.set_current_file(&file.to_string_lossy());
-        let result = copy_one(
-            global,
-            client,
-            file.to_string_lossy().as_ref(),
-            &target,
-            runtime.copy_options(
-                None,
-                false,
-                true,
-                args.checkpoint_dir.as_deref(),
-                write_options.clone(),
-                progress_enabled,
-                true,
-                summary.overall.as_ref(),
-            ),
-        )
-        .await;
+        let Some((source, target, local_size, result)) = in_flight.next().await else {
+            break;
+        };
         match result {
             Ok(result) => match result.outcome {
                 CopyOutcome::Transferred => {
-                    summary.record_success(*local_size);
-                    report.record_success("sync-copy", &file.to_string_lossy(), Some(&target));
+                    summary.record_success(local_size);
+                    report.record_success("sync-copy", &source, Some(&target));
                     uploaded += 1;
                 }
                 CopyOutcome::Skipped => {
                     summary.record_skip();
-                    summary.add_bytes(*local_size);
-                    report.record_skipped("sync-copy", &file.to_string_lossy(), Some(&target));
+                    summary.add_bytes(local_size);
+                    report.record_skipped("sync-copy", &source, Some(&target));
                     skipped += 1;
                 }
             },
             Err(err) => {
-                summary.record_failure(*local_size);
-                report.record_failure("sync-copy", &file.to_string_lossy(), Some(&target), &err);
-                eprintln!(
-                    "warn: sync upload failed source={} error={}",
-                    file.display(),
-                    err
-                );
+                summary.record_failure(local_size);
+                report.record_failure("sync-copy", &source, Some(&target), &err);
+                eprintln!("warn: sync upload failed source={} error={}", source, err);
             }
         }
     }
@@ -4912,7 +5263,7 @@ async fn execute_sync_local_to_tos(
     }
 
     let mut deleted = 0_u64;
-    if args.delete && report.summary.failed > 0 {
+    if args.delete && report.has_failures() {
         // [Review Fix #2] `sync --delete` must never delete destination extras
         // after a failed copy phase; the report keeps those planned deletions as skipped.
         for entry in extras {
@@ -4935,8 +5286,17 @@ async fn execute_sync_local_to_tos(
         } else {
             None
         };
-        for entry in extras {
+        let mut pending_deletes = extras.into_iter();
+        while let Some(entry) = pending_deletes.next() {
             let uri = format!("tos://{}/{}", destination.bucket, entry.key);
+            if report.reporting_failed() {
+                report.record_skipped("delete-extra", &uri, None);
+                for pending in pending_deletes {
+                    let pending_uri = format!("tos://{}/{}", destination.bucket, pending.key);
+                    report.record_skipped("delete-extra", &pending_uri, None);
+                }
+                break;
+            }
             match delete_tos_object(
                 client,
                 "ve-tos sync delete-extra",
@@ -5038,9 +5398,12 @@ async fn execute_cp_recursive(
         client,
         &args.source,
         &args.destination,
-        args.include_parent,
-        args.recursive_list_mode,
-        runtime.list_concurrency,
+        RecursiveMappingOptions {
+            include_parent: args.include_parent,
+            recursive_list_mode: args.recursive_list_mode,
+            list_concurrency: runtime.list_concurrency,
+            scan_progress: Some(&mut scan_progress),
+        },
     )
     .await?;
     let planned: Vec<_> = mappings
@@ -5077,7 +5440,13 @@ async fn execute_cp_recursive(
         .sum();
     let manifest = build_transfer_manifest(&planned);
     write_manifest_file(manifest_path.as_deref(), "ve-tos cp", &manifest)?;
-    let mut report = BatchReport::new(total_files);
+    let mut report = BatchReport::new_streaming(
+        total_files,
+        report_path.as_deref(),
+        "ve-tos cp",
+        args.report_failures_only,
+        Some(&manifest),
+    )?;
     let mut summary = BatchProgressSummary::new(
         "ve-tos cp",
         &args.source,
@@ -5168,7 +5537,13 @@ async fn execute_cp_recursive_streaming_no_manifest(
         progress_enabled,
     } = config;
     let progress = streaming_batch_progress(progress_enabled, "ve-tos cp");
-    let mut report = BatchReport::new(0);
+    let mut report = BatchReport::new_streaming(
+        0,
+        report_path.as_deref(),
+        "ve-tos cp",
+        args.report_failures_only,
+        None,
+    )?;
     // [Review Fix #8] Streaming discovery can fail after copy tasks were
     // queued, so always drain queued work and persist its report first.
     let stream_result = {
@@ -5179,7 +5554,6 @@ async fn execute_cp_recursive_streaming_no_manifest(
             runtime,
             write_options,
             progress: &progress,
-            report_path: report_path.as_deref(),
             report: &mut report,
             in_flight: FuturesUnordered::new(),
             limit: runtime.batch_concurrency.max(1),
@@ -5232,7 +5606,6 @@ struct TosStreamCopyContext<'a> {
     runtime: TransferRuntimeConfig,
     write_options: ObjectWriteOptions,
     progress: &'a Option<ProgressBar>,
-    report_path: Option<&'a str>,
     report: &'a mut BatchReport,
     in_flight: FuturesUnordered<TosCopyFuture<'a>>,
     limit: usize,
@@ -5252,8 +5625,6 @@ impl<'a> TosStreamCopyContext<'a> {
         let runtime = self.runtime;
         let global = self.global;
         let client = self.client;
-        let report_path = self.report_path;
-        let report_failures_only = self.args.report_failures_only;
         let checkpoint_enabled = self.args.checkpoint;
         let checkpoint_dir = self.args.checkpoint_dir.as_deref();
         let write_options = self.write_options.clone();
@@ -5264,8 +5635,8 @@ impl<'a> TosStreamCopyContext<'a> {
                 &source,
                 &destination,
                 runtime.copy_options(
-                    report_path,
-                    report_failures_only,
+                    None,
+                    false,
                     checkpoint_enabled,
                     checkpoint_dir,
                     write_options,
@@ -5617,9 +5988,12 @@ async fn execute_sync_recursive(
         client,
         &args.source,
         &args.destination,
-        args.include_parent,
-        args.recursive_list_mode,
-        runtime.list_concurrency,
+        RecursiveMappingOptions {
+            include_parent: args.include_parent,
+            recursive_list_mode: args.recursive_list_mode,
+            list_concurrency: runtime.list_concurrency,
+            scan_progress: Some(&mut scan_progress),
+        },
     )
     .await?;
     let planned: Vec<_> = mappings
@@ -5632,6 +6006,13 @@ async fn execute_sync_recursive(
             )
         })
         .collect();
+    let destination_inventory = build_sync_destination_inventory(
+        client,
+        args,
+        runtime.list_concurrency,
+        &mut scan_progress,
+    )
+    .await?;
     enforce_transfer_plan_path_traversal(
         global,
         "ve-tos sync",
@@ -5652,11 +6033,17 @@ async fn execute_sync_recursive(
         .iter()
         .map(|item| progress_units_for_size(item.size, runtime, true))
         .sum();
-    let mut manifest_items = build_transfer_manifest(&planned).items;
+    let mut manifest_items = build_transfer_manifest_for_operation(&planned, "sync-copy").items;
     manifest_items.extend(delete_plan.clone());
     let manifest = TransferManifest::from_items(manifest_items);
     write_manifest_file(manifest_path, "ve-tos sync", &manifest)?;
-    let mut report = BatchReport::new(manifest.object_count);
+    let mut report = BatchReport::new_streaming(
+        manifest.object_count,
+        report_path,
+        "ve-tos sync",
+        args.report_failures_only,
+        Some(&manifest),
+    )?;
     let mut summary = BatchProgressSummary::new(
         "ve-tos sync",
         &args.source,
@@ -5676,8 +6063,6 @@ async fn execute_sync_recursive(
     let overall_bar_owned = summary.overall.clone();
     let overall_bar_ref = overall_bar_owned.as_ref();
     let mut in_flight = FuturesUnordered::new();
-    // [Review Fix #2] Sync still does skip checks sequentially, but transfer
-    // work uses a bounded queue that drains as each copy completes.
     let max_in_flight = runtime.batch_concurrency.max(1);
     let mut pending = planned.into_iter();
 
@@ -5686,18 +6071,16 @@ async fn execute_sync_recursive(
             let Some(item) = pending.next() else {
                 break;
             };
+            if sync_item_should_skip(&item, destination_inventory.as_ref(), args)? {
+                skipped += 1;
+                summary.record_skip();
+                summary.add_bytes(item.size);
+                report.record_skipped("sync-copy", &item.source, Some(&item.destination));
+                continue;
+            }
             let source = item.source;
             let destination = item.destination;
             let bytes = item.size;
-            // Skip check must be sequential (it may HEAD the object).
-            if sync_mapping_should_skip(client, &source, &destination, args).await? {
-                skipped += 1;
-                summary.record_skip();
-                summary.add_bytes(bytes);
-                report.record_skipped("sync-copy", &source, Some(&destination));
-                continue;
-            }
-
             summary.set_current_file(&source);
 
             let checkpoint_dir = args.checkpoint_dir.as_deref();
@@ -5756,7 +6139,7 @@ async fn execute_sync_recursive(
     if let Some(bar) = &summary.overall {
         bar.finish();
     }
-    let deleted = if report.summary.failed == 0 {
+    let deleted = if !report.has_failures() {
         execute_sync_delete_plan(
             client,
             delete_plan,
@@ -5783,50 +6166,51 @@ async fn execute_sync_recursive(
     Ok((copied, skipped, deleted, failed))
 }
 
-async fn sync_mapping_should_skip(
-    client: &TosClient,
-    source: &str,
-    destination: &str,
+fn sync_item_should_skip(
+    item: &TransferPlanItem,
+    destination_inventory: Option<&HashMap<String, ObjectEntry>>,
     args: &SyncArgs,
 ) -> Result<bool, CliError> {
     match (
-        source.starts_with("tos://"),
-        destination.starts_with("tos://"),
+        item.source.starts_with("tos://"),
+        item.destination.starts_with("tos://"),
     ) {
-        (true, false) => {
-            let Some(source_entry) = object_entry_from_head(client, source).await? else {
-                return Ok(false);
-            };
-            Ok(local_destination_matches_remote(
-                destination,
-                &source_entry,
-                args,
-            )?)
-        }
+        (true, false) => local_destination_matches_remote(
+            &item.destination,
+            &object_entry_from_transfer_item(item)?,
+            args,
+        ),
         (true, true) => {
-            let Some(source_entry) = object_entry_from_head(client, source).await? else {
-                return Ok(false);
-            };
-            let Some(destination_entry) = object_entry_from_head(client, destination).await? else {
+            let Some(destination_entry) =
+                destination_inventory.and_then(|entries| entries.get(&item.destination))
+            else {
                 return Ok(false);
             };
             Ok(tos_entries_match_for_sync(
-                &source_entry,
-                &destination_entry,
+                &object_entry_from_transfer_item(item)?,
+                destination_entry,
                 args,
             ))
         }
         (false, true) => {
-            let local_size = fs::metadata(source)?.len();
-            let destination_entry = object_entry_from_head(client, destination).await?;
-            Ok(remote_sync_should_skip(
-                local_size,
-                destination_entry.as_ref(),
-                args,
-            ))
+            let local_size = fs::metadata(&item.source)?.len();
+            let destination_entry =
+                destination_inventory.and_then(|entries| entries.get(&item.destination));
+            Ok(remote_sync_should_skip(local_size, destination_entry, args))
         }
-        (false, false) => local_sync_should_skip(source, destination, args),
+        (false, false) => local_sync_should_skip(&item.source, &item.destination, args),
     }
+}
+
+fn object_entry_from_transfer_item(item: &TransferPlanItem) -> Result<ObjectEntry, CliError> {
+    let target = parse_tos_uri(&item.source, false)?;
+    Ok(ObjectEntry {
+        key: target.key.expect("validated object key"),
+        size: item.size,
+        last_modified: item.last_modified.clone(),
+        etag: item.etag.clone(),
+        storage_class: None,
+    })
 }
 
 async fn copy_one(
@@ -5895,12 +6279,10 @@ async fn upload_local_to_tos(
         )
         .await;
     }
-    // [Review Fix #8] Simple upload streams hash/CRC/body instead of buffering the file.
-    let payload_hash = file_sha256(source)?;
-    let local_crc64 = file_crc64(source)?;
+    // Compute SHA256 asynchronously, then rebuild the file stream for each HTTP attempt.
+    let payload_hash = file_sha256(source).await?;
     let headers = cp_simple_upload_headers(
         &options.write_options,
-        local_crc64,
         file_size,
         options.overwrite_strategy,
     );
@@ -5918,16 +6300,18 @@ async fn upload_local_to_tos(
     } else {
         FileProgress { bar: None }
     };
-    let response = match core::execute_object_streaming_request(
+    let response = match core::execute_object_replayable_streaming_request(
         client,
-        "ve-tos cp upload",
-        Method::PUT,
-        &target.bucket,
-        &key,
-        BTreeMap::new(),
-        headers,
-        payload_hash,
-        file_stream_body(source).await?,
+        core::ReplayableObjectRequest {
+            command: "ve-tos cp upload",
+            method: Method::PUT,
+            bucket: &target.bucket,
+            key: &key,
+            query: BTreeMap::new(),
+            headers,
+            payload_hash,
+        },
+        || file_stream_body(source),
     )
     .await
     {
@@ -5949,16 +6333,6 @@ async fn upload_local_to_tos(
             return Err(err);
         }
     };
-    if let Some(data) = &response.data {
-        if let Some(remote_crc64) = find_crc64_header(&data.headers) {
-            if remote_crc64 != local_crc64 {
-                return Err(CliError::TransferFailed(format!(
-                    "CRC64 mismatch for '{}': local={}, remote={}",
-                    source, local_crc64, remote_crc64
-                )));
-            }
-        }
-    }
     // [Review Fix #Recursive-Summary] 批量场景下静默单文件 envelope，由调用方汇总。
     // --verbose（global.verbose）保持原行为，便于排障。
     if !options.silent_per_file || global.verbose {
@@ -5986,7 +6360,6 @@ async fn upload_local_to_tos_multipart(
     let file_size = metadata.len();
     let part_size = multipart_part_size(file_size);
     let file_mtime = file_mtime_nanos(&metadata)?;
-    let local_object_crc64 = file_crc64(source)?;
     let checkpoint_path = checkpoint_path(
         options.checkpoint_dir,
         source,
@@ -6164,16 +6537,6 @@ async fn upload_local_to_tos_multipart(
         Some(complete_body),
     )
     .await?;
-    if let Some(headers) = completed.data.as_ref().map(|data| &data.headers) {
-        if let Some(remote_crc64) = find_crc64_header(headers) {
-            if remote_crc64 != local_object_crc64 {
-                return Err(CliError::TransferFailed(format!(
-                    "multipart complete CRC64 mismatch: local={}, remote={}",
-                    local_object_crc64, remote_crc64
-                )));
-            }
-        }
-    }
     if !options.silent_per_file || global.verbose {
         output_result(global, &completed)?;
     }
@@ -6201,17 +6564,18 @@ async fn upload_tos_multipart_part(
     offset: u64,
     current_size: u64,
 ) -> Result<(CompletedPart, u64), CliError> {
-    let local_crc64 = file_part_crc64(source, offset, current_size)?;
-    let uploaded = core::execute_object_streaming_request(
+    let uploaded = core::execute_object_replayable_streaming_request(
         client,
-        "ve-tos cp multipart upload-part",
-        Method::PUT,
-        bucket,
-        key,
-        multipart_part_query(upload_id, part_number),
-        cp_multipart_upload_part_headers(local_crc64, current_size),
-        file_part_sha256(source, offset, current_size)?,
-        file_part_stream_body(source, offset, current_size).await?,
+        core::ReplayableObjectRequest {
+            command: "ve-tos cp multipart upload-part",
+            method: Method::PUT,
+            bucket,
+            key,
+            query: multipart_part_query(upload_id, part_number),
+            headers: cp_multipart_upload_part_headers(current_size),
+            payload_hash: file_part_sha256(source, offset, current_size).await?,
+        },
+        || file_part_stream_body(source, offset, current_size),
     )
     .await?;
 
@@ -6220,21 +6584,13 @@ async fn upload_tos_multipart_part(
         .as_ref()
         .map(|data| &data.headers)
         .ok_or_else(|| CliError::ValidationError("UploadPart missing response data".to_string()))?;
-    if let Some(remote_crc64) = find_crc64_header(headers) {
-        if remote_crc64 != local_crc64 {
-            return Err(CliError::TransferFailed(format!(
-                "CRC64 mismatch for part {}: local={}, remote={}",
-                part_number, local_crc64, remote_crc64
-            )));
-        }
-    }
     let etag = upload_part_etag(headers)
         .ok_or_else(|| CliError::ValidationError("UploadPart response missing ETag".to_string()))?;
     Ok((
         CompletedPart {
             part_number,
             etag,
-            crc64: Some(local_crc64),
+            crc64: None,
         },
         current_size,
     ))
@@ -6242,7 +6598,6 @@ async fn upload_tos_multipart_part(
 
 fn cp_simple_upload_headers(
     write_options: &ObjectWriteOptions,
-    local_crc64: u64,
     file_size: u64,
     overwrite_strategy: EffectiveOverwriteStrategy,
 ) -> BTreeMap<String, String> {
@@ -6250,7 +6605,6 @@ fn cp_simple_upload_headers(
     // [Review Fix #1] PSM-backed ByteTOS rejects transfer-chunk bodies, so
     // high-level cp must send fixed-length PutObject requests like object upload.
     headers.insert("content-length".to_string(), file_size.to_string());
-    headers.insert("x-hash-crc64ecma".to_string(), local_crc64.to_string());
     // [Review Fix #NoClobber] Only set if-none-match when --no-clobber is specified.
     // Default behavior: overwrite existing objects (aligned with aws s3 cp).
     if overwrite_strategy == EffectiveOverwriteStrategy::NoClobber {
@@ -6259,16 +6613,10 @@ fn cp_simple_upload_headers(
     headers
 }
 
-fn cp_multipart_upload_part_headers(
-    local_crc64: u64,
-    current_size: u64,
-) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        // [Review Fix #2] UploadPart uses a bounded file slice, so pass its
-        // exact length to avoid chunked transfer on PSM-backed ByteTOS.
-        ("content-length".to_string(), current_size.to_string()),
-        ("x-hash-crc64ecma".to_string(), local_crc64.to_string()),
-    ])
+fn cp_multipart_upload_part_headers(current_size: u64) -> BTreeMap<String, String> {
+    // UploadPart uses a bounded file slice, so pass its exact length to avoid
+    // chunked transfer on PSM-backed ByteTOS.
+    BTreeMap::from([("content-length".to_string(), current_size.to_string())])
 }
 
 async fn download_tos_to_local(
@@ -7364,7 +7712,7 @@ async fn object_entry_from_head(
     let key = target.key.expect("validated object key");
     match core::execute_object_request(
         client,
-        "ve-tos sync head-manifest-entry",
+        "ve-tos cp head-destination",
         Method::HEAD,
         &target.bucket,
         &key,
@@ -7391,7 +7739,7 @@ async fn object_entry_from_head(
             }))
         }
         Err(CliError::ResourceNotFound(_)) => Ok(None),
-        Err(err) => Err(err),
+        Err(error) => Err(error),
     }
 }
 
@@ -7493,12 +7841,15 @@ fn execute_cp_recursive_local(
         &args.destination,
         &planned,
     )?;
-    write_manifest_file(
-        manifest_path,
+    let manifest = build_transfer_manifest(&planned);
+    write_manifest_file(manifest_path, "ve-tos cp", &manifest)?;
+    let mut report = BatchReport::new_streaming(
+        manifest.object_count,
+        report_path,
         "ve-tos cp",
-        &build_transfer_manifest(&planned),
+        args.report_failures_only,
+        Some(&manifest),
     )?;
-    let mut report = BatchReport::new(planned.len() as u64);
     for item in planned {
         match copy_local_to_local(
             global,
@@ -7587,11 +7938,17 @@ fn execute_sync_local_to_local(global: &GlobalArgs, args: &SyncArgs) -> Result<i
     } else {
         Vec::new()
     };
-    let mut manifest_items = build_transfer_manifest(&planned).items;
+    let mut manifest_items = build_transfer_manifest_for_operation(&planned, "sync-copy").items;
     manifest_items.extend(delete_plan.clone());
     let manifest = TransferManifest::from_items(manifest_items);
     write_manifest_file(manifest_path.as_deref(), "ve-tos sync", &manifest)?;
-    let mut report = BatchReport::new(manifest.object_count);
+    let mut report = BatchReport::new_streaming(
+        manifest.object_count,
+        report_path.as_deref(),
+        "ve-tos sync",
+        args.report_failures_only,
+        Some(&manifest),
+    )?;
     let mut copied = 0_u64;
     let mut skipped = 0_u64;
     for item in planned {
@@ -7611,14 +7968,22 @@ fn execute_sync_local_to_local(global: &GlobalArgs, args: &SyncArgs) -> Result<i
         }
     }
     let mut deleted = 0_u64;
-    if args.delete && report.summary.failed > 0 {
+    if args.delete && report.has_failures() {
         // [Review Fix #4] Local sync also treats copy failure as a hard gate for
         // `--delete`, instead of removing destination-only files after a partial copy.
         for item in delete_plan {
             report.record_skipped("delete-extra", &item.source, None);
         }
     } else if args.delete {
-        for item in delete_plan {
+        let mut pending_deletes = delete_plan.into_iter();
+        while let Some(item) = pending_deletes.next() {
+            if report.reporting_failed() {
+                report.record_skipped("delete-extra", &item.source, None);
+                for pending in pending_deletes {
+                    report.record_skipped("delete-extra", &pending.source, None);
+                }
+                break;
+            }
             match fs::remove_file(&item.source) {
                 Ok(()) => {
                     deleted += 1;
@@ -7811,12 +8176,8 @@ async fn put_tos_single_stdin_object(
     write_options: &ObjectWriteOptions,
 ) -> Result<(), CliError> {
     let body_len = body.len() as u64;
-    let mut crc = !0_u64;
-    crc64_update(&mut crc, &body);
-    let local_crc64 = !crc;
     let mut headers = write_options.headers(false);
     headers.insert("content-length".to_string(), body.len().to_string());
-    headers.insert("x-hash-crc64ecma".to_string(), local_crc64.to_string());
     if args.no_clobber {
         headers.insert("if-none-match".to_string(), "*".to_string());
     }
@@ -7832,7 +8193,6 @@ async fn put_tos_single_stdin_object(
         Body::from(body),
     )
     .await?;
-    verify_tos_crc64_response(&uploaded, local_crc64, "stdin upload")?;
     let response = uploaded.data.as_ref().ok_or_else(|| {
         CliError::ValidationError("PutObject response did not include response data".to_string())
     })?;
@@ -7888,7 +8248,7 @@ async fn put_tos_multipart_stdin_object(
     )
     .await;
     match result {
-        Ok((completed_parts, total_size, local_crc64)) => {
+        Ok((completed_parts, total_size)) => {
             // [Review Fix #1] Abort the upload when completion itself fails so
             // a retryable CompleteMultipartUpload error does not leave parts behind.
             let completed = match complete_tos_stdin_multipart(
@@ -7906,7 +8266,6 @@ async fn put_tos_multipart_stdin_object(
                     return Err(err);
                 }
             };
-            verify_tos_crc64_response(&completed, local_crc64, "stdin multipart upload")?;
             let response = completed.data.as_ref().ok_or_else(|| {
                 CliError::ValidationError(
                     "CompleteMultipartUpload response did not include response data".to_string(),
@@ -7945,9 +8304,8 @@ async fn put_tos_multipart_stdin_inner<R: AsyncRead + Unpin>(
     first_part: Vec<u8>,
     stdin: &mut R,
     progress_enabled: bool,
-) -> Result<(Vec<CompletedPart>, u64, u64), CliError> {
+) -> Result<(Vec<CompletedPart>, u64), CliError> {
     let mut completed_parts = Vec::new();
-    let mut full_crc = !0_u64;
     let mut total_size = 0_u64;
     let mut part_number = 1_u32;
     let part_size = first_part.len();
@@ -7963,7 +8321,6 @@ async fn put_tos_multipart_stdin_inner<R: AsyncRead + Unpin>(
             break;
         }
         let current_size = part.len() as u64;
-        crc64_update(&mut full_crc, &part);
         total_size += current_size;
         let completed =
             upload_tos_stdin_part(client, bucket, key, upload_id, part_number, part).await?;
@@ -7976,7 +8333,7 @@ async fn put_tos_multipart_stdin_inner<R: AsyncRead + Unpin>(
     if let Some(progress) = progress {
         progress.finish_and_clear();
     }
-    Ok((completed_parts, total_size, !full_crc))
+    Ok((completed_parts, total_size))
 }
 
 async fn upload_tos_stdin_part(
@@ -7987,9 +8344,6 @@ async fn upload_tos_stdin_part(
     part_number: u32,
     body: Vec<u8>,
 ) -> Result<CompletedPart, CliError> {
-    let mut part_crc = !0_u64;
-    crc64_update(&mut part_crc, &body);
-    let local_crc64 = !part_crc;
     let uploaded = core::execute_object_streaming_request(
         client,
         "ve-tos put multipart upload-part",
@@ -7997,15 +8351,11 @@ async fn upload_tos_stdin_part(
         bucket,
         key,
         multipart_part_query(upload_id, part_number),
-        BTreeMap::from([
-            ("content-length".to_string(), body.len().to_string()),
-            ("x-hash-crc64ecma".to_string(), local_crc64.to_string()),
-        ]),
+        BTreeMap::from([("content-length".to_string(), body.len().to_string())]),
         hash_payload(&body),
         Body::from(body),
     )
     .await?;
-    verify_tos_crc64_response(&uploaded, local_crc64, "stdin upload part")?;
     let etag = uploaded
         .data
         .as_ref()
@@ -8014,7 +8364,7 @@ async fn upload_tos_stdin_part(
     Ok(CompletedPart {
         part_number,
         etag,
-        crc64: Some(local_crc64),
+        crc64: None,
     })
 }
 
@@ -8056,24 +8406,6 @@ async fn abort_tos_multipart_upload(
         None,
     )
     .await?;
-    Ok(())
-}
-
-fn verify_tos_crc64_response(
-    response: &Envelope<core::RawResponseData>,
-    local_crc64: u64,
-    label: &str,
-) -> Result<(), CliError> {
-    if let Some(headers) = response.data.as_ref().map(|data| &data.headers) {
-        if let Some(remote_crc64) = find_crc64_header(headers) {
-            if remote_crc64 != local_crc64 {
-                return Err(CliError::TransferFailed(format!(
-                    "{} CRC64 mismatch: local={}, remote={}",
-                    label, local_crc64, remote_crc64
-                )));
-            }
-        }
-    }
     Ok(())
 }
 
@@ -8156,12 +8488,23 @@ fn finish_streaming_progress(progress: Option<ProgressBar>, total: u64) {
 
 struct RemoteScanProgress {
     bar: Option<ProgressBar>,
+    target: String,
+    prefixes_scanned: u64,
+    prefixes_discovered: u64,
+    objects_discovered: u64,
 }
 
 impl RemoteScanProgress {
     fn new(enabled: bool, label: &'static str, target: &str) -> Self {
+        let target = short_label_from(target);
         if !enabled {
-            return Self { bar: None };
+            return Self {
+                bar: None,
+                target,
+                prefixes_scanned: 0,
+                prefixes_discovered: 0,
+                objects_discovered: 0,
+            };
         }
         let bar = ProgressBar::new_spinner();
         bar.set_style(
@@ -8169,16 +8512,49 @@ impl RemoteScanProgress {
                 .unwrap_or_else(|_| ProgressStyle::default_spinner()),
         );
         bar.set_prefix(label);
-        bar.set_message(short_label_from(target));
+        bar.set_message(target.clone());
         // [Review Fix #5] Remote batch commands need visible progress while
         // ListObjects/ListVersions is still discovering the delete/restore plan.
         bar.enable_steady_tick(Duration::from_millis(200));
-        Self { bar: Some(bar) }
+        Self {
+            bar: Some(bar),
+            target,
+            prefixes_scanned: 0,
+            prefixes_discovered: 0,
+            objects_discovered: 0,
+        }
+    }
+
+    fn set_target(&mut self, target: &str) {
+        self.target = short_label_from(target);
+        self.refresh_message();
+    }
+
+    fn record_prefix_scan(&mut self, object_count: usize, child_prefix_count: usize) {
+        self.prefixes_scanned += 1;
+        self.prefixes_discovered += child_prefix_count as u64;
+        self.objects_discovered += object_count as u64;
+        self.refresh_message();
+    }
+
+    fn refresh_message(&self) {
+        if let Some(bar) = &self.bar {
+            bar.set_message(format!(
+                "{} | prefixes: {} scanned/{} found, objects: {}",
+                self.target,
+                self.prefixes_scanned,
+                self.prefixes_discovered,
+                self.objects_discovered
+            ));
+        }
     }
 
     fn finish_with_count(&mut self, count: u64, unit: &'static str) {
         if let Some(bar) = self.bar.take() {
-            bar.finish_with_message(format!("{count} {unit} discovered"));
+            bar.finish_with_message(format!(
+                "{count} {unit} discovered ({} prefixes scanned, {} objects listed)",
+                self.prefixes_scanned, self.objects_discovered
+            ));
         }
     }
 
@@ -8565,7 +8941,9 @@ fn cp_operation(args: &CpArgs) -> Result<HighLevelOperation, CliError> {
         requires_force: false,
         consistency_guards: vec![
             "download: GetObject uses If-Match or version_id and writes temp file before rename",
-            "upload: client streams CRC64 and compares it with TOS response crc64",
+            // [Review Fix #4] Runtime descriptions must match the SHA256-only
+            // high-level upload contract and must not advertise an unsupported header.
+            "upload: SHA256 is computed with asynchronous file reads; retryable requests reopen the local file stream",
             "copy: CopyObject uses copy-source-if-match when source etag is known",
             "copy: remote-to-remote copy is preflighted to same-region buckets only",
         ],
@@ -9208,7 +9586,7 @@ fn put_operation(args: &PutArgs) -> Result<HighLevelOperation, CliError> {
         consistency_guards: vec![
             "interactive stdin is submitted with EOF (Ctrl+D on Unix/macOS; Ctrl+Z then Enter on Windows), while Ctrl+C cancels the command",
             "stdin upload streams in bounded multipart chunks when input reaches multipart size",
-            "each upload part carries CRC64 and the completed object CRC64 is compared when TOS returns it",
+            "each upload part carries a signed SHA256 payload hash and completion records the returned ETag",
         ],
         low_level_apis: vec!["PutObject", "CreateMultipartUpload", "UploadPart", "CompleteMultipartUpload"],
         confirm_command: None,
@@ -11606,37 +11984,16 @@ async fn build_recursive_copy_mappings(
     client: &TosClient,
     source: &str,
     destination: &str,
-    include_parent: bool,
-    recursive_list_mode: Option<RecursiveListMode>,
-    list_concurrency: usize,
+    options: RecursiveMappingOptions<'_>,
 ) -> Result<Vec<TransferPlanItem>, CliError> {
     match (
         source.starts_with("tos://"),
         destination.starts_with("tos://"),
     ) {
-        (false, false) => build_local_source_mappings(source, destination, include_parent),
-        (false, true) => build_local_source_mappings(source, destination, include_parent),
-        (true, false) => {
-            build_tos_source_mappings(
-                client,
-                source,
-                destination,
-                include_parent,
-                recursive_list_mode,
-                list_concurrency,
-            )
-            .await
-        }
-        (true, true) => {
-            build_tos_source_mappings(
-                client,
-                source,
-                destination,
-                include_parent,
-                recursive_list_mode,
-                list_concurrency,
-            )
-            .await
+        (false, false) => build_local_source_mappings(source, destination, options.include_parent),
+        (false, true) => build_local_source_mappings(source, destination, options.include_parent),
+        (true, false) | (true, true) => {
+            build_tos_source_mappings(client, source, destination, options).await
         }
     }
 }
@@ -11696,10 +12053,14 @@ async fn build_tos_source_mappings(
     client: &TosClient,
     source: &str,
     destination: &str,
-    include_parent: bool,
-    recursive_list_mode: Option<RecursiveListMode>,
-    list_concurrency: usize,
+    options: RecursiveMappingOptions<'_>,
 ) -> Result<Vec<TransferPlanItem>, CliError> {
+    let RecursiveMappingOptions {
+        include_parent,
+        recursive_list_mode,
+        list_concurrency,
+        scan_progress,
+    } = options;
     let mut source_target = parse_tos_uri(source, true)?;
     normalize_recursive_tos_target(&mut source_target);
     let source_prefix = source_target.key.clone().unwrap_or_default();
@@ -11709,12 +12070,15 @@ async fn build_tos_source_mappings(
         resolve_tos_recursive_list_mode(source_is_hns, recursive_list_mode);
     // [Review Fix #Progress-Overall] 改用 list_object_entries 以同时拿到 Size 字段；
     // FNS 平铺列举，HNS 通过 delimiter="/" 分层展开 common prefixes。
-    let entries = list_object_entries_recursive(
+    let entries = list_object_entries_recursive_with_progress(
         client,
         &source_target.bucket,
         Some(&source_prefix),
-        use_hierarchical_listing,
-        list_concurrency,
+        TosRecursiveListOptions {
+            use_hierarchical_listing,
+            list_concurrency,
+        },
+        scan_progress,
     )
     .await?;
     build_tos_source_transfer_items(
@@ -11724,6 +12088,41 @@ async fn build_tos_source_mappings(
         parent_prefix.as_deref(),
         entries,
     )
+}
+
+async fn build_sync_destination_inventory(
+    client: &TosClient,
+    args: &SyncArgs,
+    list_concurrency: usize,
+    scan_progress: &mut RemoteScanProgress,
+) -> Result<Option<HashMap<String, ObjectEntry>>, CliError> {
+    if !args.destination.starts_with("tos://") {
+        return Ok(None);
+    }
+    let mut target = parse_tos_uri(&args.destination, true)?;
+    normalize_recursive_tos_target(&mut target);
+    scan_progress.set_target(&args.destination);
+    let prefix = target.key.clone().unwrap_or_default();
+    let is_hns = bucket_is_hns(client, &target.bucket).await?;
+    let use_hierarchical_listing =
+        resolve_tos_recursive_list_mode(is_hns, args.recursive_list_mode);
+    let entries = list_object_entries_recursive_with_progress(
+        client,
+        &target.bucket,
+        Some(&prefix),
+        TosRecursiveListOptions {
+            use_hierarchical_listing,
+            list_concurrency,
+        },
+        Some(scan_progress),
+    )
+    .await?;
+    Ok(Some(
+        entries
+            .into_iter()
+            .map(|entry| (format!("tos://{}/{}", target.bucket, entry.key), entry))
+            .collect(),
+    ))
 }
 
 fn build_tos_source_transfer_items(
@@ -11879,7 +12278,7 @@ async fn delete_sync_delete_item_group(
     let limit = batch_concurrency.max(1);
     let mut deleted = 0_u64;
     loop {
-        while in_flight.len() < limit {
+        while in_flight.len() < limit && !report.reporting_failed() {
             let Some(item) = pending.next() else {
                 break;
             };
@@ -11901,6 +12300,12 @@ async fn delete_sync_delete_item_group(
                 eprintln!("warn: sync delete-extra failed {}: {}", item.source, err);
             }
         }
+        if let Some(bar) = progress {
+            bar.inc(1);
+        }
+    }
+    for item in pending {
+        report.record_skipped("delete-extra", &item.source, None);
         if let Some(bar) = progress {
             bar.inc(1);
         }
@@ -12055,6 +12460,9 @@ fn build_local_extras_plan_from_desired(
                 etag: None,
                 crc64: None,
                 last_modified: None,
+                schema_version: TRANSFER_REPORT_SCHEMA_VERSION,
+                action_id: 0,
+                depends_on_action_id: None,
             });
         }
     }
@@ -12203,6 +12611,9 @@ async fn build_tos_extras_plan(
                 etag: entry.etag.clone(),
                 crc64: None,
                 last_modified: entry.last_modified.clone(),
+                schema_version: TRANSFER_REPORT_SCHEMA_VERSION,
+                action_id: 0,
+                depends_on_action_id: None,
             });
         }
     }
@@ -12233,14 +12644,36 @@ async fn list_object_entries_for_bucket(
     bucket: &str,
     prefix: Option<&str>,
 ) -> Result<Vec<ObjectEntry>, CliError> {
-    let use_hierarchical_listing =
-        resolve_tos_recursive_list_mode(bucket_is_hns(client, bucket).await?, None);
-    list_object_entries_recursive(
+    list_object_entries_for_bucket_with_progress(
         client,
         bucket,
         prefix,
-        use_hierarchical_listing,
         DEFAULT_LIST_CONCURRENCY,
+        None,
+    )
+    .await
+}
+
+async fn list_object_entries_for_bucket_with_progress(
+    client: &TosClient,
+    bucket: &str,
+    prefix: Option<&str>,
+    list_concurrency: usize,
+    scan_progress: Option<&mut RemoteScanProgress>,
+) -> Result<Vec<ObjectEntry>, CliError> {
+    // [Review Fix #2] Sync destination discovery must honor the command's
+    // configured list concurrency instead of silently falling back to 16.
+    let use_hierarchical_listing =
+        resolve_tos_recursive_list_mode(bucket_is_hns(client, bucket).await?, None);
+    list_object_entries_recursive_with_progress(
+        client,
+        bucket,
+        prefix,
+        TosRecursiveListOptions {
+            use_hierarchical_listing,
+            list_concurrency,
+        },
+        scan_progress,
     )
     .await
 }
@@ -12751,14 +13184,38 @@ async fn list_object_entries_recursive(
     use_hierarchical_listing: bool,
     list_concurrency: usize,
 ) -> Result<Vec<ObjectEntry>, CliError> {
-    if !use_hierarchical_listing {
-        return list_object_entries(client, bucket, prefix, None).await;
+    list_object_entries_recursive_with_progress(
+        client,
+        bucket,
+        prefix,
+        TosRecursiveListOptions {
+            use_hierarchical_listing,
+            list_concurrency,
+        },
+        None,
+    )
+    .await
+}
+
+async fn list_object_entries_recursive_with_progress(
+    client: &TosClient,
+    bucket: &str,
+    prefix: Option<&str>,
+    list_options: TosRecursiveListOptions,
+    mut scan_progress: Option<&mut RemoteScanProgress>,
+) -> Result<Vec<ObjectEntry>, CliError> {
+    if !list_options.use_hierarchical_listing {
+        let entries = list_object_entries(client, bucket, prefix, None).await?;
+        if let Some(progress) = scan_progress.as_mut() {
+            progress.record_prefix_scan(entries.len(), 0);
+        }
+        return Ok(entries);
     }
     let mut entries = Vec::new();
     let mut pending_prefixes = vec![prefix.unwrap_or("").to_string()];
     let mut seen_prefixes = HashSet::new();
     let mut in_flight = FuturesUnordered::new();
-    let limit = list_concurrency.max(1);
+    let limit = list_options.list_concurrency.max(1);
     while !pending_prefixes.is_empty() || !in_flight.is_empty() {
         while in_flight.len() < limit {
             let Some(current_prefix) = pending_prefixes.pop() else {
@@ -12773,6 +13230,9 @@ async fn list_object_entries_recursive(
             continue;
         };
         let mut scan = scan?;
+        if let Some(progress) = scan_progress.as_mut() {
+            progress.record_prefix_scan(scan.entries.len(), scan.child_prefixes.len());
+        }
         entries.append(&mut scan.entries);
         for child_prefix in scan.child_prefixes {
             if !seen_prefixes.contains(&child_prefix) {
@@ -12791,7 +13251,20 @@ async fn scan_tos_entries_prefix(
     current_prefix: String,
 ) -> Result<TosEntriesPrefixScan, CliError> {
     let (entries, child_prefixes) =
-        list_object_entries_with_prefixes(client, bucket, Some(&current_prefix), Some("/")).await?;
+        match list_object_entries_with_prefixes(client, bucket, Some(&current_prefix), Some("/"))
+            .await
+        {
+            Ok(scan) => scan,
+            Err(error) => {
+                // [Review Fix #3] Preserve the original error classification
+                // while identifying the exact prefix whose retried request failed.
+                eprintln!(
+                    "error: failed to scan tos://{}/{}: {}",
+                    bucket, current_prefix, error
+                );
+                return Err(error);
+            }
+        };
     Ok(TosEntriesPrefixScan {
         entries,
         child_prefixes,
@@ -14553,18 +15026,33 @@ pub(crate) fn partial_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{}.tos-partial-{}", file_name, std::process::id()))
 }
 
-/// [Review Fix #M4] Promoted to `pub(crate)` so low-level upload handlers
-/// can pre-compute the V4 payload hash without buffering the file body.
-pub(crate) fn file_sha256(path: &str) -> Result<String, CliError> {
-    let mut file = File::open(path)?;
-    hash_reader(&mut file).map_err(CliError::Io)
+/// Compute a local file's SHA256 using asynchronous, bounded reads.
+pub(crate) async fn file_sha256(path: &str) -> Result<String, CliError> {
+    file_range_sha256(path, 0, None).await
 }
 
-fn file_part_sha256(path: &str, offset: u64, size: u64) -> Result<String, CliError> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut limited = file.take(size);
-    hash_reader(&mut limited).map_err(CliError::Io)
+async fn file_part_sha256(path: &str, offset: u64, size: u64) -> Result<String, CliError> {
+    file_range_sha256(path, offset, Some(size)).await
+}
+
+async fn file_range_sha256(path: &str, offset: u64, size: Option<u64>) -> Result<String, CliError> {
+    let mut file = tokio::fs::File::open(path).await?;
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset)).await?;
+    }
+    let mut hasher = Sha256::new();
+    let mut remaining = size.unwrap_or(u64::MAX);
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    while remaining > 0 {
+        let read_limit = remaining.min(buffer.len() as u64) as usize;
+        let bytes_read = file.read(&mut buffer[..read_limit]).await?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+        remaining -= bytes_read as u64;
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// [Review Fix #M4] Promoted to `pub(crate)` for cross-module reuse.
@@ -14579,18 +15067,13 @@ async fn file_part_stream_body(path: &str, offset: u64, size: u64) -> Result<Bod
     Ok(Body::wrap_stream(ReaderStream::new(file.take(size))))
 }
 
-/// [Review Fix #M4] Promoted to `pub(crate)` so low-level upload handlers
-/// can stream a CRC64 over the file in a single pass.
+/// Calculate CRC64 for optional server-provided download integrity checks.
+///
+/// High-level uploads intentionally do not calculate or send CRC64 because the
+/// service upload contract supports SHA256 rather than `x-hash-crc64ecma`.
 pub(crate) fn file_crc64(path: &str) -> Result<u64, CliError> {
     let mut file = File::open(path)?;
     crc64_reader(&mut file, None)
-}
-
-fn file_part_crc64(path: &str, offset: u64, size: u64) -> Result<u64, CliError> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut limited = file.take(size);
-    crc64_reader(&mut limited, None)
 }
 
 /// [Review Fix #M1] Streaming response writer: pulls chunks via
@@ -14942,8 +15425,168 @@ const TOS_REPORT_COLUMNS: &[&str] = &[
     "error_code",
     "message",
     "retryable",
+    "schema_version",
+    "action_id",
 ];
 
+fn transfer_action_fingerprint(
+    operation: &str,
+    source: &str,
+    destination: Option<&str>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for value in [Some(operation), Some(source), destination] {
+        match value {
+            Some(value) => {
+                hasher.update([1]);
+                hasher.update((value.len() as u64).to_be_bytes());
+                hasher.update(value.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+    hasher.finalize().into()
+}
+
+#[derive(Debug, Default)]
+struct ManifestActionIds {
+    first: Option<u64>,
+    duplicates: VecDeque<u64>,
+}
+
+impl ManifestActionIds {
+    fn push(&mut self, action_id: u64) {
+        if self.first.is_none() {
+            self.first = Some(action_id);
+        } else {
+            self.duplicates.push_back(action_id);
+        }
+    }
+
+    fn pop(&mut self) -> Option<u64> {
+        self.first.take().or_else(|| self.duplicates.pop_front())
+    }
+
+    fn len(&self) -> usize {
+        usize::from(self.first.is_some()) + self.duplicates.len()
+    }
+}
+
+#[derive(Debug)]
+struct StreamingReportSink {
+    writer: RollingCsvWriter,
+    command: String,
+    failures_only: bool,
+    action_ids: HashMap<[u8; 32], ManifestActionIds>,
+    next_unplanned_action_id: u64,
+    requires_manifest_match: bool,
+    first_error: Option<String>,
+}
+
+impl StreamingReportSink {
+    fn new(
+        report_path: &str,
+        command: &str,
+        failures_only: bool,
+        manifest: Option<&TransferManifest>,
+    ) -> Result<Self, CliError> {
+        let mut action_ids = HashMap::<[u8; 32], ManifestActionIds>::new();
+        let mut next_unplanned_action_id = 1;
+        if let Some(manifest) = manifest {
+            for item in &manifest.items {
+                action_ids
+                    .entry(transfer_action_fingerprint(
+                        item.operation,
+                        &item.source,
+                        item.destination.as_deref(),
+                    ))
+                    .or_default()
+                    .push(item.action_id);
+                next_unplanned_action_id =
+                    next_unplanned_action_id.max(item.action_id.saturating_add(1));
+            }
+        }
+        Ok(Self {
+            writer: RollingCsvWriter::new(report_path, TOS_REPORT_COLUMNS)?,
+            command: command.to_string(),
+            failures_only,
+            action_ids,
+            next_unplanned_action_id,
+            requires_manifest_match: manifest.is_some(),
+            first_error: None,
+        })
+    }
+
+    fn write_item(&mut self, item: &BatchItemResult) {
+        let Some(action_id) = self.resolve_action_id(item) else {
+            return;
+        };
+        if self.failures_only && item.status != "failed" {
+            return;
+        }
+        let record = tos_report_record(&self.command, item, Some(action_id));
+        if let Err(err) = self.writer.write_record(&record) {
+            self.remember_error(err.to_string());
+        }
+    }
+
+    fn resolve_action_id(&mut self, item: &BatchItemResult) -> Option<u64> {
+        let key =
+            transfer_action_fingerprint(&item.operation, &item.source, item.destination.as_deref());
+        if let Some(action_id) = self
+            .action_ids
+            .get_mut(&key)
+            .and_then(ManifestActionIds::pop)
+        {
+            return Some(action_id);
+        }
+        if self.requires_manifest_match {
+            self.remember_error(format!(
+                "report action is missing from manifest: operation={} source={} destination={}",
+                item.operation,
+                item.source,
+                item.destination.as_deref().unwrap_or("")
+            ));
+            return None;
+        }
+        let action_id = self.next_unplanned_action_id;
+        self.next_unplanned_action_id = self.next_unplanned_action_id.saturating_add(1);
+        Some(action_id)
+    }
+
+    fn remember_error(&mut self, message: String) {
+        if self.first_error.is_none() {
+            self.first_error = Some(message);
+        }
+    }
+
+    fn has_error(&self) -> bool {
+        self.first_error.is_some()
+    }
+
+    fn error(&self) -> Option<CliError> {
+        if let Some(message) = &self.first_error {
+            return Some(CliError::Io(std::io::Error::other(format!(
+                "failed to stream transfer report: {message}"
+            ))));
+        }
+        let unresolved_actions = self
+            .action_ids
+            .values()
+            .map(ManifestActionIds::len)
+            .sum::<usize>();
+        // [Review Fix #1] A successful finalization must account for every
+        // manifest action, even though concurrent completion order is arbitrary.
+        if self.requires_manifest_match && unresolved_actions > 0 {
+            return Some(CliError::TransferFailed(format!(
+                "transfer report is missing {unresolved_actions} manifest action result(s)"
+            )));
+        }
+        None
+    }
+}
+
+#[derive(Debug)]
 struct RollingCsvWriter {
     base_path: PathBuf,
     header_line: String,
@@ -14962,6 +15605,9 @@ impl RollingCsvWriter {
         {
             fs::create_dir_all(parent)?;
         }
+        // [Review Fix #2] Reusing an explicit path must not expose rolled
+        // parts left by a larger previous run as results of the new run.
+        remove_stale_rolled_csv_parts(&base_path)?;
         let header_line = csv_record(headers.iter().copied());
         let (current_file, current_bytes) = Self::open_part(&base_path, 1, &header_line, true)?;
         Ok(Self {
@@ -15021,6 +15667,42 @@ impl RollingCsvWriter {
     }
 }
 
+fn remove_stale_rolled_csv_parts(base_path: &Path) -> Result<(), CliError> {
+    let parent = base_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stem = base_path
+        .file_stem()
+        .or_else(|| base_path.file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("report");
+    let prefix = format!("{stem}.part-");
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(part_number) = file_name
+            .strip_prefix(&prefix)
+            .and_then(|value| value.strip_suffix(".csv"))
+        else {
+            continue;
+        };
+        // [Review Fix #9] Part numbers exceed four digits after part 9999;
+        // remove every generated numeric rollover part, regardless of width.
+        let is_generated_part = part_number
+            .parse::<usize>()
+            .is_ok_and(|part| part >= 2 && part_number == format!("{part:04}"));
+        if is_generated_part {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 fn rolled_csv_path(base_path: &Path, part: usize) -> PathBuf {
     if part == 1 {
         return base_path.to_path_buf();
@@ -15063,7 +15745,11 @@ fn append_tos_report_record(report_path: &str, fields: &[String]) -> Result<(), 
     Ok(())
 }
 
-fn tos_report_record(command: &str, item: &BatchItemResult) -> [String; 9] {
+fn tos_report_record(
+    command: &str,
+    item: &BatchItemResult,
+    action_id: Option<u64>,
+) -> [String; 11] {
     [
         command.to_string(),
         item.operation.clone(),
@@ -15076,6 +15762,8 @@ fn tos_report_record(command: &str, item: &BatchItemResult) -> [String; 9] {
             .unwrap_or_default(),
         item.message.clone().unwrap_or_default(),
         item.retryable.to_string(),
+        TRANSFER_REPORT_SCHEMA_VERSION.to_string(),
+        action_id.map(|value| value.to_string()).unwrap_or_default(),
     ]
 }
 
@@ -15101,6 +15789,8 @@ fn write_single_report(
             String::new(),
             String::new(),
             "false".to_string(),
+            TRANSFER_REPORT_SCHEMA_VERSION.to_string(),
+            String::new(),
         ],
     )
 }
@@ -15125,6 +15815,9 @@ fn write_manifest_file(
             "etag",
             "crc64",
             "last_modified",
+            "schema_version",
+            "action_id",
+            "depends_on_action_id",
         ],
     )?;
     for item in &manifest.items {
@@ -15140,6 +15833,11 @@ fn write_manifest_file(
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
             item.last_modified.clone().unwrap_or_default(),
+            item.schema_version.to_string(),
+            item.action_id.to_string(),
+            item.depends_on_action_id
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
         ])?;
     }
     Ok(())
@@ -15192,17 +15890,27 @@ fn write_tos_batch_report(
     let Some(report_path) = report_path else {
         return Ok(());
     };
+    if report.is_streaming {
+        if let Some(err) = report
+            .streaming_sink
+            .as_ref()
+            .and_then(StreamingReportSink::error)
+        {
+            return Err(err);
+        }
+        return Ok(());
+    }
     let mut writer = RollingCsvWriter::new(report_path, TOS_REPORT_COLUMNS)?;
     if !failures_only {
         for item in &report.succeeded {
-            writer.write_record(&tos_report_record(command, item))?;
+            writer.write_record(&tos_report_record(command, item, None))?;
         }
         for item in &report.skipped {
-            writer.write_record(&tos_report_record(command, item))?;
+            writer.write_record(&tos_report_record(command, item, None))?;
         }
     }
     for item in &report.failed {
-        writer.write_record(&tos_report_record(command, item))?;
+        writer.write_record(&tos_report_record(command, item, None))?;
     }
     Ok(())
 }
@@ -15325,9 +16033,7 @@ fn write_error_report(
             err.exit_code().as_i32().to_string(),
             err.to_string(),
             is_retryable_error(err).to_string(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TRANSFER_REPORT_SCHEMA_VERSION.to_string(),
             String::new(),
         ],
     )
@@ -15366,8 +16072,8 @@ fn is_retryable_error(err: &CliError) -> bool {
 //   * XorOut = 0xFFFFFFFFFFFFFFFF（Go update() 出口的 `return ^crc`）
 // 由 `crc64_reader` / `crc64_ecma` 在边界处统一处理 init/xor 反转，
 // 让 `crc64_update` 保持为纯增量更新器，方便分片场景拼接。
-// 此修复对齐 TOS 服务端复算 x-hash-crc64ecma 的方式（见 ve-tos-golang-sdk/tos/consts.go:
-// DefaultCrcTable = crc64.MakeTable(crc64.ECMA)），消除既往 PUT 请求触发的 HTTP 400 [BadDigest]。
+// 保留该算法仅用于兼容旧 checkpoint/manifest，以及校验服务端在下载响应中
+// 可选返回的历史 CRC64 字段；上传请求不再发送 x-hash-crc64ecma。
 #[cfg(test)]
 fn crc64_ecma(bytes: &[u8]) -> u64 {
     let mut crc = !0_u64;
@@ -15652,6 +16358,9 @@ mod tests {
             etag: None,
             crc64: None,
             last_modified: None,
+            schema_version: TRANSFER_REPORT_SCHEMA_VERSION,
+            action_id: 0,
+            depends_on_action_id: None,
         }
     }
 
@@ -16126,6 +16835,394 @@ mod tests {
         assert_eq!(body.lines().count(), 2);
         assert!(body.contains(",failed,"));
         assert!(!body.contains("a.txt"));
+    }
+
+    #[test]
+    fn test_transfer_manifest_appends_action_identity_columns() {
+        let dir = temp_dir("tos-manifest-action-columns");
+        let manifest_path = dir.join("manifest.csv");
+        let manifest = build_transfer_manifest(&[test_plan_item("tos://bucket/a.txt")]);
+
+        write_manifest_file(manifest_path.to_str(), "ve-tos cp", &manifest)
+            .expect("write manifest");
+
+        let body = fs::read_to_string(&manifest_path).expect("read manifest");
+        let mut lines = body.lines();
+        assert_eq!(
+            lines.next(),
+            Some(
+                "command,operation,relative_key,source,destination,size,etag,crc64,last_modified,schema_version,action_id,depends_on_action_id"
+            )
+        );
+        assert!(lines.next().expect("manifest row").ends_with(",2,1,"));
+    }
+
+    #[test]
+    fn test_move_manifest_records_one_dependent_delete_action_per_copy() {
+        let manifest = build_move_transfer_manifest(&[
+            test_plan_item("tos://bucket/a.txt"),
+            test_plan_item("tos://bucket/b.txt"),
+        ]);
+
+        assert_eq!(manifest.items.len(), 4);
+        for actions in manifest.items.chunks_exact(2) {
+            assert_eq!(actions[0].operation, "copy");
+            assert_eq!(actions[1].operation, "delete-source");
+            assert_eq!(actions[1].source, actions[0].source);
+            assert_eq!(actions[1].depends_on_action_id, Some(actions[0].action_id));
+        }
+    }
+
+    #[test]
+    fn test_streaming_report_writes_completed_action_before_finalization() {
+        let dir = temp_dir("tos-report-streaming");
+        let report_path = dir.join("report.csv");
+        let manifest = build_transfer_manifest(&[test_plan_item("tos://bucket/a.txt")]);
+        let mut report = BatchReport::new_streaming(
+            manifest.object_count,
+            report_path.to_str(),
+            "ve-tos cp",
+            false,
+            Some(&manifest),
+        )
+        .expect("create streaming report");
+
+        report.record_success("copy", "tos://bucket/a.txt", Some("tos://bucket/dst"));
+
+        let body = fs::read_to_string(&report_path).expect("read active report");
+        assert_eq!(body.lines().count(), 2);
+        assert!(body.contains(",succeeded,"));
+        assert!(report.succeeded.is_empty());
+    }
+
+    #[test]
+    fn test_streaming_report_uses_action_id_when_results_finish_out_of_order() {
+        let dir = temp_dir("tos-report-out-of-order");
+        let report_path = dir.join("report.csv");
+        let manifest = build_transfer_manifest(&[
+            test_plan_item("tos://bucket/a.txt"),
+            test_plan_item("tos://bucket/b.txt"),
+        ]);
+        let mut report = BatchReport::new_streaming(
+            manifest.object_count,
+            report_path.to_str(),
+            "ve-tos cp",
+            false,
+            Some(&manifest),
+        )
+        .expect("create streaming report");
+
+        report.record_success("copy", "tos://bucket/b.txt", Some("tos://bucket/dst"));
+        report.record_success("copy", "tos://bucket/a.txt", Some("tos://bucket/dst"));
+
+        let body = fs::read_to_string(&report_path).expect("read report");
+        let action_ids = body
+            .lines()
+            .skip(1)
+            .map(|line| {
+                line.rsplit(',')
+                    .next()
+                    .expect("action id column")
+                    .parse::<u64>()
+                    .expect("numeric action id")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(action_ids, vec![2, 1]);
+    }
+
+    #[test]
+    fn test_streaming_report_preserves_distinct_ids_for_duplicate_action_keys() {
+        let dir = temp_dir("tos-report-duplicate-actions");
+        let report_path = dir.join("report.csv");
+        let manifest = build_transfer_manifest(&[
+            test_plan_item("tos://bucket/a.txt"),
+            test_plan_item("tos://bucket/a.txt"),
+        ]);
+        let mut report = BatchReport::new_streaming(
+            manifest.object_count,
+            report_path.to_str(),
+            "ve-tos cp",
+            false,
+            Some(&manifest),
+        )
+        .expect("create streaming report");
+
+        for _ in 0..2 {
+            report.record_success("copy", "tos://bucket/a.txt", Some("tos://bucket/dst"));
+        }
+
+        let body = fs::read_to_string(&report_path).expect("read report");
+        let action_ids = body
+            .lines()
+            .skip(1)
+            .map(|line| line.rsplit(',').next().expect("action id"))
+            .collect::<Vec<_>>();
+        assert_eq!(action_ids, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn test_streaming_failures_only_filters_rows_without_changing_summary() {
+        let dir = temp_dir("tos-report-streaming-failures-only");
+        let report_path = dir.join("report.csv");
+        let manifest = build_transfer_manifest(&[
+            test_plan_item("tos://bucket/a.txt"),
+            test_plan_item("tos://bucket/b.txt"),
+        ]);
+        let mut report = BatchReport::new_streaming(
+            manifest.object_count,
+            report_path.to_str(),
+            "ve-tos cp",
+            true,
+            Some(&manifest),
+        )
+        .expect("create streaming report");
+
+        report.record_success("copy", "tos://bucket/a.txt", Some("tos://bucket/dst"));
+        report.record_failure(
+            "copy",
+            "tos://bucket/b.txt",
+            Some("tos://bucket/dst"),
+            &CliError::TransferFailed("boom".to_string()),
+        );
+
+        let body = fs::read_to_string(&report_path).expect("read report");
+        assert_eq!(report.summary.succeeded, 1);
+        assert_eq!(report.summary.failed, 1);
+        assert_eq!(body.lines().count(), 2);
+        assert!(!body.contains("a.txt"));
+        assert!(body.contains("b.txt"));
+    }
+
+    #[test]
+    fn test_streaming_report_rolls_complete_csv_records_by_size() {
+        let dir = temp_dir("tos-report-streaming-rollover");
+        let report_path = dir.join("report.csv");
+        let manifest = build_transfer_manifest(&[
+            test_plan_item("tos://bucket/a.txt"),
+            test_plan_item("tos://bucket/b.txt"),
+        ]);
+        let mut report = BatchReport::new_streaming(
+            manifest.object_count,
+            report_path.to_str(),
+            "ve-tos cp",
+            false,
+            Some(&manifest),
+        )
+        .expect("create streaming report");
+
+        report.record_success("copy", "tos://bucket/a.txt", Some("tos://bucket/dst"));
+        let sink = report.streaming_sink.as_mut().expect("streaming sink");
+        sink.writer.max_bytes = sink.writer.current_bytes + 1;
+        report.record_success("copy", "tos://bucket/b.txt", Some("tos://bucket/dst"));
+
+        let first = fs::read_to_string(&report_path).expect("read first report part");
+        let second =
+            fs::read_to_string(rolled_csv_path(&report_path, 2)).expect("read second report part");
+        assert_eq!(first.lines().count(), 2);
+        assert_eq!(second.lines().count(), 2);
+        assert_eq!(first.lines().next(), second.lines().next());
+        assert!(first.contains("a.txt"));
+        assert!(second.contains("b.txt"));
+    }
+
+    #[test]
+    fn test_streaming_report_removes_stale_rolled_parts_on_reuse() {
+        let dir = temp_dir("tos-report-streaming-stale-rollover");
+        let report_path = dir.join("report.csv");
+        let stale_part = rolled_csv_path(&report_path, 2);
+        let wide_stale_part = rolled_csv_path(&report_path, 10_000);
+        let noncanonical_numeric_file = dir.join("report.part-2.csv");
+        fs::write(&report_path, "old base").expect("write old base");
+        fs::write(&stale_part, "old part").expect("write stale part");
+        fs::write(&wide_stale_part, "old wide part").expect("write wide stale part");
+        fs::write(&noncanonical_numeric_file, "unrelated").expect("write unrelated file");
+        let manifest = build_transfer_manifest(&[test_plan_item("tos://bucket/a.txt")]);
+
+        let mut report = BatchReport::new_streaming(
+            manifest.object_count,
+            report_path.to_str(),
+            "ve-tos cp",
+            false,
+            Some(&manifest),
+        )
+        .expect("create streaming report");
+        report.record_success("copy", "tos://bucket/a.txt", Some("tos://bucket/dst"));
+
+        assert!(!stale_part.exists());
+        assert!(!wide_stale_part.exists());
+        assert!(noncanonical_numeric_file.exists());
+        let body = fs::read_to_string(&report_path).expect("read new report");
+        assert!(!body.contains("old base"));
+        assert!(body.contains("a.txt"));
+    }
+
+    #[test]
+    fn test_streaming_report_write_error_sets_destructive_action_gate() {
+        let dir = temp_dir("tos-report-streaming-write-error");
+        let report_path = dir.join("report.csv");
+        let manifest = build_transfer_manifest(&[test_plan_item("tos://bucket/a.txt")]);
+        let mut report = BatchReport::new_streaming(
+            manifest.object_count,
+            report_path.to_str(),
+            "ve-tos cp",
+            false,
+            Some(&manifest),
+        )
+        .expect("create streaming report");
+        let read_only_file = OpenOptions::new()
+            .read(true)
+            .open(&report_path)
+            .expect("open report read-only");
+        report
+            .streaming_sink
+            .as_mut()
+            .expect("streaming sink")
+            .writer
+            .current_file = read_only_file;
+
+        report.record_success("copy", "tos://bucket/a.txt", Some("tos://bucket/dst"));
+
+        assert!(report.reporting_failed());
+        assert!(report.has_failures());
+        assert!(!should_prune_move_source(true, true, &report));
+        assert!(
+            write_tos_batch_report(report_path.to_str(), "ve-tos cp", &report, false,).is_err()
+        );
+    }
+
+    #[test]
+    fn test_move_cleanup_gates_allow_only_safe_follow_up_deletes() {
+        let report = BatchReport::new(1);
+
+        assert!(should_prune_move_source(true, true, &report));
+        assert!(!should_prune_move_source(false, true, &report));
+        assert!(!should_prune_move_source(true, false, &report));
+    }
+
+    #[test]
+    fn test_unmanifested_hns_directory_deletes_are_bottom_up() {
+        let mut directories = vec![
+            (test_plan_item("tos://bucket/root/"), true),
+            (test_plan_item("tos://bucket/root/a/"), true),
+            (test_plan_item("tos://bucket/root/a/b/"), true),
+            (test_plan_item("tos://bucket/root/c/"), true),
+        ];
+
+        sort_unmanifested_hns_directory_deletes_bottom_up(&mut directories);
+
+        let sources = directories
+            .iter()
+            .map(|(item, _)| item.source.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sources,
+            vec![
+                "tos://bucket/root/a/b/",
+                "tos://bucket/root/a/",
+                "tos://bucket/root/c/",
+                "tos://bucket/root/",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unlisted_hns_root_is_recorded_skipped_after_traversal_failure() {
+        let dir = temp_dir("tos-hns-unlisted-root-skipped");
+        let report_path = dir.join("report.csv");
+        let mut report =
+            BatchReport::new_streaming(0, report_path.to_str(), "ve-tos mv", false, None)
+                .expect("create streaming report");
+        let source_root = Some((
+            "bucket".to_string(),
+            "root/".to_string(),
+            "tos://bucket/root/".to_string(),
+        ));
+
+        let (_, _, source_uri) =
+            plan_unlisted_hns_move_root_action(&mut report, source_root, false)
+                .expect("unlisted root action");
+        record_tos_stream_move_delete_action(&None, &mut report, &source_uri, None);
+
+        let body = fs::read_to_string(&report_path).expect("read report");
+        assert_eq!(report.summary.planned, 1);
+        assert_eq!(report.summary.skipped, 1);
+        assert_eq!(body.lines().count(), 2);
+        assert!(body.contains("delete-source,tos://bucket/root/,,skipped"));
+    }
+
+    #[test]
+    fn test_streaming_report_finalization_rejects_missing_manifest_actions() {
+        let dir = temp_dir("tos-report-streaming-missing-action");
+        let report_path = dir.join("report.csv");
+        let manifest = build_transfer_manifest(&[
+            test_plan_item("tos://bucket/a.txt"),
+            test_plan_item("tos://bucket/b.txt"),
+        ]);
+        let mut report = BatchReport::new_streaming(
+            manifest.object_count,
+            report_path.to_str(),
+            "ve-tos cp",
+            false,
+            Some(&manifest),
+        )
+        .expect("create streaming report");
+        report.record_success("copy", "tos://bucket/a.txt", Some("tos://bucket/dst"));
+
+        let err = write_tos_batch_report(report_path.to_str(), "ve-tos cp", &report, false)
+            .expect_err("missing action must fail finalization");
+        assert!(err.to_string().contains("missing 1 manifest action"));
+    }
+
+    #[test]
+    fn test_hns_move_manifest_includes_separate_source_root_delete_action() {
+        let args = mv_args("tos://bucket/root/", "tos://bucket/destination/", true);
+        let planned = vec![test_plan_item("tos://bucket/root/a.txt")];
+        let manifest = append_move_source_root_action(
+            build_move_transfer_manifest(&planned),
+            &args,
+            &planned,
+            true,
+        );
+
+        assert_eq!(manifest.items.len(), 3);
+        let root_delete = manifest.items.last().expect("root delete action");
+        assert_eq!(root_delete.operation, "delete-source");
+        assert_eq!(root_delete.source, "tos://bucket/root/");
+        assert_eq!(root_delete.action_id, 3);
+    }
+
+    #[test]
+    fn test_hns_move_copy_failure_accounts_for_source_root_action() {
+        let dir = temp_dir("tos-hns-move-root-skipped");
+        let report_path = dir.join("report.csv");
+        let args = mv_args("tos://bucket/root/", "tos://bucket/destination/", true);
+        let planned = vec![test_plan_item("tos://bucket/root/a.txt")];
+        let manifest = append_move_source_root_action(
+            build_move_transfer_manifest(&planned),
+            &args,
+            &planned,
+            true,
+        );
+        let mut report = BatchReport::new_streaming(
+            manifest.object_count,
+            report_path.to_str(),
+            "ve-tos mv",
+            false,
+            Some(&manifest),
+        )
+        .expect("create streaming report");
+        report.record_failure(
+            "copy",
+            &planned[0].source,
+            Some(&planned[0].destination),
+            &CliError::TransferFailed("copy failed".to_string()),
+        );
+        record_manifest_actions_skipped(&mut report, &manifest, "delete-source");
+
+        write_tos_batch_report(report_path.to_str(), "ve-tos mv", &report, false)
+            .expect("all manifest actions accounted for");
+        assert_eq!(report.summary.failed, 1);
+        assert_eq!(report.summary.skipped, 2);
     }
 
     #[test]
@@ -16905,7 +18002,6 @@ mod tests {
     fn test_tos_cp_simple_upload_headers_include_content_length() {
         let headers = cp_simple_upload_headers(
             &ObjectWriteOptions::default(),
-            12345,
             42,
             EffectiveOverwriteStrategy::Force,
         );
@@ -16914,24 +18010,53 @@ mod tests {
             headers.get("content-length").map(String::as_str),
             Some("42")
         );
-        assert_eq!(
-            headers.get("x-hash-crc64ecma").map(String::as_str),
-            Some("12345")
-        );
+        assert!(!headers.contains_key("x-hash-crc64ecma"));
     }
 
     #[test]
     fn test_tos_cp_multipart_part_headers_include_content_length() {
-        let headers = cp_multipart_upload_part_headers(12345, 64);
+        let headers = cp_multipart_upload_part_headers(64);
 
         assert_eq!(
             headers.get("content-length").map(String::as_str),
             Some("64")
         );
-        assert_eq!(
-            headers.get("x-hash-crc64ecma").map(String::as_str),
-            Some("12345")
-        );
+        assert!(!headers.contains_key("x-hash-crc64ecma"));
+    }
+
+    #[test]
+    fn test_high_level_upload_descriptions_do_not_advertise_crc64() {
+        let cp = cp_operation(&cp_args(
+            "/tmp/source.bin",
+            "tos://bucket/source.bin",
+            false,
+        ))
+        .expect("cp operation");
+        let put = put_operation(&PutArgs {
+            path: Some("tos://bucket/stdin.bin".to_string()),
+            bucket: None,
+            key: None,
+            content_type: None,
+            storage_class: None,
+            acl: None,
+            meta: None,
+            multipart_threshold: None,
+            no_clobber: false,
+            progress: false,
+            no_progress: true,
+        })
+        .expect("put operation");
+
+        for guard in cp
+            .consistency_guards
+            .iter()
+            .chain(put.consistency_guards.iter())
+        {
+            assert!(
+                !guard.to_ascii_lowercase().contains("crc64"),
+                "unsupported upload CRC64 advertised by: {guard}"
+            );
+        }
     }
 
     #[test]
@@ -17224,13 +18349,28 @@ mod tests {
         );
     }
 
-    // [Review Fix #CRC64-XZ] 锁定 CLI 的 CRC64 实现与 TOS 服务端 (Go hash/crc64.ECMA = CRC-64/XZ) 同源。
-    // 这些向量是 Go 标准库 crc64.New(crc64.MakeTable(crc64.ECMA)) 在相同输入下的输出值
-    // （含 init = 0xFFFFFFFFFFFFFFFF / xorOut = 0xFFFFFFFFFFFFFFFF），等同于 TOS 服务端复算
-    // x-hash-crc64ecma 的方式。其中 "123456789" => 0x995DC9BBDF1939FA 是 CRC-64/XZ 公认基准向量。
-    // 任何破坏对齐的改动会立即被本测试拦截。
+    #[tokio::test]
+    async fn test_async_file_sha256_hashes_full_file_and_part() {
+        let dir = temp_dir("async-sha256");
+        let path = dir.join("object.bin");
+        fs::write(&path, b"prefix-payload-suffix").expect("write file");
+        let path = path.to_string_lossy();
+
+        assert_eq!(
+            file_sha256(&path).await.expect("full hash"),
+            hash_payload(b"prefix-payload-suffix")
+        );
+        assert_eq!(
+            file_part_sha256(&path, 7, 7).await.expect("part hash"),
+            hash_payload(b"payload")
+        );
+    }
+
+    // [Review Fix #CRC64-XZ] 锁定兼容读取路径使用的 CRC-64/XZ 算法。
+    // 这些向量来自 Go 标准库 crc64.New(crc64.MakeTable(crc64.ECMA))；
+    // 任何破坏旧 checkpoint/manifest 或可选下载响应校验的改动会被本测试拦截。
     #[test]
-    fn test_crc64_matches_tos_server_reflected_ecma_vectors() {
+    fn test_crc64_matches_legacy_compatibility_vectors() {
         let cases: &[(&[u8], u64)] = &[
             (b"", 0x0000_0000_0000_0000),
             (b"a", 0x3302_8477_2e65_2b05),
@@ -17253,10 +18393,10 @@ mod tests {
         }
     }
 
-    // [Review Fix #CRC64-XZ] 验证流式 CRC64 与一次性 CRC64 在 TOS 标准向量上完全一致，
+    // [Review Fix #CRC64-XZ] 验证流式 CRC64 与一次性 CRC64 在兼容向量上完全一致，
     // 防止"自一致但与服务端不一致"的盲区（既往的回归测试只对比了内部一致性）。
     #[test]
-    fn test_streaming_crc64_matches_tos_server_reflected_ecma_vectors() {
+    fn test_streaming_crc64_matches_legacy_compatibility_vectors() {
         let cases: &[(&[u8], u64)] = &[
             (b"abc", 0x2cd8_094a_1a27_7627),
             (b"123456789", 0x995d_c9bb_df19_39fa),
@@ -17280,7 +18420,7 @@ mod tests {
         }
     }
 
-    // [Review Fix #CRC64-XZ] 大块输入（>1 MiB）跨缓冲区边界仍要保持与 TOS 一致；
+    // [Review Fix #CRC64-XZ] 大块输入（>1 MiB）跨缓冲区边界仍要保持一致；
     // crc64_reader 的内部缓冲区是 1 MiB，这里强制触发多次填充。
     #[test]
     fn test_streaming_crc64_handles_multi_buffer_chunks() {
@@ -17497,6 +18637,65 @@ mod tests {
             ..args
         };
         assert!(!remote_sync_should_skip(10, Some(&destination), &exact));
+    }
+
+    #[test]
+    fn test_sync_item_should_skip_uses_source_listing_for_tos_to_local() {
+        let dir = temp_dir("sync-source-inventory");
+        let destination = dir.join("destination.txt");
+        fs::write(&destination, b"listed").expect("write destination");
+        let item = TransferPlanItem {
+            relative_key: "source.txt".to_string(),
+            source: "tos://bucket/source.txt".to_string(),
+            destination: destination.to_string_lossy().into_owned(),
+            size: 6,
+            etag: Some("source-etag".to_string()),
+            crc64: None,
+            last_modified: Some("2026-07-30T00:00:00Z".to_string()),
+        };
+        let args = sync_args(&item.source, &item.destination);
+
+        assert!(sync_item_should_skip(&item, None, &args).expect("skip decision"));
+    }
+
+    #[test]
+    fn test_sync_item_should_skip_uses_destination_inventory_for_tos_to_tos() {
+        let item = TransferPlanItem {
+            relative_key: "source.txt".to_string(),
+            source: "tos://source-bucket/source.txt".to_string(),
+            destination: "tos://destination-bucket/source.txt".to_string(),
+            size: 6,
+            etag: Some("same-etag".to_string()),
+            crc64: None,
+            last_modified: Some("2026-07-30T00:00:00Z".to_string()),
+        };
+        let destination = ObjectEntry {
+            key: "source.txt".to_string(),
+            size: 6,
+            etag: Some("same-etag".to_string()),
+            last_modified: Some("2026-07-30T00:00:00Z".to_string()),
+            storage_class: None,
+        };
+        let inventory = HashMap::from([(item.destination.clone(), destination)]);
+        let args = sync_args(&item.source, &item.destination);
+
+        assert!(
+            sync_item_should_skip(&item, Some(&inventory), &args).expect("inventory skip decision")
+        );
+        assert!(!sync_item_should_skip(&item, Some(&HashMap::new()), &args)
+            .expect("missing destination decision"));
+    }
+
+    #[test]
+    fn test_remote_scan_progress_tracks_prefix_and_object_counts() {
+        let mut progress = RemoteScanProgress::new(false, "ve-tos sync plan", "tos://bucket/root/");
+
+        progress.record_prefix_scan(4, 2);
+        progress.record_prefix_scan(3, 1);
+
+        assert_eq!(progress.prefixes_scanned, 2);
+        assert_eq!(progress.objects_discovered, 7);
+        assert_eq!(progress.prefixes_discovered, 3);
     }
 
     #[test]

@@ -1280,6 +1280,23 @@ pub const CAPABILITIES: &[CapabilityRow] = &[
         parameters: &[],
         examples: &["ve-adrive-cli doctor --check principles"],
     },
+    CapabilityRow {
+        command: "ve-adrive auth",
+        domain: "auth",
+        group: "Capabilities / Utilities",
+        layer: "utility",
+        description: "Inspect or manage the selected ADrive authentication strategy",
+        risk_level: "low",
+        destructive: false,
+        supports_force: false,
+        supports_dry_run: false,
+        api_actions: &[],
+        parameters: &[],
+        examples: &[
+            "ve-adrive-cli auth status",
+            "ve-adrive-cli --auth-mode oauth auth login",
+        ],
+    },
 ];
 
 pub fn capabilities() -> &'static [CapabilityRow] {

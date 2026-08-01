@@ -21,7 +21,17 @@ use std::{
 };
 
 fn cli(args: &[&str]) -> Output {
+    let thread = format!("{:?}", std::thread::current().id());
+    let safe_thread = thread.replace(|character: char| !character.is_ascii_alphanumeric(), "_");
+    let home = std::env::temp_dir().join(format!(
+        "ve-storage-high-level-home-{}-{safe_thread}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&home).expect("create isolated HOME");
+    // [Review Fix #22] High-level tests exercise credential resolution and
+    // must not depend on a developer's real credentials schema.
     Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
+        .env("HOME", home)
         .args(args)
         .output()
         .expect("failed to execute ve-storage-uni-cli")
@@ -416,7 +426,9 @@ fn test_high_level_dry_run_outputs_controlled_plan() {
     assert_eq!(json["list_echo"]["disabled_reason"], "non_tty");
     assert_eq!(json["progress"]["enabled"], false);
     assert_eq!(json["progress"]["disabled_reason"], "non_tty");
-    assert!(json["consistency_guards"].to_string().contains("CRC64"));
+    // [Review Fix #5] High-level uploads intentionally advertise SHA256 only;
+    // CRC64 remains a compatibility check for server-provided download hashes.
+    assert!(json["consistency_guards"].to_string().contains("SHA256"));
 }
 
 #[test]

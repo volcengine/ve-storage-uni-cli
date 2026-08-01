@@ -29,20 +29,24 @@ use tos_core::agent::global_args::GlobalArgs;
 use tos_core::agent::output::OutputFormat;
 use tos_core::infra::client::storage_user_agent;
 use tos_core::infra::config::{
-    redact_effective, AdriveOverride, Binary, ConfigFile, EffectiveProfile, FieldSource,
+    overlay_effective_credentials, overlay_effective_oauth_credentials, redact_effective,
+    AdriveOverride, Binary, ConfigFile, EffectiveProfile, FieldSource,
     DEFAULT_HTTP_CONNECT_TIMEOUT_SECONDS, DEFAULT_HTTP_MAX_CONNECTIONS,
     DEFAULT_HTTP_MAX_RETRY_COUNT, DEFAULT_HTTP_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_TOS_BATCH_REPORT_FORMAT, DEFAULT_TOS_PROGRESS_ENABLED,
 };
+use tos_core::infra::credentials::{CredentialSection, CredentialsFile};
 
 use crate::cli::meta::{
     ApiArgs, CapabilitiesArgs, CompletionArgs, ConfigAction, ConfigCommand, DoctorArgs,
     DocumentationLanguage, ServeArgs, SkillAction, SkillCommand,
 };
+use crate::cli::ADriveAuthArgs;
+use crate::domain::auth::AuthMode;
 use crate::domain::client::resolve_endpoint_and_region;
 use crate::handler::common::{
-    build_profile, output_envelope, output_result, output_result_with_columns,
-    public_adrive_command_path,
+    build_profile, inspect_selected_credentials, output_envelope, output_result,
+    output_result_with_columns, public_adrive_command_path,
 };
 use crate::registry::{
     business_domain, business_domains, capabilities, command_domains, find_capability,
@@ -1215,22 +1219,55 @@ pub async fn handle_config_command(
             let config_path = global.config_path();
             let config_dir = ConfigFile::config_dir_from_path(&config_path);
             let config = ConfigFile::load_from(&config_path)?;
+            // [Review Fix #9] Keep explicit credentials-path behavior aligned
+            // across runtime, diagnostics, and config inspection.
+            let credentials_path = global.existing_runtime_credentials_path()?;
+            let credentials = CredentialsFile::load_from(&credentials_path)?;
+            let mut display_config = config.clone();
+            for profile_name in credentials.profile_names() {
+                display_config.get_or_insert_profile(&profile_name);
+            }
 
             // 与 tos config show 对齐：列出所有 profiles
             let binary = Binary::Adrive;
             let mut effective: Vec<EffectiveProfile> = Vec::new();
-            for profile_name in config.profiles.keys() {
-                let eff = config.get_effective_profile_in_dir(profile_name, binary, &config_dir)?;
+            for profile_name in display_config.profiles.keys() {
+                let mut eff = display_config.get_effective_profile_in_dir(
+                    profile_name,
+                    binary,
+                    &config_dir,
+                )?;
+                let stored = credentials.effective_aksk(
+                    profile_name,
+                    CredentialSection::ADrive,
+                    &credentials_path,
+                )?;
+                let oauth = credentials.adrive_oauth(profile_name, &credentials_path)?;
+                if !config.profiles.contains_key(profile_name)
+                    && stored.is_empty()
+                    && oauth.is_empty()
+                {
+                    continue;
+                }
+                overlay_effective_credentials(&mut eff, &stored);
+                overlay_effective_oauth_credentials(&mut eff, &oauth);
                 effective.push(redact_adrive_effective(eff));
             }
 
             let format = global.output.unwrap_or_else(OutputFormat::auto_detect);
             match format {
                 OutputFormat::Table => {
-                    println!("Config file: {}\n", config_path.display());
+                    println!(
+                        "Config file: {}\nCredentials file: {}\n",
+                        config_path.display(),
+                        credentials_path.display()
+                    );
                     let headers = &["PROFILE", "FIELD", "VALUE", "SOURCE"];
                     let mut rows: Vec<Vec<String>> = Vec::new();
                     for eff in &effective {
+                        if let Some(ref f) = eff.auth_mode {
+                            push_traced_row(&mut rows, eff, "auth_mode", f);
+                        }
                         push_traced_row(&mut rows, eff, "region", &eff.region);
                         push_traced_row(&mut rows, eff, "endpoint", &eff.endpoint);
                         push_traced_row(&mut rows, eff, "checkpoint_dir", &eff.checkpoint_dir);
@@ -1279,6 +1316,12 @@ pub async fn handle_config_command(
                             &eff.secret_access_key,
                         );
                         push_traced_row(&mut rows, eff, "security_token", &eff.security_token);
+                        if let Some(ref f) = eff.access_token {
+                            push_traced_row(&mut rows, eff, "access_token", f);
+                        }
+                        if let Some(ref f) = eff.refresh_token {
+                            push_traced_row(&mut rows, eff, "refresh_token", f);
+                        }
                         if let Some(ref f) = eff.account_id {
                             push_traced_row(&mut rows, eff, "account_id", f);
                         }
@@ -1297,6 +1340,7 @@ pub async fn handle_config_command(
                         "ve-adrive config show",
                         json!({
                             "config_path": config_path.display().to_string(),
+                            "credentials_path": credentials_path.display().to_string(),
                             "profiles": effective,
                         }),
                     );
@@ -1306,6 +1350,9 @@ pub async fn handle_config_command(
             Ok(0)
         }
         ConfigAction::Set { key, value } => {
+            if is_sensitive_adrive_config_key(key) {
+                return handle_adrive_credential_set(global, key, value);
+            }
             let config_path = global.config_path();
             let mut config = ConfigFile::load_from(&config_path)?;
             // [Review Fix #ADrive-ConfigDryRun] Real execution and dry-run use the
@@ -1321,6 +1368,70 @@ pub async fn handle_config_command(
             output_envelope(global, &envelope)?;
             Ok(0)
         }
+    }
+}
+
+fn handle_adrive_credential_set(
+    global: &GlobalArgs,
+    key: &str,
+    value: &str,
+) -> Result<i32, CliError> {
+    let segments = adrive_config_key_segments(global, key)?;
+    let profile_name = segments
+        .first()
+        .ok_or_else(|| CliError::ValidationError("missing credential profile".to_string()))?;
+    let field = segments
+        .last()
+        .ok_or_else(|| CliError::ValidationError("missing credential field".to_string()))?;
+    // [Review Fix #10] Preserve explicit legacy key routing such as
+    // `default.tos.access_key_id`; only bare ADrive keys default to ADrive.
+    let section = credential_section_for_adrive_path(&segments)?;
+    let credentials_path = global.credentials_path();
+    let mut credentials = CredentialsFile::load_from(&credentials_path)?;
+    credentials.set_aksk_field(profile_name, section, field, value)?;
+    credentials.save_to_path(&credentials_path)?;
+
+    let envelope = Envelope::success(
+        "ve-adrive config set",
+        json!({
+            "key": key,
+            "section": adrive_credential_section_path(profile_name, section),
+            "field": field,
+            "value": "****",
+            "encrypted": true,
+            "status": "saved",
+            "config_path": global.config_path().display().to_string(),
+            "credentials_path": credentials_path.display().to_string(),
+            "message": format!("Saved {field} to credentials"),
+        }),
+    );
+    output_envelope(global, &envelope)?;
+    Ok(0)
+}
+
+fn credential_section_for_adrive_path(segments: &[String]) -> Result<CredentialSection, CliError> {
+    match segments {
+        [_profile, _field] => Ok(CredentialSection::Shared),
+        [_profile, binary, _field] => match Binary::parse(binary) {
+            Some(Binary::Tos) => Ok(CredentialSection::Tos),
+            Some(Binary::VeTos) => Ok(CredentialSection::VeTos),
+            Some(Binary::Adrive) => Ok(CredentialSection::ADrive),
+            _ => Err(CliError::ValidationError(format!(
+                "unsupported credential namespace '{binary}'"
+            ))),
+        },
+        _ => Err(CliError::ValidationError(
+            "invalid credential key path".to_string(),
+        )),
+    }
+}
+
+fn adrive_credential_section_path(profile_name: &str, section: CredentialSection) -> String {
+    match section {
+        CredentialSection::Shared => format!("[{profile_name}]"),
+        CredentialSection::Tos => format!("[{profile_name}.tos]"),
+        CredentialSection::VeTos => format!("[{profile_name}.ve-tos]"),
+        CredentialSection::ADrive => format!("[{profile_name}.adrive]"),
     }
 }
 
@@ -1426,16 +1537,27 @@ fn handle_config_dry_run(global: &GlobalArgs, action: &ConfigAction) -> Result<i
             let mut validation_config = ConfigFile::default();
             validation_config.set_by_path(&segment_refs, value)?;
             let redacted_value = redact_adrive_config_value(key, value);
-            let plan_line = match segments.len() {
-                2 => format!(
-                    "SET [{}].{} = '{}'",
-                    segments[0], segments[1], redacted_value
-                ),
-                3 => format!(
-                    "SET [{}.{}].{} = '{}'",
-                    segments[0], segments[1], segments[2], redacted_value
-                ),
-                _ => format!("SET {} = '{}'", key, redacted_value),
+            let plan_line = if is_sensitive_adrive_config_key(key) {
+                let section = credential_section_for_adrive_path(&segments)?;
+                format!(
+                    "SET {}.{} in '{}' = '{}'",
+                    adrive_credential_section_path(&segments[0], section),
+                    segments.last().unwrap_or(key),
+                    global.credentials_path().display(),
+                    redacted_value
+                )
+            } else {
+                match segments.len() {
+                    2 => format!(
+                        "SET [{}].{} = '{}'",
+                        segments[0], segments[1], redacted_value
+                    ),
+                    3 => format!(
+                        "SET [{}.{}].{} = '{}'",
+                        segments[0], segments[1], segments[2], redacted_value
+                    ),
+                    _ => format!("SET {} = '{}'", key, redacted_value),
+                }
             };
             DryRunResult {
                 action: "config set".to_string(),
@@ -1778,6 +1900,14 @@ fn describe_meta_examples(command_path: &str) -> Vec<String> {
 
 fn redact_adrive_effective(effective: EffectiveProfile) -> EffectiveProfile {
     let mut redacted = redact_effective(effective);
+    for token in [&mut redacted.access_token, &mut redacted.refresh_token]
+        .into_iter()
+        .flatten()
+    {
+        if token.value.is_some() {
+            token.value = Some("****".to_string());
+        }
+    }
     // Keep ADrive config show aligned with runtime profile loading:
     // ADrive does not inherit shared TOS network settings or credentials.
     if redacted.region.source == FieldSource::Shared {
@@ -2283,16 +2413,21 @@ struct DoctorReport {
 /// Handle ADrive doctor.
 pub async fn handle_doctor_command(
     global: &GlobalArgs,
+    auth: &ADriveAuthArgs,
     args: &DoctorArgs,
 ) -> Result<i32, CliError> {
-    let report = doctor_report(global, args).await?;
+    let report = doctor_report(global, auth, args).await?;
     let envelope = Envelope::success("ve-adrive doctor", serde_json::to_value(&report).unwrap());
     output_envelope(global, &envelope)?;
     Ok(0)
 }
 
-async fn doctor_report(global: &GlobalArgs, args: &DoctorArgs) -> Result<DoctorReport, CliError> {
-    let checks = build_doctor_checks(global, args).await?;
+async fn doctor_report(
+    global: &GlobalArgs,
+    auth: &ADriveAuthArgs,
+    args: &DoctorArgs,
+) -> Result<DoctorReport, CliError> {
+    let checks = build_doctor_checks(global, auth, args).await?;
     let passed = checks.iter().filter(|c| c.status == "passed").count();
     let warnings = checks.iter().filter(|c| c.status == "warning").count();
     let failed = checks.iter().filter(|c| c.status == "failed").count();
@@ -2357,12 +2492,13 @@ fn completion_words() -> Vec<&'static str> {
 
 async fn build_doctor_checks(
     global: &GlobalArgs,
+    auth: &ADriveAuthArgs,
     args: &DoctorArgs,
 ) -> Result<Vec<DoctorCheck>, CliError> {
     let selected = args.check.as_deref();
     let mut checks = Vec::new();
     maybe_push_check_result(&mut checks, selected, "config", || config_check(global));
-    maybe_push_check_result(&mut checks, selected, "auth", || auth_check(global));
+    maybe_push_check_result(&mut checks, selected, "auth", || auth_check(global, auth));
     maybe_push_check(&mut checks, selected, "registry", registry_check);
     // network_check is async because --live-network performs a real HTTPS probe.
     let is_network_selected = selected.map(|name| name == "network").unwrap_or(true);
@@ -2452,17 +2588,20 @@ fn config_check(global: &GlobalArgs) -> Result<DoctorCheck, CliError> {
     })
 }
 
-fn auth_check(global: &GlobalArgs) -> Result<DoctorCheck, CliError> {
-    let profile = build_profile(global)?;
-    let has_access_key = profile.access_key_id.is_some();
-    let has_secret_key = profile.secret_access_key.is_some();
-    let status = if has_access_key && has_secret_key {
+fn auth_check(global: &GlobalArgs, auth: &ADriveAuthArgs) -> Result<DoctorCheck, CliError> {
+    let resolved = crate::handler::common::resolve_auth_mode(global, auth.auth_mode)?;
+    let credentials = inspect_selected_credentials(global, resolved.mode)?;
+    let status = if resolved.mode == AuthMode::Aksk && credentials.has_complete_aksk() {
         "passed"
     } else {
         "warning"
     };
-    let message = if has_access_key && has_secret_key {
+    let message = if resolved.mode == AuthMode::Aksk && credentials.has_complete_aksk() {
         "ADrive credentials are configured".to_string()
+    } else if resolved.mode == AuthMode::Oauth && credentials.has_oauth_token() {
+        "ADrive OAuth credentials are available; service integration is pending".to_string()
+    } else if resolved.mode == AuthMode::Oauth {
+        "ADrive OAuth credentials are not configured".to_string()
     } else {
         "ADrive credentials are incomplete (check ADRIVE_ACCESS_KEY / ADRIVE_SECRET_KEY or config file)"
             .to_string()
@@ -2472,9 +2611,17 @@ fn auth_check(global: &GlobalArgs) -> Result<DoctorCheck, CliError> {
         status,
         message,
         details: json!({
-            "has_access_key": has_access_key,
-            "has_secret_key": has_secret_key,
-            "has_security_token": profile.security_token.is_some(),
+            "mode": resolved.mode.as_str(),
+            "source": resolved.source.as_str(),
+            "has_access_key": credentials.has_access_key,
+            "has_secret_key": credentials.has_secret_key,
+            "has_security_token": credentials.has_security_token,
+            "has_access_token": credentials.has_access_token,
+            "has_refresh_token": credentials.has_refresh_token,
+            // [Review Fix #3] OAuth cannot be reported healthy before its
+            // resource-request integration is actually available.
+            "oauth_service_integration": credentials.oauth_service_integration,
+            "credential_source": credentials.credential_source,
         }),
     })
 }

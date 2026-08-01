@@ -60,7 +60,7 @@ use crate::domain::types::{
 };
 
 use crate::cli::high_level::*;
-use crate::cli::ADriveCommand;
+use crate::cli::{ADriveAuthArgs, ADriveCommand};
 use crate::handler::common::{
     build_ids_client, build_profile, ensure_force_for_destructive, map_ids_error, output_envelope,
     output_result_with_columns, parse_adrive_uri, public_adrive_command_path, resolve_target,
@@ -353,6 +353,7 @@ struct ADriveUploadCheckpointRef {
 /// the internal IDS REST client.
 pub async fn handle_high_level_command(
     global: &GlobalArgs,
+    auth: &ADriveAuthArgs,
     command: &ADriveCommand,
 ) -> Result<i32, CliError> {
     if global.describe {
@@ -362,7 +363,7 @@ pub async fn handle_high_level_command(
     }
 
     if global.dry_run {
-        let plan = build_plan(global, command).await?;
+        let plan = build_plan(global, auth, command).await?;
         output_envelope(
             global,
             &Envelope::success(crate::cli::command_path(command), plan),
@@ -407,7 +408,7 @@ pub async fn handle_high_level_command(
     }
 
     prevalidate_command(command)?;
-    execute_command(global, command).await
+    execute_command(global, auth, command).await
 }
 
 fn enforce_critical_confirmation(
@@ -904,8 +905,12 @@ async fn resolve_mkdir_args_by_name(
     Ok(resolved)
 }
 
-async fn execute_command(global: &GlobalArgs, command: &ADriveCommand) -> Result<i32, CliError> {
-    let client = build_ids_client(global)?;
+async fn execute_command(
+    global: &GlobalArgs,
+    auth: &ADriveAuthArgs,
+    command: &ADriveCommand,
+) -> Result<i32, CliError> {
+    let client = build_ids_client(global, auth.auth_mode)?;
 
     match command {
         ADriveCommand::Cp(args) => execute_cp(global, &client, args).await,
@@ -10000,6 +10005,7 @@ fn cp_checkpoint_scope(args: &CpArgs) -> &'static str {
 /// constructed (e.g. missing credentials in dry-run-only scenarios).
 async fn compute_dry_run_impact(
     global: &GlobalArgs,
+    auth: &ADriveAuthArgs,
     command: &ADriveCommand,
     cmd_name: &str,
     destructive: bool,
@@ -10026,7 +10032,7 @@ async fn compute_dry_run_impact(
     };
 
     // Build the IDS client; gracefully return None if credentials are absent.
-    let client = build_ids_client(global).ok()?;
+    let client = build_ids_client(global, auth.auth_mode).ok()?;
 
     let listed = match list_all_files_and_folders_hierarchical(
         &client,
@@ -10091,6 +10097,7 @@ async fn compute_dry_run_impact(
 
 async fn build_plan(
     global: &GlobalArgs,
+    auth: &ADriveAuthArgs,
     command: &ADriveCommand,
 ) -> Result<serde_json::Value, CliError> {
     // [Review Fix #ADrive-CheckpointPlan] Dry-run must describe checkpoint and
@@ -10404,7 +10411,7 @@ async fn build_plan(
         ),
     };
 
-    let impact = compute_dry_run_impact(global, command, cmd_name, destructive).await;
+    let impact = compute_dry_run_impact(global, auth, command, cmd_name, destructive).await;
 
     let mut plan = json!({
         "command": cmd_name,

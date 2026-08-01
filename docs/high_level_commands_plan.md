@@ -181,19 +181,19 @@ Execute 阶段的批量任务默认并发 `16`。`sync --delete`、`rm --recursi
 
 ## 上传下载数据一致性
 
-`cp`、`sync`、`mv` 涉及本地文件和对象读写，必须同时利用本地文件系统原子操作和 TOS 原生一致性能力。核心原则是：读使用条件请求固定对象版本，写流式计算 CRC64 并与 TOS 服务端返回的 CRC64、ETag 或 VersionId 对比确认，不做写后的二次 `HeadObject` 或本地重读校验。
+`cp`、`sync`、`mv` 涉及本地文件和对象读写，必须同时利用本地文件系统原子操作和 TOS 原生一致性能力。核心原则是：读使用条件请求固定对象版本，写使用 SHA256 对请求体签名并记录服务端返回的 ETag 或 VersionId，不发送服务端不支持的 `x-hash-crc64ecma`，也不做写后的二次 `HeadObject`。
 
 ### Local -> TOS
 
 - 上传前读取本地 metadata：size、mtime、可选 hash。
 - 打开文件后再次读取 metadata；如果 size/mtime 与计划阶段不一致，返回确定性 `ValidationError`，避免上传半新半旧内容。
-- 上传读取本地文件流时同步计算 CRC64；不能为了校验再额外读取第二遍本地文件。
+- 上传签名前使用 Tokio 文件 I/O 分块计算 SHA256；HTTP 重试时重新打开文件流，但复用已经计算的 SHA256。
 - 简单上传应尽量携带 `Content-MD5` 或 SDK 支持的校验头，由 TOS 在服务端校验 payload。
 - 如果目标不存在语义是必须的，应使用条件写入能力，例如 `If-None-Match: *`；如果是覆盖已知版本，应使用 `If-Match: <etag>` 或等价条件头。
-- 简单上传完成后记录 TOS 返回的 `crc64`、`etag`、`version_id` 和 `request_id`；本地流式 CRC64 必须与服务端返回的 CRC64 对比，写一致性以对比结果为准。
-- Multipart 上传每个 `UploadPart` 都必须在读取 part 流时计算 part CRC64，并与服务端 `UploadPart` 返回的 CRC64 对比；同时记录每个 part 的 `etag`。
+- 简单上传完成后记录 TOS 返回的 `etag`、`version_id` 和 `request_id`。
+- Multipart 上传每个 `UploadPart` 都计算对应范围的 SHA256 并记录服务端返回的 `etag`。
 - Multipart Complete 前按 part number 排序并校验 part 列表连续。
-- Multipart Complete 后必须记录 TOS 返回的最终对象 `crc64`、`etag` 或 `version_id`；当前实现会在 Complete 响应返回最终 CRC64 时与上传前流式计算的本地对象 CRC64 对比，不只依赖 HTTP 2xx，也不做 Complete 后二次 `HeadObject`。
+- Multipart Complete 后记录 TOS 返回的最终对象 `etag` 或 `version_id`，不做 Complete 后二次 `HeadObject`。
 - 如果启用 `--checkpoint`，checkpoint 中必须包含 file_size、mtime、part_size、upload_id、completed_parts；恢复时全部校验一致才允许续传。
 
 ### TOS -> Local
@@ -210,16 +210,16 @@ Execute 阶段的批量任务默认并发 `16`。`sync --delete`、`rm --recursi
 - 单对象复制使用 TOS 服务端 `CopyObject`，避免数据经本地落盘。
 - 如果源对象在计划阶段有 etag/version_id，CopyObject 必须使用源条件头，例如 `x-tos-copy-source-if-match` 或等价能力；其语义等同于 `GetObject` 的 `If-Match`，用于确保复制的是计划中的对象版本。
 - 目标不存在语义使用目标条件写入能力；覆盖已知目标时使用目标 `If-Match` 或等价条件头。
-- 复制完成后记录 TOS 返回的 `crc64`、`etag`、`version_id` 或 copy result，不额外二次 `HeadObject`。
+- 复制完成后记录 TOS 返回的 `etag`、`version_id` 或 copy result，不额外二次 `HeadObject`。
 - 跨桶/大对象 Multipart Copy 必须记录每个 copy part 的 etag，Complete 后记录服务端返回的最终校验信息。
 - `mv` 只有在 copy 成功且服务端返回校验信息后才能删除源对象；如果 bucket 开启版本控制，应删除计划中记录的 source version_id；未开启版本控制时，删除必须带源对象条件约束，避免删除已被其他进程改写的对象。
 - 批量 `mv` 对每个对象独立执行 copy -> verify -> delete；部分失败不能删除未验证成功的源。
 
 ### sync 一致性
 
-- sync 先生成 source manifest 和 destination manifest，再做 diff，manifest 中必须包含 size、mtime、etag、version_id 或 crc64，避免边扫描边删除；当前 TOS 方向通过 ListObjects/HeadObject 生成 manifest entry，按 size/etag 判断 skip/copy/delete。
+- sync 先在内存中生成 source/destination inventory 再做 diff，inventory 包含 size、mtime、etag 或 version_id，避免边扫描边删除；磁盘 manifest 仅用于审计输出，不参与执行或恢复。
 - `--delete` 只删除 diff 中明确判定为目标多余的对象；执行前 dry-run plan 必须列出删除数量和样例。
-- 如果同步过程中 source manifest 对应文件/对象发生变化，应跳过该项并记录为 failed 或 retryable，不得上传不一致内容。
+- 如果同步过程中 source inventory 对应文件/对象发生变化，应跳过该项并记录为 failed 或 retryable，不得上传不一致内容。
 - 对 TOS 目标的删除必须使用计划阶段记录的 etag/version_id 做条件约束；条件不满足时记录冲突失败，不应盲目删除。当前 extra 删除和 mv 源删除已携带 ETag 条件，目标覆盖条件写入仍作为后续增强。
 - 部分失败时不能回滚已成功项，但必须输出成功/失败清单和可重试标记。
 
@@ -239,7 +239,7 @@ Execute 阶段的批量任务默认并发 `16`。`sync --delete`、`rm --recursi
 
 1. `CreateMultipartUpload`：获取 `upload_id`。
 2. 切分本地文件：按 part size 读取固定范围，part number 从 1 开始。
-3. `UploadPart`：逐分片上传，读取 part 流时计算 CRC64，并与服务端返回的 part CRC64 对比；记录每个 part 的 `etag` 和 `crc64`。
+3. `UploadPart`：按并发度上传分片，使用分片 SHA256 签名，并记录每个 part 的 `etag`。
 4. `CompleteMultipartUpload`：提交已完成 part 列表。
 5. 失败清理：如果没有启用 checkpoint 且不可恢复失败，应提示用户可执行 abort；后续可自动调用 `AbortMultipartUpload`。
 

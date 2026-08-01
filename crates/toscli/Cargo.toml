@@ -14,7 +14,7 @@
 
 [package]
 name = "tos-cli-core"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 license = "Apache-2.0"
 description = "Dedicated ByteCloud TOS high-level command surface"
@@ -30,8 +30,8 @@ name = "tos_cli"
 path = "src/lib.rs"
 
 [dependencies]
-tos-core = { version = "1.0.1", path = "../tos-core" }
-ve-tos-cli = { package = "ve-tos-cli-core", version = "1.0.0", path = "../tos" }
+tos-core = { version = "1.0.2", path = "../tos-core" }
+ve-tos-cli = { package = "ve-tos-cli-core", version = "1.0.2", path = "../tos" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

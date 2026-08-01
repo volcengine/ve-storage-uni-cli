@@ -125,6 +125,31 @@ export ADRIVE_SECRET_KEY=<your-adrive-secret-access-key>
 export ADRIVE_SECURITY_TOKEN=<optional-sts-token>
 ```
 
+ADrive also has an authentication-mode framework. Existing installations keep
+using `aksk` by default; OAuth service calls are not implemented yet.
+
+```bash
+ve-adrive-cli config set auth_mode aksk
+ve-adrive-cli --auth-mode oauth auth status
+ve-adrive-cli auth login   # framework placeholder until OAuth integration lands
+```
+
+Mode precedence is `--auth-mode` > `[profile.adrive].auth_mode` >
+`ADRIVE_AUTH_MODE` > the backward-compatible `aksk` default. Once a
+mode is selected, credentials from the other mode are not used as fallback.
+
+Sensitive credentials are stored separately from normal configuration:
+
+```text
+$HOME/.tos/config.toml       # region, endpoint, auth_mode, and other settings
+$HOME/.tos/credentials.toml  # encrypted AK/SK, security tokens, and OAuth tokens
+```
+
+New AK/SK writes from `tos-cli`, `ve-tos-cli`, and `ve-adrive-cli` go only to
+`credentials.toml`. Existing AK/SK values in `config.toml` remain readable for
+compatibility and are not migrated or duplicated automatically. Credential
+precedence is `credentials.toml` > legacy `config.toml` > environment variables.
+
 Initialize or inspect local configuration:
 
 ```bash
@@ -195,6 +220,7 @@ Most commands share these options:
 |-----------------------------|---------------|-----------------------------------------------------------|
 | `-P, --profile <PROFILE>`   | `TOS_PROFILE` | Configuration profile, default `default`.                 |
 | `--config-path <PATH>`      | `TOS_CONFIG_PATH` | Config TOML path, default `$HOME/.tos/config.toml`.   |
+| `--credentials-path <PATH>` | `TOS_CREDENTIALS_PATH` | Credentials TOML path; defaults beside the effective config file. |
 | `-r, --region <REGION>`     |               | Region override.                                          |
 | `-e, --endpoint <URL>`      |               | Data-plane endpoint override.                             |
 | `--control-endpoint <URL>`  |               | Control-plane endpoint override for TOS.                  |
@@ -223,6 +249,9 @@ Credential variables are resolved by the config layer:
 | `ADRIVE_SECURITY_TOKEN` | Optional ADrive STS security token.                                            |
 | `ADRIVE_REGION`         | ADrive region, used to derive the IDS endpoint when no endpoint is configured. |
 | `ADRIVE_ENDPOINT`       | ADrive IDS endpoint override.                                                  |
+| `ADRIVE_AUTH_MODE`      | Process-scoped ADrive authentication mode: `aksk` or `oauth`.                   |
+| `ADRIVE_ACCESS_TOKEN`   | Process-scoped OAuth access token placeholder for future service integration.   |
+| `ADRIVE_REFRESH_TOKEN`  | Process-scoped OAuth refresh token placeholder for future service integration.  |
 
 ## Skill Installation
 

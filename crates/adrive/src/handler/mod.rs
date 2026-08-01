@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+pub mod auth;
 pub mod common;
 pub mod high_level;
 pub mod meta;
