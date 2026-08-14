@@ -59,6 +59,11 @@ pub enum TosCliCommand {
     /// Generate shell completion
     Completion(meta::CompletionArgs),
     /// Start or plan MCP serving
+    ///
+    /// SSE is same-host only. After binding, it prints a fresh Bearer token once to stderr.
+    /// Every HTTP request must send it in the Authorization header. The Host header must be
+    /// exact loopback plus the configured port. Native clients may omit the Origin header;
+    /// when present, the Origin header must be the matching HTTP loopback origin and port.
     Serve(meta::ServeArgs),
     /// Manage/export skill metadata
     Skill(meta::SkillCommand),

@@ -45,20 +45,22 @@ use tos_core::agent::output::OutputFormat;
 use tos_core::infra::auth::hash_payload;
 use tos_core::infra::client::TosClient;
 use tos_core::infra::config::{
-    Binary, DEFAULT_BATCH_CONCURRENCY, DEFAULT_LIST_CONCURRENCY, DEFAULT_MULTIPART_CONCURRENCY,
-    DEFAULT_OVERWRITE_STRATEGY, DEFAULT_PROGRESS_GRANULARITY, DEFAULT_TOS_BATCH_REPORT_DIR,
-    DEFAULT_TOS_BATCH_REPORT_FORMAT, DEFAULT_TOS_CHECKPOINT_DIR, DEFAULT_TOS_PROGRESS_ENABLED,
-    DEFAULT_TRANSFER_CHECKPOINT_THRESHOLD,
+    Binary, Profile, DEFAULT_BATCH_CONCURRENCY, DEFAULT_LIST_CONCURRENCY,
+    DEFAULT_MULTIPART_CONCURRENCY, DEFAULT_OVERWRITE_STRATEGY, DEFAULT_PROGRESS_GRANULARITY,
+    DEFAULT_TOS_BATCH_REPORT_DIR, DEFAULT_TOS_BATCH_REPORT_FORMAT, DEFAULT_TOS_CHECKPOINT_DIR,
+    DEFAULT_TOS_PROGRESS_ENABLED, DEFAULT_TRANSFER_CHECKPOINT_THRESHOLD,
 };
 use tos_core::transfer::checkpoint::{Checkpoint, CompletedPart};
 use tos_core::transfer::upload::UploadStrategy;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::cli::high_level::*;
 use crate::cli::TosCommand;
 use crate::domain::{bucket, core};
 use crate::handler::common::{
-    active_tos_config_binary, build_profile, ensure_force_for_destructive, output_result,
-    output_result_with_columns,
+    active_tos_config_binary, build_runtime, ensure_force_for_destructive, output_result,
+    output_result_with_columns, TosRuntime,
 };
 use crate::registry::{describe_command_metadata, enforce_registry_guards};
 
@@ -75,6 +77,8 @@ const DU_CATEGORY_BUCKET_LIMIT: usize = 1024;
 const DU_REQUEST_ID_LIMIT: usize = 1024;
 const DU_OVERFLOW_BUCKET: &str = "(other)";
 const DEFAULT_BATCH_FILE_ROLLOVER_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_PROGRESS_LABEL_WIDTH: usize = 60;
+const PROGRESS_LABEL_ELLIPSIS: &str = "…";
 const TRANSFER_REPORT_SCHEMA_VERSION: u8 = 2;
 const TOS_OBJECT_STORAGE_CLASS_VALUES: &[&str] = &[
     "STANDARD",
@@ -1010,7 +1014,14 @@ impl TransferPlanItem {
 }
 
 fn build_transfer_manifest(items: &[TransferPlanItem]) -> TransferManifest {
-    build_transfer_manifest_for_operation(items, "copy")
+    // [Review Fix #1] A recursive cp action is identified by its concrete
+    // transfer direction so the manifest matches the report and user intent.
+    TransferManifest::from_items(
+        items
+            .iter()
+            .map(|item| item.manifest_item(cp_transfer_operation(&item.source, &item.destination)))
+            .collect(),
+    )
 }
 
 fn build_transfer_manifest_for_operation(
@@ -1122,7 +1133,14 @@ pub async fn handle_high_level_command(
     let path_traversal_confirm_target = command_path_traversal_confirm_target(command, &operation)?;
 
     if global.dry_run {
-        let plan = build_plan(global, &operation, path_traversal_confirm_target.as_deref()).await?;
+        let runtime = build_runtime(global)?;
+        let plan = build_plan(
+            global,
+            &runtime,
+            &operation,
+            path_traversal_confirm_target.as_deref(),
+        )
+        .await?;
         output_result(global, &Envelope::success(plan.command.clone(), plan))?;
         return Ok(0);
     }
@@ -1159,22 +1177,27 @@ async fn execute_high_level_command(
     global: &GlobalArgs,
     command: &TosCommand,
 ) -> Result<i32, CliError> {
+    // [Review Fix #2] One high-level invocation owns one config/auth snapshot.
+    // Every transfer control and client below must derive from this runtime.
+    let runtime = build_runtime(global)?;
+    let profile = &runtime.profile;
     if let TosCommand::Cp(args) = command {
         if !args.source.starts_with("tos://") && !args.destination.starts_with("tos://") {
-            let runtime = effective_cp_runtime_config(global, args)?;
+            let transfer_runtime = effective_cp_runtime_config(profile, args)?;
             let progress_enabled =
-                effective_progress_enabled(global, args.progress, args.no_progress)?;
+                effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
             if args.recursive {
                 let report_path =
-                    effective_report_path(global, args.report_path.as_deref(), "ve-tos cp")?;
+                    effective_report_path(profile, args.report_path.as_deref(), "ve-tos cp")?;
                 let manifest_path = effective_optional_manifest_path(
-                    global,
+                    profile,
                     args.manifest_path.as_deref(),
                     args.no_manifest,
                     "ve-tos cp",
                 )?;
                 return execute_cp_recursive_local(
                     global,
+                    profile,
                     args,
                     report_path.as_deref(),
                     manifest_path.as_deref(),
@@ -1195,7 +1218,7 @@ async fn execute_high_level_command(
                     global,
                     &args.source,
                     &destination,
-                    runtime.copy_options(
+                    transfer_runtime.copy_options(
                         None,
                         false,
                         args.checkpoint,
@@ -1214,15 +1237,16 @@ async fn execute_high_level_command(
         if !args.source.starts_with("tos://") && !args.destination.starts_with("tos://") {
             if args.recursive {
                 let report_path =
-                    effective_report_path(global, args.report_path.as_deref(), "ve-tos mv")?;
+                    effective_report_path(profile, args.report_path.as_deref(), "ve-tos mv")?;
                 let manifest_path = effective_optional_manifest_path(
-                    global,
+                    profile,
                     args.manifest_path.as_deref(),
                     args.no_manifest,
                     "ve-tos mv",
                 )?;
                 return execute_mv_recursive_local(
                     global,
+                    profile,
                     args,
                     report_path.as_deref(),
                     manifest_path.as_deref(),
@@ -1238,16 +1262,16 @@ async fn execute_high_level_command(
                     args.list_concurrency,
                 )?;
                 let progress_enabled =
-                    effective_progress_enabled(global, args.progress, args.no_progress)?;
-                let mut runtime = effective_default_runtime_config(global)?;
-                runtime.overwrite_strategy = EffectiveOverwriteStrategy::Force;
+                    effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
+                let mut transfer_runtime = effective_default_runtime_config(profile)?;
+                transfer_runtime.overwrite_strategy = EffectiveOverwriteStrategy::Force;
                 let destination =
                     resolve_single_transfer_destination(&args.source, &args.destination)?;
                 let outcome = copy_local_to_local(
                     global,
                     &args.source,
                     &destination,
-                    runtime.copy_options(
+                    transfer_runtime.copy_options(
                         None,
                         false,
                         false,
@@ -1270,29 +1294,28 @@ async fn execute_high_level_command(
     }
     if let TosCommand::Sync(args) = command {
         if !args.source.starts_with("tos://") && !args.destination.starts_with("tos://") {
-            return execute_sync_local_to_local(global, args);
+            return execute_sync_local_to_local(global, profile, args);
         }
     }
 
-    let profile = build_profile(global)?;
-    let client = TosClient::new(&profile, "tos")?;
+    let client = runtime.client(global, "tos")?;
 
     match command {
-        TosCommand::Cp(args) => execute_cp(global, &client, args).await,
-        TosCommand::Mv(args) => execute_mv(global, &client, args).await,
-        TosCommand::Sync(args) => execute_sync(global, &client, args).await,
-        TosCommand::Mb(args) => execute_mb(global, &client, args).await,
+        TosCommand::Cp(args) => execute_cp(global, profile, &client, args).await,
+        TosCommand::Mv(args) => execute_mv(global, profile, &client, args).await,
+        TosCommand::Sync(args) => execute_sync(global, profile, &client, args).await,
+        TosCommand::Mb(args) => execute_mb(global, &runtime, &client, args).await,
         TosCommand::Rb(args) => execute_rb(global, &client, args).await,
         TosCommand::Mkdir(args) => execute_mkdir(global, &client, args).await,
-        TosCommand::Rm(args) => execute_rm(global, &client, args).await,
+        TosCommand::Rm(args) => execute_rm(global, profile, &client, args).await,
         TosCommand::Ls(args) => execute_ls(global, &client, args).await,
         TosCommand::Stat(args) => execute_stat(global, &client, args).await,
-        TosCommand::Du(args) => execute_du(global, &client, args).await,
+        TosCommand::Du(args) => execute_du(global, profile, &client, args).await,
         TosCommand::Find(args) => execute_find(global, &client, args).await,
         TosCommand::Cat(args) => execute_cat(global, &client, args).await,
-        TosCommand::Put(args) => execute_put(global, &client, args).await,
+        TosCommand::Put(args) => execute_put(global, profile, &client, args).await,
         TosCommand::Presign(args) => execute_presign(global, &client, args).await,
-        TosCommand::Restore(args) => execute_restore(global, &client, args).await,
+        TosCommand::Restore(args) => execute_restore(global, profile, &client, args).await,
         _ => Err(CliError::ValidationError(
             "unsupported high-level command".to_string(),
         )),
@@ -1301,18 +1324,19 @@ async fn execute_high_level_command(
 
 async fn execute_mb(
     global: &GlobalArgs,
+    runtime: &TosRuntime,
     client: &TosClient,
     args: &MbArgs,
 ) -> Result<i32, CliError> {
     validate_optional_value("bucket-type", args.bucket_type.as_deref(), &["fns", "hns"])?;
     let override_client;
     let effective_client = if let Some(region) = &args.region {
-        let mut profile = build_profile(global)?;
+        let mut profile = runtime.profile.clone();
         // [Review Fix #MbRegion] Keep high-level `mb --region` aligned with
         // low-level `ve-tos bucket create --region`; it must affect the request
         // client, not only appear in help/describe output.
         profile.region = Some(region.clone());
-        override_client = Some(TosClient::new(&profile, "tos")?);
+        override_client = Some(runtime.client_with_profile(global, "tos", &profile)?);
         override_client.as_ref().unwrap()
     } else {
         client
@@ -1604,23 +1628,25 @@ async fn execute_stat(
 
 async fn execute_rm(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &TosClient,
     args: &RmArgs,
 ) -> Result<i32, CliError> {
     let path = resolve_rm_path(args)?;
     if args.recursive {
-        let report_path = effective_report_path(global, args.report_path.as_deref(), "ve-tos rm")?;
+        let report_path = effective_report_path(profile, args.report_path.as_deref(), "ve-tos rm")?;
         let manifest_path = effective_optional_manifest_path(
-            global,
+            profile,
             args.manifest_path.as_deref(),
             args.no_manifest,
             "ve-tos rm",
         )?;
-        let progress_enabled = effective_progress_enabled(global, args.progress, args.no_progress)?;
+        let progress_enabled =
+            effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
         let list_echo_enabled =
             effective_list_echo_enabled(global, args.list_echo, args.no_list_echo);
-        let batch_concurrency = effective_batch_concurrency(global, args.batch_concurrency)?;
-        let list_concurrency = effective_list_concurrency(global, args.list_concurrency)?;
+        let batch_concurrency = effective_batch_concurrency(profile, args.batch_concurrency)?;
+        let list_concurrency = effective_list_concurrency(profile, args.list_concurrency)?;
         let mut target = parse_tos_uri(&path, true)?;
         normalize_recursive_tos_target(&mut target);
         let prefix = target.key.as_deref();
@@ -2741,6 +2767,7 @@ fn resolve_tos_recursive_delete_mode(
 
 async fn execute_restore(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &TosClient,
     args: &RestoreArgs,
 ) -> Result<i32, CliError> {
@@ -2752,18 +2779,19 @@ async fn execute_restore(
     )?;
     if args.recursive || args.manifest.is_some() {
         let report_path =
-            effective_report_path(global, args.report_path.as_deref(), "ve-tos restore")?;
+            effective_report_path(profile, args.report_path.as_deref(), "ve-tos restore")?;
         let manifest_path = effective_optional_manifest_path(
-            global,
+            profile,
             args.manifest_path.as_deref(),
             args.no_manifest,
             "ve-tos restore",
         )?;
-        let progress_enabled = effective_progress_enabled(global, args.progress, args.no_progress)?;
+        let progress_enabled =
+            effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
         let list_echo_enabled =
             effective_list_echo_enabled(global, args.list_echo, args.no_list_echo);
-        let batch_concurrency = effective_batch_concurrency(global, args.batch_concurrency)?;
-        let list_concurrency = effective_list_concurrency(global, args.list_concurrency)?;
+        let batch_concurrency = effective_batch_concurrency(profile, args.batch_concurrency)?;
+        let list_concurrency = effective_list_concurrency(profile, args.list_concurrency)?;
         if args.no_manifest {
             return execute_restore_streaming_no_manifest(
                 global,
@@ -3309,12 +3337,13 @@ fn record_tos_restore_skipped(
 
 async fn execute_cp(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &TosClient,
     args: &CpArgs,
 ) -> Result<i32, CliError> {
     ensure_same_region_for_tos_uris(client, &args.source, &args.destination).await?;
     if args.recursive {
-        return execute_cp_recursive(global, client, args).await;
+        return execute_cp_recursive(global, profile, client, args).await;
     }
     reject_single_transfer_artifacts(
         "ve-tos cp",
@@ -3325,8 +3354,9 @@ async fn execute_cp(
         args.batch_concurrency,
         args.list_concurrency,
     )?;
-    let progress_enabled = effective_progress_enabled(global, args.progress, args.no_progress)?;
-    let runtime = effective_cp_runtime_config(global, args)?;
+    let progress_enabled =
+        effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
+    let runtime = effective_cp_runtime_config(profile, args)?;
     let write_options = copy_write_options(args)?;
     let destination = resolve_single_transfer_destination(&args.source, &args.destination)?;
     ensure_tos_upload_storage_class_supported(
@@ -3355,7 +3385,7 @@ async fn execute_cp(
     output_single_transfer_envelope(
         global,
         "ve-tos cp",
-        single_transfer_operation(&args.source, &destination),
+        cp_transfer_operation(&args.source, &destination),
         &args.source,
         &destination,
         outcome,
@@ -3365,12 +3395,13 @@ async fn execute_cp(
 
 async fn execute_mv(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &TosClient,
     args: &MvArgs,
 ) -> Result<i32, CliError> {
     ensure_same_region_for_tos_uris(client, &args.source, &args.destination).await?;
     if args.recursive {
-        return execute_mv_recursive_tos(global, client, args).await;
+        return execute_mv_recursive_tos(global, profile, client, args).await;
     }
     let source_delete_etag = if args.source.starts_with("tos://") {
         let source = parse_tos_uri(&args.source, false)?;
@@ -3388,8 +3419,9 @@ async fn execute_mv(
         args.batch_concurrency,
         args.list_concurrency,
     )?;
-    let progress_enabled = effective_progress_enabled(global, args.progress, args.no_progress)?;
-    let mut runtime = effective_default_runtime_config(global)?;
+    let progress_enabled =
+        effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
+    let mut runtime = effective_default_runtime_config(profile)?;
     runtime.overwrite_strategy = EffectiveOverwriteStrategy::Force;
     let write_options = mv_write_options(args)?;
     let destination = resolve_single_transfer_destination(&args.source, &args.destination)?;
@@ -3453,19 +3485,21 @@ async fn execute_mv(
 
 async fn execute_mv_recursive_tos(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &TosClient,
     args: &MvArgs,
 ) -> Result<i32, CliError> {
-    let report_path = effective_report_path(global, args.report_path.as_deref(), "ve-tos mv")?;
+    let report_path = effective_report_path(profile, args.report_path.as_deref(), "ve-tos mv")?;
     let manifest_path = effective_optional_manifest_path(
-        global,
+        profile,
         args.manifest_path.as_deref(),
         args.no_manifest,
         "ve-tos mv",
     )?;
     let cp_args = cp_args_from_mv(args, true, report_path.clone());
-    let runtime = effective_cp_runtime_config(global, &cp_args)?;
-    let progress_enabled = effective_progress_enabled(global, args.progress, args.no_progress)?;
+    let runtime = effective_cp_runtime_config(profile, &cp_args)?;
+    let progress_enabled =
+        effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
     let list_echo_enabled = effective_list_echo_enabled(global, args.list_echo, args.no_list_echo);
     let write_options = mv_write_options(args)?;
     ensure_tos_upload_storage_class_supported(
@@ -4463,13 +4497,15 @@ fn should_prune_move_source(
 
 fn execute_mv_recursive_local(
     global: &GlobalArgs,
+    profile: &Profile,
     args: &MvArgs,
     report_path: Option<&str>,
     manifest_path: Option<&str>,
 ) -> Result<i32, CliError> {
     let cp_args = cp_args_from_mv(args, false, report_path.map(ToString::to_string));
-    let runtime = effective_cp_runtime_config(global, &cp_args)?;
-    let progress_enabled = effective_progress_enabled(global, args.progress, args.no_progress)?;
+    let runtime = effective_cp_runtime_config(profile, &cp_args)?;
+    let progress_enabled =
+        effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
     let planned =
         build_local_source_mappings(&args.source, &args.destination, args.include_parent)?
             .into_iter()
@@ -4941,7 +4977,7 @@ fn status_code_from_payload(payload: &Value) -> Option<u16> {
         .and_then(|status_code| u16::try_from(status_code).ok())
 }
 
-fn single_transfer_operation(source: &str, destination: &str) -> &'static str {
+fn cp_transfer_operation(source: &str, destination: &str) -> &'static str {
     match (
         source.starts_with("tos://"),
         destination.starts_with("tos://"),
@@ -4955,11 +4991,13 @@ fn single_transfer_operation(source: &str, destination: &str) -> &'static str {
 
 async fn execute_sync(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &TosClient,
     args: &SyncArgs,
 ) -> Result<i32, CliError> {
-    let progress_enabled = effective_progress_enabled(global, args.progress, args.no_progress)?;
-    let runtime = effective_sync_runtime_config(global, args)?;
+    let progress_enabled =
+        effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
+    let runtime = effective_sync_runtime_config(profile, args)?;
     ensure_same_region_for_tos_uris(client, &args.source, &args.destination).await?;
     let validation_write_options = sync_write_options(args)?;
     ensure_tos_upload_storage_class_supported(
@@ -4970,9 +5008,9 @@ async fn execute_sync(
     )?;
     if Path::new(&args.source).is_dir() && args.destination.starts_with("tos://") {
         let report_path =
-            effective_report_path(global, args.report_path.as_deref(), "ve-tos sync")?;
+            effective_report_path(profile, args.report_path.as_deref(), "ve-tos sync")?;
         let manifest_path = effective_optional_manifest_path(
-            global,
+            profile,
             args.manifest_path.as_deref(),
             args.no_manifest,
             "ve-tos sync",
@@ -4990,9 +5028,9 @@ async fn execute_sync(
     }
     if sync_is_recursive(args) {
         let report_path =
-            effective_report_path(global, args.report_path.as_deref(), "ve-tos sync")?;
+            effective_report_path(profile, args.report_path.as_deref(), "ve-tos sync")?;
         let manifest_path = effective_optional_manifest_path(
-            global,
+            profile,
             args.manifest_path.as_deref(),
             args.no_manifest,
             "ve-tos sync",
@@ -5356,10 +5394,12 @@ async fn execute_sync_local_to_tos(
 
 async fn execute_cp_recursive(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &TosClient,
     args: &CpArgs,
 ) -> Result<i32, CliError> {
-    let progress_enabled = effective_progress_enabled(global, args.progress, args.no_progress)?;
+    let progress_enabled =
+        effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
     let list_echo_enabled = effective_list_echo_enabled(global, args.list_echo, args.no_list_echo);
     let write_options = copy_write_options(args)?;
     ensure_tos_upload_storage_class_supported(
@@ -5369,14 +5409,14 @@ async fn execute_cp_recursive(
         write_options.storage_class.as_deref(),
     )?;
     if args.no_manifest {
-        let report_path = effective_report_path(global, args.report_path.as_deref(), "ve-tos cp")?;
+        let report_path = effective_report_path(profile, args.report_path.as_deref(), "ve-tos cp")?;
         let manifest_path = effective_optional_manifest_path(
-            global,
+            profile,
             args.manifest_path.as_deref(),
             args.no_manifest,
             "ve-tos cp",
         )?;
-        let runtime = effective_cp_runtime_config(global, args)?;
+        let runtime = effective_cp_runtime_config(profile, args)?;
         return execute_cp_recursive_streaming_no_manifest(
             global,
             client,
@@ -5391,7 +5431,7 @@ async fn execute_cp_recursive(
         )
         .await;
     }
-    let runtime = effective_cp_runtime_config(global, args)?;
+    let runtime = effective_cp_runtime_config(profile, args)?;
     let mut scan_progress =
         RemoteScanProgress::new(list_echo_enabled, "ve-tos cp plan", &args.source);
     let mappings = build_recursive_copy_mappings(
@@ -5425,9 +5465,9 @@ async fn execute_cp_recursive(
         &planned,
     )?;
     scan_progress.finish_with_count(planned.len() as u64, "item(s)");
-    let report_path = effective_report_path(global, args.report_path.as_deref(), "ve-tos cp")?;
+    let report_path = effective_report_path(profile, args.report_path.as_deref(), "ve-tos cp")?;
     let manifest_path = effective_optional_manifest_path(
-        global,
+        profile,
         args.manifest_path.as_deref(),
         args.no_manifest,
         "ve-tos cp",
@@ -5509,7 +5549,8 @@ async fn execute_cp_recursive(
         let Some((src, dst, b, result)) = in_flight.next().await else {
             break;
         };
-        record_tos_copy_result(&mut report, &mut summary, "copy", src, dst, b, result);
+        let operation = cp_transfer_operation(&src, &dst);
+        record_tos_copy_result(&mut report, &mut summary, operation, src, dst, b, result);
     }
 
     let exit_code = if summary.failed > 0 { 1 } else { 0 };
@@ -5955,15 +5996,18 @@ fn record_tos_stream_copy_result(
     if let Some(progress) = progress {
         progress.inc(1);
     }
+    // [Review Fix #1] The no-manifest path must use the same directional
+    // operation contract as manifest-backed recursive cp.
+    let operation = cp_transfer_operation(&source, &destination);
     match result {
         Ok(result) if result.is_skipped() => {
-            report.record_skipped("copy", &source, Some(&destination));
+            report.record_skipped(operation, &source, Some(&destination));
         }
         Ok(_) => {
-            report.record_success("copy", &source, Some(&destination));
+            report.record_success(operation, &source, Some(&destination));
         }
         Err(ref err) => {
-            report.record_failure("copy", &source, Some(&destination), err);
+            report.record_failure(operation, &source, Some(&destination), err);
             eprintln!(
                 "warn: copy failed source={} destination={} error={}",
                 source, destination, err
@@ -6716,42 +6760,66 @@ async fn download_tos_to_local(
         .await;
     }
     headers.insert("if-match".to_string(), etag);
-    let response = core::send_object_request(
+    let retry_temp_path = temp_path.clone();
+    let expected_source_length = expected_length;
+    let expected_source_crc64 = expected_crc64;
+    let download_result = core::send_object_request_with_consumer(
         client,
-        Method::GET,
-        &source_target.bucket,
-        &key,
-        BTreeMap::new(),
-        headers,
-        None,
+        core::ReplayableObjectBytesRequest {
+            method: Method::GET,
+            bucket: &source_target.bucket,
+            key: &key,
+            query: BTreeMap::new(),
+            headers,
+            body: None,
+        },
+        move |response| {
+            let attempt_temp_path = retry_temp_path.clone();
+            async move {
+                let status_code = response.status().as_u16();
+                let response_headers = core::extract_headers(&response);
+                let mut response = client.check_response(response).await?;
+                if resume_offset > 0 {
+                    let file = fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        // [Review Fix #3] Preserve the completed checkpoint prefix;
+                        // set_len below performs the exact rollback explicitly.
+                        .truncate(false)
+                        .open(&attempt_temp_path)?;
+                    file.set_len(resume_offset)?;
+                }
+                let bytes_written = write_response_stream_with_mode(
+                    &mut response,
+                    &attempt_temp_path,
+                    resume_offset > 0,
+                )
+                .await?;
+                if let Some(expected_length) = expected_source_length {
+                    let total_written = resume_offset.saturating_add(bytes_written);
+                    if total_written != expected_length {
+                        return Err(CliError::TransferFailed(format!(
+                            "download length mismatch: expected={expected_length}, actual={total_written}"
+                        )));
+                    }
+                }
+                if let Some(expected_crc64) = expected_source_crc64 {
+                    let local_crc64 = file_crc64(attempt_temp_path.to_string_lossy().as_ref())?;
+                    if local_crc64 != expected_crc64 {
+                        return Err(CliError::TransferFailed(format!(
+                            "download CRC64 mismatch: local={local_crc64}, remote={expected_crc64}"
+                        )));
+                    }
+                }
+                Ok((status_code, response_headers, bytes_written))
+            }
+        },
     )
-    .await?;
-    let status_code = response.status().as_u16();
-    let response_headers = core::extract_headers(&response);
-    let mut response = client.check_response(response).await?;
-    // [Review Fix #11] Downloads write response chunks to a temp file before atomic persist.
-    let bytes_written =
-        write_response_stream_with_mode(&mut response, &temp_path, resume_offset > 0).await?;
-    if let Some(expected_length) = expected_length {
-        let total_written = resume_offset.saturating_add(bytes_written);
-        if total_written != expected_length {
-            let _ = fs::remove_file(&temp_path);
-            return Err(CliError::TransferFailed(format!(
-                "download length mismatch for '{}': expected={}, actual={}",
-                source, expected_length, total_written
-            )));
-        }
+    .await;
+    if download_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
     }
-    if let Some(expected_crc64) = expected_crc64 {
-        let local_crc64 = file_crc64(temp_path.to_string_lossy().as_ref())?;
-        if local_crc64 != expected_crc64 {
-            let _ = fs::remove_file(&temp_path);
-            return Err(CliError::TransferFailed(format!(
-                "download CRC64 mismatch for '{}': local={}, remote={}",
-                source, local_crc64, expected_crc64
-            )));
-        }
-    }
+    let (status_code, response_headers, bytes_written) = download_result?;
     persist_downloaded_file(&temp_path, destination_path, true)?;
     // [Review Fix #Progress-Overall] 下载成功后一次性把 bytes_written 推进 overall。
     // 注意：write_response_stream 已完成所有数据写入，这里仅做整体进度通知。
@@ -6966,31 +7034,44 @@ async fn download_tos_range_part(
     part_path: PathBuf,
 ) -> Result<u64, CliError> {
     let end = offset + size - 1;
-    let response = core::send_object_request(
+    let retry_part_path = part_path.clone();
+    let result = core::send_object_request_with_consumer(
         client,
-        Method::GET,
-        bucket,
-        key,
-        BTreeMap::new(),
-        BTreeMap::from([
-            ("if-match".to_string(), source_etag.to_string()),
-            ("range".to_string(), format!("bytes={offset}-{end}")),
-        ]),
-        None,
+        core::ReplayableObjectBytesRequest {
+            method: Method::GET,
+            bucket,
+            key,
+            query: BTreeMap::new(),
+            headers: BTreeMap::from([
+                ("if-match".to_string(), source_etag.to_string()),
+                ("range".to_string(), format!("bytes={offset}-{end}")),
+            ]),
+            body: None,
+        },
+        move |response| {
+            let attempt_part_path = retry_part_path.clone();
+            async move {
+                let mut response = client.check_response(response).await?;
+                let written =
+                    write_response_stream_with_mode(&mut response, &attempt_part_path, false)
+                        .await?;
+                if written != size {
+                    return Err(CliError::TransferFailed(format!(
+                        "range download length mismatch for '{}': expected={}, actual={}",
+                        attempt_part_path.display(),
+                        size,
+                        written
+                    )));
+                }
+                Ok(written)
+            }
+        },
     )
-    .await?;
-    let mut response = client.check_response(response).await?;
-    let written = write_response_stream_with_mode(&mut response, &part_path, false).await?;
-    if written != size {
+    .await;
+    if result.is_err() {
         let _ = fs::remove_file(&part_path);
-        return Err(CliError::TransferFailed(format!(
-            "range download length mismatch for '{}': expected={}, actual={}",
-            part_path.display(),
-            size,
-            written
-        )));
     }
-    Ok(written)
+    result
 }
 
 fn range_download_part_path(temp_path: &Path, part_number: u32) -> PathBuf {
@@ -7815,14 +7896,16 @@ async fn delete_tos_object(
 
 fn execute_cp_recursive_local(
     global: &GlobalArgs,
+    profile: &Profile,
     args: &CpArgs,
     report_path: Option<&str>,
     manifest_path: Option<&str>,
 ) -> Result<i32, CliError> {
     let mappings =
         build_local_source_mappings(&args.source, &args.destination, args.include_parent)?;
-    let runtime = effective_cp_runtime_config(global, args)?;
-    let progress_enabled = effective_progress_enabled(global, args.progress, args.no_progress)?;
+    let runtime = effective_cp_runtime_config(profile, args)?;
+    let progress_enabled =
+        effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
     let planned = mappings
         .into_iter()
         .filter(|item| {
@@ -7851,6 +7934,7 @@ fn execute_cp_recursive_local(
         Some(&manifest),
     )?;
     for item in planned {
+        let operation = cp_transfer_operation(&item.source, &item.destination);
         match copy_local_to_local(
             global,
             &item.source,
@@ -7868,14 +7952,14 @@ fn execute_cp_recursive_local(
         ) {
             Ok(result) => match result.outcome {
                 CopyOutcome::Transferred => {
-                    report.record_success("copy", &item.source, Some(&item.destination));
+                    report.record_success(operation, &item.source, Some(&item.destination));
                 }
                 CopyOutcome::Skipped => {
-                    report.record_skipped("copy", &item.source, Some(&item.destination));
+                    report.record_skipped(operation, &item.source, Some(&item.destination));
                 }
             },
             Err(err) => {
-                report.record_failure("copy", &item.source, Some(&item.destination), &err);
+                report.record_failure(operation, &item.source, Some(&item.destination), &err);
             }
         }
     }
@@ -7898,10 +7982,14 @@ fn execute_cp_recursive_local(
     }
 }
 
-fn execute_sync_local_to_local(global: &GlobalArgs, args: &SyncArgs) -> Result<i32, CliError> {
-    let report_path = effective_report_path(global, args.report_path.as_deref(), "ve-tos sync")?;
+fn execute_sync_local_to_local(
+    global: &GlobalArgs,
+    profile: &Profile,
+    args: &SyncArgs,
+) -> Result<i32, CliError> {
+    let report_path = effective_report_path(profile, args.report_path.as_deref(), "ve-tos sync")?;
     let manifest_path = effective_optional_manifest_path(
-        global,
+        profile,
         args.manifest_path.as_deref(),
         args.no_manifest,
         "ve-tos sync",
@@ -8115,6 +8203,7 @@ async fn execute_cat(
 
 async fn execute_put(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &TosClient,
     args: &PutArgs,
 ) -> Result<i32, CliError> {
@@ -8127,8 +8216,9 @@ async fn execute_put(
     let target = parse_tos_uri(&path, false)?;
     let key = target.key.expect("validated object key");
     let part_size =
-        effective_stdin_multipart_threshold(global, args.multipart_threshold.as_deref())?;
-    let progress_enabled = effective_progress_enabled(global, args.progress, args.no_progress)?;
+        effective_stdin_multipart_threshold(profile, args.multipart_threshold.as_deref())?;
+    let progress_enabled =
+        effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
     let write_options = put_write_options(args)?;
     ensure_tos_upload_storage_class_supported(
         "ve-tos put",
@@ -8572,10 +8662,9 @@ impl Drop for RemoteScanProgress {
 }
 
 fn effective_stdin_multipart_threshold(
-    global: &GlobalArgs,
+    profile: &Profile,
     cli_value: Option<&str>,
 ) -> Result<usize, CliError> {
-    let profile = build_profile(global)?;
     let threshold = effective_size_value(
         cli_value,
         profile.checkpoint_threshold.as_deref(),
@@ -8604,7 +8693,9 @@ async fn execute_presign(
     let target = parse_tos_uri(&path, false)?;
     let key = target.key.expect("validated object key");
     let method = validate_presign_method(&args.method)?;
-    let url = client.presign_object_url(method, &target.bucket, &key, args.expires)?;
+    let url = client
+        .presign_object_url(method, &target.bucket, &key, args.expires)
+        .await?;
     output_result(
         global,
         &high_level_success_envelope(
@@ -8621,6 +8712,7 @@ async fn execute_presign(
 
 async fn execute_du(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &TosClient,
     args: &DuArgs,
 ) -> Result<i32, CliError> {
@@ -8636,7 +8728,7 @@ async fn execute_du(
     let price_table = storage_price_table(&args.storage_price)?;
     let is_hns_bucket = bucket_is_hns(client, &target.bucket).await?;
     let use_hierarchical_listing = resolve_tos_du_list_mode(is_hns_bucket);
-    let list_concurrency = effective_list_concurrency(global, args.list_concurrency)?;
+    let list_concurrency = effective_list_concurrency(profile, args.list_concurrency)?;
     let progress = traversal_progress(
         "ve-tos du",
         &path,
@@ -9774,7 +9866,7 @@ pub(crate) fn command_needs_impact_listing(command: &str) -> bool {
 }
 
 async fn compute_dry_run_impact(
-    global: &GlobalArgs,
+    runtime: &TosRuntime,
     operation: &HighLevelOperation,
 ) -> Option<Impact> {
     if !command_needs_impact_listing(operation.command) {
@@ -9798,8 +9890,15 @@ async fn compute_dry_run_impact(
         return None;
     };
 
-    let profile = build_profile(global).ok()?;
-    let client = TosClient::new(&profile, "tos").ok()?;
+    // [Review Fix #8] Impact discovery is preview-only network I/O. Its
+    // service IDs must not become authoritative for a dry-run Envelope.
+    let client = runtime
+        .client_with_request_trace(
+            "tos",
+            &runtime.profile,
+            std::sync::Arc::new(tos_core::agent::request_id::ServiceRequestTrace::default()),
+        )
+        .ok()?;
 
     let prefix = parsed.key.as_deref();
     let entries = match list_object_entries_for_bucket(&client, &parsed.bucket, prefix).await {
@@ -9840,10 +9939,11 @@ async fn compute_dry_run_impact(
 
 async fn build_plan(
     global: &GlobalArgs,
+    runtime: &TosRuntime,
     operation: &HighLevelOperation,
     path_traversal_confirm_target: Option<&str>,
 ) -> Result<HighLevelPlan, CliError> {
-    let profile = build_profile(global)?;
+    let profile = &runtime.profile;
     let checkpoint_dir = operation.checkpoint_dir.clone().unwrap_or_else(|| {
         scoped_default_path(
             profile
@@ -9901,7 +10001,7 @@ async fn build_plan(
     let filters = plan_filters(operation);
     let request_plan = request_plan_steps(operation);
     let samples = plan_samples(operation);
-    let impact = compute_dry_run_impact(global, operation).await;
+    let impact = compute_dry_run_impact(runtime, operation).await;
     let mut warnings = dry_run_warnings(operation, path_traversal_confirm_target);
     if let Some(ref imp) = impact {
         // [Review Fix #m3] Prefer the explicit truncation flag now produced by
@@ -10196,7 +10296,7 @@ fn plan_samples(operation: &HighLevelOperation) -> Vec<PlanSample> {
 }
 
 fn effective_report_path(
-    global: &GlobalArgs,
+    profile: &Profile,
     explicit: Option<&str>,
     command: &str,
 ) -> Result<Option<String>, CliError> {
@@ -10207,12 +10307,13 @@ fn effective_report_path(
     if let Some(path) = explicit {
         return Ok(Some(expand_user_path(path).to_string_lossy().into_owned()));
     }
-    let profile = build_profile(global)?;
     let report_dir_raw = profile
         .batch_report_dir
+        .clone()
         .unwrap_or_else(|| DEFAULT_TOS_BATCH_REPORT_DIR.to_string());
     let report_format = profile
         .batch_report_format
+        .clone()
         .unwrap_or_else(|| DEFAULT_TOS_BATCH_REPORT_FORMAT.to_string());
     if report_format != "csv" {
         return Err(CliError::ValidationError(format!(
@@ -10237,16 +10338,16 @@ fn effective_report_path(
 }
 
 fn effective_manifest_path(
-    global: &GlobalArgs,
+    profile: &Profile,
     explicit: Option<&str>,
     command: &str,
 ) -> Result<Option<String>, CliError> {
     if let Some(path) = explicit {
         return Ok(Some(expand_user_path(path).to_string_lossy().into_owned()));
     }
-    let profile = build_profile(global)?;
     let report_dir_raw = profile
         .batch_report_dir
+        .clone()
         .unwrap_or_else(|| DEFAULT_TOS_BATCH_REPORT_DIR.to_string());
     let scoped_report_dir = scoped_default_path(
         report_dir_raw.trim_end_matches('/'),
@@ -10265,7 +10366,7 @@ fn effective_manifest_path(
 }
 
 fn effective_optional_manifest_path(
-    global: &GlobalArgs,
+    profile: &Profile,
     explicit: Option<&str>,
     no_manifest: bool,
     command: &str,
@@ -10273,7 +10374,7 @@ fn effective_optional_manifest_path(
     if no_manifest {
         return Ok(None);
     }
-    effective_manifest_path(global, explicit, command)
+    effective_manifest_path(profile, explicit, command)
 }
 
 fn top_level_storage_surface() -> &'static str {
@@ -10433,10 +10534,10 @@ fn effective_traversal_echo_enabled(
 
 fn effective_progress_enabled(
     global: &GlobalArgs,
+    profile: &Profile,
     progress: bool,
     no_progress: bool,
 ) -> Result<bool, CliError> {
-    let profile = build_profile(global)?;
     Ok(resolve_progress_plan(
         global,
         profile
@@ -10449,10 +10550,9 @@ fn effective_progress_enabled(
 }
 
 fn effective_cp_runtime_config(
-    global: &GlobalArgs,
+    profile: &Profile,
     args: &CpArgs,
 ) -> Result<TransferRuntimeConfig, CliError> {
-    let profile = build_profile(global)?;
     Ok(TransferRuntimeConfig {
         checkpoint_threshold: effective_size_value(
             args.checkpoint_threshold.as_deref(),
@@ -10492,10 +10592,9 @@ fn effective_cp_runtime_config(
 }
 
 fn effective_sync_runtime_config(
-    global: &GlobalArgs,
+    profile: &Profile,
     args: &SyncArgs,
 ) -> Result<TransferRuntimeConfig, CliError> {
-    let profile = build_profile(global)?;
     Ok(TransferRuntimeConfig {
         checkpoint_threshold: effective_size_value(
             args.checkpoint_threshold.as_deref(),
@@ -10534,10 +10633,7 @@ fn effective_sync_runtime_config(
     })
 }
 
-fn effective_default_runtime_config(
-    global: &GlobalArgs,
-) -> Result<TransferRuntimeConfig, CliError> {
-    let profile = build_profile(global)?;
+fn effective_default_runtime_config(profile: &Profile) -> Result<TransferRuntimeConfig, CliError> {
     Ok(TransferRuntimeConfig {
         checkpoint_threshold: effective_size_value(
             None,
@@ -10577,10 +10673,9 @@ fn effective_default_runtime_config(
 }
 
 fn effective_batch_concurrency(
-    global: &GlobalArgs,
+    profile: &Profile,
     cli_value: Option<usize>,
 ) -> Result<usize, CliError> {
-    let profile = build_profile(global)?;
     positive_or_config(
         cli_value,
         profile.batch_concurrency,
@@ -10590,10 +10685,9 @@ fn effective_batch_concurrency(
 }
 
 fn effective_list_concurrency(
-    global: &GlobalArgs,
+    profile: &Profile,
     cli_value: Option<usize>,
 ) -> Result<usize, CliError> {
-    let profile = build_profile(global)?;
     positive_or_config(
         cli_value,
         profile.list_concurrency,
@@ -12706,12 +12800,19 @@ async fn list_multipart_uploads_for_rm(
         if let Some(uim) = upload_id_marker.take() {
             query.insert("upload-id-marker".to_string(), uim);
         }
-        let response =
-            core::send_bucket_request(client, Method::GET, bucket, query, BTreeMap::new(), None)
-                .await?;
-        let response = client.check_response(response).await?;
-        let body = response.text().await.map_err(CliError::Http)?;
-        let json = parse_json_body(&body, "ListMultipartUploads")?;
+        let response = core::send_bucket_request_parsed(
+            client,
+            core::ReplayableBucketBytesRequest {
+                method: Method::GET,
+                bucket,
+                query,
+                headers: BTreeMap::new(),
+                body: None,
+            },
+            |body| parse_json_body(body, "ListMultipartUploads"),
+        )
+        .await?;
+        let json = response.value;
         for item in json_array(&json, &["uploads", "upload", "Uploads", "Upload"]) {
             let key = item
                 .get("Key")
@@ -12764,12 +12865,19 @@ async fn list_object_entries_with_prefixes(
         if let Some(token) = continuation_token.take() {
             query.insert("continuation-token".to_string(), token);
         }
-        let response =
-            core::send_bucket_request(client, Method::GET, bucket, query, BTreeMap::new(), None)
-                .await?;
-        let response = client.check_response(response).await?;
-        let body = response.text().await.map_err(CliError::Http)?;
-        let json = parse_json_body(&body, "ListObjects")?;
+        let response = core::send_bucket_request_parsed(
+            client,
+            core::ReplayableBucketBytesRequest {
+                method: Method::GET,
+                bucket,
+                query,
+                headers: BTreeMap::new(),
+                body: None,
+            },
+            |body| parse_json_body(body, "ListObjects"),
+        )
+        .await?;
+        let json = response.value;
         entries.extend(
             json_array(&json, &["contents", "Contents", "objects"])
                 .into_iter()
@@ -12838,12 +12946,19 @@ async fn list_object_entries_with_prefixes_limited(
             query.insert("continuation-token".to_string(), token);
         }
 
-        let response =
-            core::send_bucket_request(client, Method::GET, bucket, query, BTreeMap::new(), None)
-                .await?;
-        let response = client.check_response(response).await?;
-        let body = response.text().await.map_err(CliError::Http)?;
-        let json = parse_json_body(&body, "ListObjects")?;
+        let response = core::send_bucket_request_parsed(
+            client,
+            core::ReplayableBucketBytesRequest {
+                method: Method::GET,
+                bucket,
+                query,
+                headers: BTreeMap::new(),
+                body: None,
+            },
+            |body| parse_json_body(body, "ListObjects"),
+        )
+        .await?;
+        let json = response.value;
 
         let page_entries = json_array(&json, &["contents", "Contents", "objects"])
             .into_iter()
@@ -12950,13 +13065,20 @@ async fn list_object_entries_page(
         query.insert("continuation-token".to_string(), token.to_string());
     }
 
-    let response =
-        core::send_bucket_request(client, Method::GET, bucket, query, BTreeMap::new(), None)
-            .await?;
-    let response = client.check_response(response).await?;
-    let request_id = core::extract_request_id(&response);
-    let body = response.text().await.map_err(CliError::Http)?;
-    let json = parse_json_body(&body, "ListObjects")?;
+    let response = core::send_bucket_request_parsed(
+        client,
+        core::ReplayableBucketBytesRequest {
+            method: Method::GET,
+            bucket,
+            query,
+            headers: BTreeMap::new(),
+            body: None,
+        },
+        |body| parse_json_body(body, "ListObjects"),
+    )
+    .await?;
+    let request_id = response.request_id.clone();
+    let json = response.value;
     let entries = json_array(&json, &["contents", "Contents", "objects"])
         .into_iter()
         .filter_map(parse_object_entry)
@@ -13144,12 +13266,19 @@ async fn list_object_entries(
         if let Some(token) = continuation_token.take() {
             query.insert("continuation-token".to_string(), token);
         }
-        let response =
-            core::send_bucket_request(client, Method::GET, bucket, query, BTreeMap::new(), None)
-                .await?;
-        let response = client.check_response(response).await?;
-        let body = response.text().await.map_err(CliError::Http)?;
-        let json = parse_json_body(&body, "ListObjects")?;
+        let response = core::send_bucket_request_parsed(
+            client,
+            core::ReplayableBucketBytesRequest {
+                method: Method::GET,
+                bucket,
+                query,
+                headers: BTreeMap::new(),
+                body: None,
+            },
+            |body| parse_json_body(body, "ListObjects"),
+        )
+        .await?;
+        let json = response.value;
         entries.extend(
             json_array(&json, &["contents", "Contents", "objects"])
                 .into_iter()
@@ -13371,12 +13500,19 @@ async fn list_object_versions_with_prefixes(
         if let Some(vm) = version_id_marker.take() {
             query.insert("version-id-marker".to_string(), vm);
         }
-        let response =
-            core::send_bucket_request(client, Method::GET, bucket, query, BTreeMap::new(), None)
-                .await?;
-        let response = client.check_response(response).await?;
-        let body = response.text().await.map_err(CliError::Http)?;
-        let json = parse_json_body(&body, "ListObjectVersions")?;
+        let response = core::send_bucket_request_parsed(
+            client,
+            core::ReplayableBucketBytesRequest {
+                method: Method::GET,
+                bucket,
+                query,
+                headers: BTreeMap::new(),
+                body: None,
+            },
+            |body| parse_json_body(body, "ListObjectVersions"),
+        )
+        .await?;
+        let json = response.value;
 
         for item in json_array(&json, &["versions", "Versions"]) {
             if let (Some(key), Some(version_id)) = (
@@ -13441,19 +13577,20 @@ async fn list_uploaded_part_numbers(
     loop {
         let marker = part_number_marker.take();
         let query = list_parts_query(upload_id, marker.as_deref());
-        let response = core::send_object_request(
+        let response = core::send_object_request_parsed(
             client,
-            Method::GET,
-            bucket,
-            key,
-            query,
-            BTreeMap::new(),
-            None,
+            core::ReplayableObjectBytesRequest {
+                method: Method::GET,
+                bucket,
+                key,
+                query,
+                headers: BTreeMap::new(),
+                body: None,
+            },
+            |body| parse_json_body(body, "ListParts"),
         )
         .await?;
-        let response = client.check_response(response).await?;
-        let body = response.text().await.map_err(CliError::Http)?;
-        let json = parse_json_body(&body, "ListParts")?;
+        let json = response.value;
         parts.extend(
             json_array(&json, &["parts", "part", "Parts", "Part"])
                 .into_iter()
@@ -13752,11 +13889,7 @@ impl BatchProgressSummary {
     /// varying name lengths from causing the progress bar to jitter.
     pub(crate) fn set_current_file(&self, label: &str) {
         if let Some(bar) = &self.overall {
-            let truncated = if label.len() > 60 {
-                format!("…{}", &label[label.len() - 59..])
-            } else {
-                label.to_string()
-            };
+            let truncated = truncate_progress_label(label);
             bar.set_message(format!(
                 "{}/{} {}",
                 self.files_done, self.files_total, truncated
@@ -13830,6 +13963,63 @@ impl BatchProgressSummary {
         );
         output_result(global, &envelope)
     }
+}
+
+// [Review Fix #2] Keep each escaped control character and original grapheme
+// atomic so terminal controls cannot execute or be exposed as partial escapes.
+struct SanitizedProgressLabel {
+    text: String,
+    unit_starts: Vec<usize>,
+}
+
+fn append_sanitized_character(character: char, text: &mut String, unit_starts: &mut Vec<usize>) {
+    unit_starts.push(text.len());
+    if character.is_control() {
+        text.extend(character.escape_default());
+    } else {
+        text.push(character);
+    }
+}
+
+fn sanitize_progress_label(label: &str) -> SanitizedProgressLabel {
+    let mut text = String::with_capacity(label.len());
+    let mut unit_starts = Vec::new();
+    for grapheme in label.graphemes(true) {
+        if grapheme.chars().any(char::is_control) {
+            for character in grapheme.chars() {
+                append_sanitized_character(character, &mut text, &mut unit_starts);
+            }
+        } else {
+            unit_starts.push(text.len());
+            text.push_str(grapheme);
+        }
+    }
+    SanitizedProgressLabel { text, unit_starts }
+}
+
+fn truncate_progress_label(label: &str) -> String {
+    let sanitized = sanitize_progress_label(label);
+    if sanitized.text.width() <= MAX_PROGRESS_LABEL_WIDTH {
+        return sanitized.text;
+    }
+
+    let suffix_width_budget =
+        MAX_PROGRESS_LABEL_WIDTH.saturating_sub(PROGRESS_LABEL_ELLIPSIS.width());
+    let mut suffix_width: usize = 0;
+    let mut suffix_start = sanitized.text.len();
+    for unit_start in sanitized.unit_starts.into_iter().rev() {
+        let unit_width = sanitized.text[unit_start..suffix_start].width();
+        if suffix_width.saturating_add(unit_width) > suffix_width_budget {
+            break;
+        }
+        suffix_width += unit_width;
+        suffix_start = unit_start;
+    }
+
+    format!(
+        "{PROGRESS_LABEL_ELLIPSIS}{}",
+        &sanitized.text[suffix_start..]
+    )
 }
 
 fn parse_json_body(body: &str, context: &str) -> Result<Value, CliError> {
@@ -15508,7 +15698,9 @@ impl StreamingReportSink {
         }
         Ok(Self {
             writer: RollingCsvWriter::new(report_path, TOS_REPORT_COLUMNS)?,
-            command: command.to_string(),
+            // [Review Fix #2] CSV metadata must expose the public command that
+            // invoked the shared handler instead of leaking its internal id.
+            command: public_high_level_command(command),
             failures_only,
             action_ids,
             next_unplanned_action_id,
@@ -15803,6 +15995,9 @@ fn write_manifest_file(
     let Some(manifest_path) = manifest_path else {
         return Ok(());
     };
+    // [Review Fix #2] Keep persisted command metadata aligned with the active
+    // `tos` or `ve-tos` public surface.
+    let command = public_high_level_command(command);
     let mut writer = RollingCsvWriter::new(
         manifest_path,
         &[
@@ -15822,7 +16017,7 @@ fn write_manifest_file(
     )?;
     for item in &manifest.items {
         writer.write_record(&[
-            command.to_string(),
+            command.clone(),
             item.operation.to_string(),
             item.relative_key.clone(),
             item.source.clone(),
@@ -15851,6 +16046,9 @@ fn write_list_manifest_file(
     let Some(manifest_path) = manifest_path else {
         return Ok(());
     };
+    // [Review Fix #2] List manifests follow the same public command contract
+    // as transfer manifests and reports.
+    let command = public_high_level_command(command);
     let mut writer = RollingCsvWriter::new(
         manifest_path,
         &[
@@ -15867,7 +16065,7 @@ fn write_list_manifest_file(
     )?;
     for item in &manifest.items {
         writer.write_record(&[
-            command.to_string(),
+            command.clone(),
             item.item_type.to_string(),
             item.source.clone(),
             item.relative_key.clone().unwrap_or_default(),
@@ -15900,17 +16098,20 @@ fn write_tos_batch_report(
         }
         return Ok(());
     }
+    // [Review Fix #2] Collected reports bypass StreamingReportSink, so apply
+    // the public command mapping at this persistence boundary as well.
+    let command = public_high_level_command(command);
     let mut writer = RollingCsvWriter::new(report_path, TOS_REPORT_COLUMNS)?;
     if !failures_only {
         for item in &report.succeeded {
-            writer.write_record(&tos_report_record(command, item, None))?;
+            writer.write_record(&tos_report_record(&command, item, None))?;
         }
         for item in &report.skipped {
-            writer.write_record(&tos_report_record(command, item, None))?;
+            writer.write_record(&tos_report_record(&command, item, None))?;
         }
     }
     for item in &report.failed {
-        writer.write_record(&tos_report_record(command, item, None))?;
+        writer.write_record(&tos_report_record(&command, item, None))?;
     }
     Ok(())
 }
@@ -16167,6 +16368,117 @@ fn validate_tos_uri(uri: &str, allow_bucket_only: bool) -> Result<(), CliError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_controls_use_supplied_profile_snapshot() {
+        let profile = tos_core::infra::config::Profile {
+            checkpoint_threshold: Some("7MiB".to_string()),
+            progress_enabled: Some(false),
+            ..tos_core::infra::config::Profile::default()
+        };
+        let global = GlobalArgs::default();
+
+        assert_eq!(
+            effective_stdin_multipart_threshold(&profile, None).unwrap(),
+            7 * 1024 * 1024
+        );
+        assert!(effective_progress_enabled(&global, &profile, true, false).unwrap());
+    }
+
+    #[test]
+    fn progress_label_preserves_labels_within_display_width() {
+        for label in ["", "short.txt", &"a".repeat(60)] {
+            assert_eq!(truncate_progress_label(label), label);
+        }
+    }
+
+    #[test]
+    fn progress_label_truncates_ascii_to_maximum_display_width() {
+        let label = format!("x{}", "a".repeat(60));
+        let truncated = truncate_progress_label(&label);
+
+        assert_eq!(truncated, format!("…{}", "a".repeat(59)));
+        assert_eq!(UnicodeWidthStr::width(truncated.as_str()), 60);
+    }
+
+    #[test]
+    fn progress_label_truncates_chinese_without_panicking() {
+        let label = "务".repeat(31);
+        let truncated = truncate_progress_label(&label);
+
+        assert_eq!(truncated, format!("…{}", "务".repeat(29)));
+        assert!(UnicodeWidthStr::width(truncated.as_str()) <= 60);
+    }
+
+    #[test]
+    fn progress_label_preserves_extended_grapheme_clusters() {
+        // [Review Fix #1] Place clusters at the truncation boundary so a
+        // scalar-safe but grapheme-unsafe implementation cannot pass.
+        let emoji_label = format!("pp👩‍💻{}", "a".repeat(57));
+        let truncated_emoji = truncate_progress_label(&emoji_label);
+        assert_eq!(truncated_emoji, format!("…👩‍💻{}", "a".repeat(57)));
+        assert_eq!(UnicodeWidthStr::width(truncated_emoji.as_str()), 60);
+
+        let combining_label = format!("ppe\u{301}{}", "a".repeat(58));
+        let truncated_combining = truncate_progress_label(&combining_label);
+        assert_eq!(truncated_combining, format!("…e\u{301}{}", "a".repeat(58)));
+        assert_eq!(UnicodeWidthStr::width(truncated_combining.as_str()), 60);
+
+        let excluded_combining_label = format!("pe\u{301}{}", "a".repeat(59));
+        assert_eq!(
+            truncate_progress_label(&excluded_combining_label),
+            format!("…{}", "a".repeat(59))
+        );
+    }
+
+    #[test]
+    fn progress_label_escapes_unicode_controls_without_interpreting_literals() {
+        let label = "tab\tline\nreturn\rdelete\u{7f}c1\u{85}";
+        let sanitized = truncate_progress_label(label);
+
+        assert_eq!(sanitized, r"tab\tline\nreturn\rdelete\u{7f}c1\u{85}");
+        assert!(sanitized.chars().all(|character| !character.is_control()));
+        assert_eq!(truncate_progress_label(r"literal\n"), r"literal\n");
+    }
+
+    #[test]
+    fn progress_label_escapes_ansi_sequences() {
+        let label = "\u{1b}[31mred\u{1b}[0m";
+        let sanitized = truncate_progress_label(label);
+
+        assert_eq!(sanitized, r"\u{1b}[31mred\u{1b}[0m");
+        assert!(sanitized.chars().all(|character| !character.is_control()));
+    }
+
+    #[test]
+    fn progress_label_sanitizes_controls_before_unicode_safe_truncation() {
+        let label = format!("prefix\u{1b}👩‍💻e\u{301}{}", "z".repeat(50));
+        let sanitized = truncate_progress_label(&label);
+        let expected = format!("…{}👩‍💻e\u{301}{}", r"\u{1b}", "z".repeat(50));
+
+        assert_eq!(sanitized, expected);
+        assert_eq!(UnicodeWidthStr::width(sanitized.as_str()), 60);
+        assert!(sanitized.chars().all(|character| !character.is_control()));
+    }
+
+    #[test]
+    fn progress_label_excludes_control_escape_that_does_not_fully_fit() {
+        let label = format!("prefix\u{1b}{}", "z".repeat(54));
+        let sanitized = truncate_progress_label(&label);
+
+        assert_eq!(sanitized, format!("…{}", "z".repeat(54)));
+        assert!(!sanitized.contains("u{1b}"));
+        assert!(UnicodeWidthStr::width(sanitized.as_str()) <= 60);
+    }
+
+    #[test]
+    fn progress_label_truncates_many_tabs_as_complete_escape_units() {
+        let sanitized = truncate_progress_label(&"\t".repeat(60));
+
+        assert_eq!(sanitized, format!("…{}", r"\t".repeat(29)));
+        assert!(sanitized.chars().all(|character| !character.is_control()));
+        assert!(UnicodeWidthStr::width(sanitized.as_str()) <= 60);
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let path =
@@ -16855,6 +17167,70 @@ mod tests {
             )
         );
         assert!(lines.next().expect("manifest row").ends_with(",2,1,"));
+    }
+
+    #[test]
+    fn recursive_cp_manifest_uses_directional_operations() {
+        let mappings = [
+            ("local.txt", "tos://bucket/local.txt", "upload"),
+            ("tos://bucket/remote.txt", "local.txt", "download"),
+            (
+                "tos://bucket/source.txt",
+                "tos://bucket/destination.txt",
+                "copy",
+            ),
+            ("source.txt", "destination.txt", "local-copy"),
+        ];
+        let items = mappings
+            .iter()
+            .map(|(source, destination, _)| TransferPlanItem {
+                relative_key: source.to_string(),
+                source: source.to_string(),
+                destination: destination.to_string(),
+                size: 0,
+                etag: None,
+                crc64: None,
+                last_modified: None,
+            })
+            .collect::<Vec<_>>();
+
+        let manifest = build_transfer_manifest(&items);
+
+        assert_eq!(
+            manifest
+                .items
+                .iter()
+                .map(|item| item.operation)
+                .collect::<Vec<_>>(),
+            mappings
+                .iter()
+                .map(|(_, _, operation)| *operation)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unmanifested_recursive_cp_report_uses_directional_operation() {
+        let dir = temp_dir("tos-unmanifested-cp-direction");
+        let report_path = dir.join("report.csv");
+        let mut report =
+            BatchReport::new_streaming(0, report_path.to_str(), "ve-tos cp", false, None)
+                .expect("create streaming report");
+
+        record_tos_stream_copy_result(
+            &None,
+            &mut report,
+            "local.txt".to_string(),
+            "tos://bucket/local.txt".to_string(),
+            0,
+            Ok(CopyTransferResult::skipped()),
+        );
+
+        let body = fs::read_to_string(&report_path).expect("read report");
+        assert!(body.lines().nth(1).is_some_and(|row| row
+            .split(',')
+            .nth(1)
+            .is_some_and(|operation| operation == "upload")));
     }
 
     #[test]

@@ -1076,10 +1076,16 @@ pub const CAPABILITIES: &[CapabilityEntry] = &[
         supports_output_formats: SUPPORTED_OUTPUT_FORMATS,
         parameters: CONFIG_SET_PARAMETERS,
         body_contract: None,
-        consistency_guards: &["credential values are stored encrypted and redacted on show"],
+        consistency_guards: &[
+            "credential values are stored encrypted and redacted on show",
+            "VeTos authentication is selected with --auth-mode <MODE>: aksk or unified; TOS_AUTH_MODE is the environment override; Unified uses the same-name external profile and `ve login`",
+        ],
         examples: &[
             "ve-tos config set region cn-beijing",
             "ve-tos config set endpoint https://tos-cn-boe.volces.com --profile dev",
+            "ve-tos-cli --profile default --auth-mode unified ls",
+            "ve-tos-cli config set auth_mode unified",
+            "ve login",
         ],
         related_commands: &["ve-tos config show", "ve-tos doctor"],
     },
@@ -2043,6 +2049,11 @@ pub fn grouped_help_text(global_options: &str) -> String {
         "TOS Target Syntax:\n  URI:     tos://<bucket>/<key>\n  Flags:   --bucket <NAME> --key <KEY> / --prefix <PREFIX>\n\n",
     );
     output.push_str(global_options);
+    // [Review Fix #1] The shared `tos config` help must remain AK/SK-only, so
+    // document Unified only in this VeTos-specific grouped-help renderer.
+    output.push_str(&format!(
+        "\nUnified Authentication:\n  --auth-mode <MODE>  Authentication mode: aksk or unified (env: TOS_AUTH_MODE)\n  {command_prefix} --profile default --auth-mode unified ls\n  {command_prefix} config set auth_mode unified\n  ve login\n\n  Resolution precedence is --auth-mode <MODE>, profile auth_mode, TOS_AUTH_MODE,\n  then aksk. Unified selects the same-name externally managed profile and\n  ignores local AK/SK credentials.\n"
+    ));
     output.push_str(&format!(
         "\nExamples:\n  {command_prefix} mb tos://mybucket\n  {command_prefix} mkdir tos://mybucket/folder/\n  {command_prefix} ls tos://mybucket/\n  {command_prefix} cp ./a.txt tos://mybucket/docs/a.txt\n  {command_prefix} cat --bucket mybucket --key docs/a.txt\n  {command_prefix} rm tos://mybucket/docs/a.txt --force --confirm tos://mybucket/docs/a.txt\n  {command_prefix} rb tos://mybucket --force --confirm tos://mybucket\n\n"
     ));
@@ -3491,6 +3502,12 @@ const CONFIG_INIT_PARAMETERS: &[RegistryParameter] = &[param(
 const CONFIG_SET_PARAMETERS: &[RegistryParameter] = &[
     param("key", ParameterLocation::Path, true, "Config key"),
     param("value", ParameterLocation::Path, true, "Config value"),
+    param(
+        "auth-mode",
+        ParameterLocation::Flag,
+        false,
+        "Per-invocation VeTos authentication override: --auth-mode <MODE>; supported values are aksk or unified. TOS_AUTH_MODE supplies the environment value.",
+    ),
 ];
 
 const COMPLETION_PARAMETERS: &[RegistryParameter] = &[param(
@@ -4024,5 +4041,53 @@ mod tests {
     fn public_tos_command_does_not_translate_legacy_tos_prefix() {
         assert_eq!(public_tos_command("ve-tos cp"), "ve-tos cp");
         assert_eq!(public_tos_command("tos cp"), "tos cp");
+    }
+
+    #[test]
+    fn unified_auth_metadata_is_synchronized_for_ve_tos_only() {
+        let config = find_capability("ve-tos config set").expect("config set capability");
+        let registry = serde_json::to_string(config).unwrap();
+        for expected in [
+            "--auth-mode <MODE>",
+            "aksk or unified",
+            "TOS_AUTH_MODE",
+            "ve login",
+            "ve-tos-cli --profile default --auth-mode unified ls",
+            "ve-tos-cli config set auth_mode unified",
+        ] {
+            assert!(registry.contains(expected), "registry missing {expected}");
+        }
+
+        let grouped_help =
+            grouped_help_text(tos_core::agent::global_args::GROUPED_HELP_GLOBAL_OPTIONS);
+        for expected in [
+            "Unified Authentication:",
+            "--auth-mode <MODE>",
+            "TOS_AUTH_MODE",
+            "ve login",
+        ] {
+            assert!(
+                grouped_help.contains(expected),
+                "grouped help missing {expected}"
+            );
+        }
+
+        let skill = include_str!("../../../skills/ve-tos-cli/SKILL.md");
+        let readme = include_str!("../../../README.md");
+        for surface in [skill, readme] {
+            for expected in [
+                "aksk or unified",
+                "TOS_AUTH_MODE",
+                "ve login",
+                "ve-tos-cli --profile default --auth-mode unified ls",
+                "ve-tos-cli config set auth_mode unified",
+            ] {
+                assert!(surface.contains(expected), "surface missing {expected}");
+            }
+        }
+
+        let tos_skill = include_str!("../../../skills/tos-cli/SKILL.md");
+        assert!(!tos_skill.contains("--auth-mode"));
+        assert!(!tos_skill.to_ascii_lowercase().contains("unified"));
     }
 }

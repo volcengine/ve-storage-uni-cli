@@ -15,9 +15,11 @@
  */
 
 use super::output::OutputFormat;
+use super::request_id::ServiceRequestTrace;
 use clap::builder::BoolishValueParser;
 use clap::Args;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::agent::error::CliError;
 use crate::infra::config::ConfigFile;
@@ -182,6 +184,22 @@ pub struct GlobalArgs {
     /// Trace redaction level (strict / relaxed / off).
     #[arg(long, default_value = "strict", global = true, hide = true)]
     pub trace_redact: String,
+
+    /// Invocation-scoped service request identifiers shared with HTTP clients.
+    #[arg(skip)]
+    pub request_trace: Arc<ServiceRequestTrace>,
+
+    /// ve-tos authentication mode copied from the tool-scoped parser.
+    #[arg(skip)]
+    pub ve_tos_auth_mode: Option<String>,
+
+    /// Invocation-scoped documentation language selected by the root parser.
+    ///
+    /// This internal value is populated only after `--language` has been
+    /// removed from a canonical `--describe` invocation. It is never read from
+    /// config, credentials, or the environment.
+    #[arg(skip)]
+    pub documentation_language: Option<String>,
 }
 
 // [Review Fix] Provide a Default impl that matches the clap defaults for ergonomic
@@ -211,11 +229,19 @@ impl Default for GlobalArgs {
             quiet: false,
             trace_dir: None,
             trace_redact: "strict".to_string(),
+            request_trace: Arc::new(ServiceRequestTrace::default()),
+            ve_tos_auth_mode: None,
+            documentation_language: None,
         }
     }
 }
 
 impl GlobalArgs {
+    /// Return true when this invocation requested Chinese documentation.
+    pub fn uses_chinese_documentation(&self) -> bool {
+        self.documentation_language.as_deref() == Some("zh")
+    }
+
     /// Return the effective config file path for this invocation.
     ///
     /// Uses `--config-path` / `TOS_CONFIG_PATH` when present; otherwise returns

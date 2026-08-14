@@ -64,7 +64,7 @@ pub struct ApiArgs {
 #[command(
     about = "Inspect and modify TOS CLI configuration",
     long_about = "Inspect and modify TOS CLI configuration stored in ~/.tos/config.toml.",
-    after_help = "Examples:\n  ve-tos-cli config init\n  ve-tos-cli config init --profile staging\n  ve-tos-cli config show\n  ve-tos-cli config set region cn-beijing\n  ve-tos-cli config set endpoint https://tos-cn-beijing.volces.com\n  ve-tos-cli config set endpoint https://tos-cn-boe.volces.com --profile dev\n  ve-tos-cli config set control_endpoint https://tos-control-cn-beijing.volces.com\n  ve-tos-cli config set max_retry_count 3\n  ve-tos-cli config set requesttimeout 60"
+    after_help = "Examples:\n  ve-tos-cli config init\n  ve-tos-cli config init --profile staging\n  ve-tos-cli config show\n  ve-tos-cli config set region cn-beijing\n  ve-tos-cli config set endpoint https://tos-cn-beijing.volces.com\n  ve-tos-cli config set endpoint https://tos-cn-boe.volces.com --profile dev\n  ve-tos-cli config set control_endpoint https://tos-control-cn-beijing.volces.com\n  ve-tos-cli config set max_retry_count 3\n  ve-tos-cli config set requesttimeout 300"
 )]
 pub struct ConfigCommand {
     #[command(subcommand)]
@@ -73,15 +73,16 @@ pub struct ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigAction {
-    /// Interactive initialization
+    /// Initialize the selected profile. ve-tos writes Beijing network defaults;
+    /// ByteTOS tos leaves region, endpoint, and PSM unset
     #[command(
-        after_help = "Examples:\n  ve-tos-cli config init\n  ve-tos-cli config init --profile staging\n\nThis command ensures both the shared profile section `[profile]` and the ve-tos-specific override section `[profile.ve-tos]` exist."
+        after_help = "Examples:\n  ve-tos-cli config init\n  ve-tos-cli config init --profile staging\n\nThis command creates the shared and active binary sections. ve-tos writes the cn-beijing production endpoint pair; ByteTOS tos leaves region, endpoint, and PSM unset."
     )]
     Init {
         #[arg(
             long,
             help = "Profile name to initialize (defaults to `default`)",
-            long_help = "Profile name to initialize (defaults to `default`).\n\nThe command ensures both the shared section `[profile]` and the ve-tos-specific section `[profile.ve-tos]` exist."
+            long_help = "Profile name to initialize (defaults to `default`).\n\nThe command creates both the shared section `[profile]` and the active binary section (`[profile.ve-tos]` or `[profile.tos]`). Only ve-tos writes network defaults."
         )]
         profile: Option<String>,
     },
@@ -92,13 +93,13 @@ pub enum ConfigAction {
     Show,
     /// Set a configuration value
     #[command(
-        after_help = "Supported KEY values:\n  region                      -> write to [active-profile]\n  endpoint                    -> write to [active-profile.ve-tos] or [active-profile.tos]\n  psm / idc / cluster / addr_family (tos only) -> write to [active-profile.tos]\n  control_endpoint (ve-tos only) -> write to [active-profile.ve-tos]\n  account_id                  -> write to [active-profile.ve-tos]\n  checkpoint_dir / progress_enabled -> write to the active TOS binary section\n  max_retry_count / requesttimeout / connecttimeout / maxconnections -> write to the active TOS binary section\n  <profile>.region            -> write to [<profile>]\n  <profile>.endpoint          -> write to the active TOS binary section\n  <profile>.psm (tos only)    -> write to [<profile>.tos]\n  <profile>.control_endpoint (ve-tos only) -> write to [<profile>.ve-tos]\n  <profile>.account_id        -> write to [<profile>.ve-tos]\n  <profile>.ve-tos.endpoint   -> write to [<profile>.ve-tos]\n  <profile>.tos.psm           -> write to [<profile>.tos]\n  <profile>.access_key_id / secret_access_key -> write to [<profile>]\n\nExamples:\n  ve-tos-cli config set region cn-beijing\n  ve-tos-cli config set endpoint https://tos-cn-beijing.volces.com\n  ve-tos-cli config set endpoint https://tos-cn-boe.volces.com --profile dev\n  ve-tos-cli config set control_endpoint https://tos-control-cn-beijing.volces.com\n  ve-tos-cli config set account_id 2100000001\n  ve-tos-cli config set max_retry_count 3\n  ve-tos-cli config set requesttimeout 60\n  ve-tos-cli config set staging.region cn-shanghai\n  ve-tos-cli config set staging.control_endpoint https://tos-control-cn-shanghai.volces.com"
+        after_help = "Supported KEY values:\n  region                      -> write to [active-profile]\n  access_key_id / secret_access_key / security_token -> write to the active TOS binary credentials\n  endpoint                    -> write to [active-profile.ve-tos] or [active-profile.tos]\n  psm / idc / cluster / addr_family (tos only) -> write to [active-profile.tos]\n  control_endpoint (ve-tos only) -> write to [active-profile.ve-tos]\n  account_id                  -> write to [active-profile.ve-tos]\n  checkpoint_dir / progress_enabled -> write to the active TOS binary section\n  max_retry_count / requesttimeout / connecttimeout / maxconnections -> write to the active TOS binary section\n  <profile>.region            -> write to [<profile>]\n  <profile>.endpoint          -> write to the active TOS binary section\n  <profile>.psm (tos only)    -> write to [<profile>.tos]\n  <profile>.control_endpoint (ve-tos only) -> write to [<profile>.ve-tos]\n  <profile>.account_id        -> write to [<profile>.ve-tos]\n  <profile>.ve-tos.endpoint   -> write to [<profile>.ve-tos]\n  <profile>.tos.psm           -> write to [<profile>.tos]\n  <profile>.access_key_id / secret_access_key -> explicitly write shared credentials to [<profile>]\n\nExamples:\n  ve-tos-cli config set region cn-beijing\n  ve-tos-cli config set access_key_id AKxxx\n  ve-tos-cli config set endpoint https://tos-cn-beijing.volces.com\n  ve-tos-cli config set endpoint https://tos-cn-boe.volces.com --profile dev\n  ve-tos-cli config set control_endpoint https://tos-control-cn-beijing.volces.com\n  ve-tos-cli config set account_id 2100000001\n  ve-tos-cli config set max_retry_count 3\n  ve-tos-cli config set requesttimeout 300\n  ve-tos-cli config set staging.region cn-shanghai\n  ve-tos-cli config set staging.control_endpoint https://tos-control-cn-shanghai.volces.com"
     )]
     Set {
         #[arg(
             value_name = "KEY",
             help = "Configuration key, e.g. `region`, `endpoint`, `account_id`, or `staging.endpoint`",
-            long_help = "Configuration key to set.\n\nCommon keys include:\n  - region\n  - endpoint\n  - psm / idc / cluster / addr_family (tos only)\n  - control_endpoint (ve-tos only)\n  - account_id\n  - access_key_id\n  - secret_access_key\n  - max_retry_count\n  - requesttimeout\n  - connecttimeout\n  - maxconnections\n\nThree path forms are supported:\n  - active profile key: `region` (uses `--profile`, defaulting to `default`)\n  - named profile: `staging.region`\n  - binary override: `staging.ve-tos.endpoint` or `staging.tos.psm`\n\nFor `ve-tos`, an `endpoint` / `control_endpoint` / `account_id` / HTTP tuning key without an explicit binary qualifier is written to `[active-profile.ve-tos]` by default. For `tos`, `endpoint` and PSM keys are written to `[active-profile.tos]`; the `tos` entry rejects `control_endpoint` because only `ve-tos` has a control plane endpoint."
+            long_help = "Configuration key to set.\n\nCommon keys include:\n  - region\n  - endpoint\n  - psm / idc / cluster / addr_family (tos only)\n  - control_endpoint (ve-tos only)\n  - account_id\n  - access_key_id\n  - secret_access_key\n  - max_retry_count\n  - requesttimeout\n  - connecttimeout\n  - maxconnections\n\nThree path forms are supported:\n  - active profile key: `region` (uses `--profile`, defaulting to `default`)\n  - named profile: `staging.region`\n  - binary override: `staging.ve-tos.endpoint` or `staging.tos.psm`\n\nBare AK/SK credential keys are written to the current command surface: `[active-profile.ve-tos]` for `ve-tos` and `[active-profile.tos]` for `tos`. Use an explicit `<profile>.access_key_id` or other two-segment credential key only when shared TOS credentials are intended. For `ve-tos`, an `endpoint` / `control_endpoint` / `account_id` / HTTP tuning key without an explicit binary qualifier is written to `[active-profile.ve-tos]` by default. For `tos`, `endpoint` and PSM keys are written to `[active-profile.tos]`; the `tos` entry rejects `control_endpoint` because only `ve-tos` has a control plane endpoint."
         )]
         key: String,
         #[arg(
@@ -122,7 +123,7 @@ pub struct CompletionArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    long_about = "Start the TOS MCP server from the same registry-backed skill definitions used by `skill list`.\n\n`stdio` is the default MCP transport for clients that spawn the CLI as a child process. `sse` starts a local HTTP/SSE listener on 127.0.0.1:<port> with rmcp's standard `/sse` and `/message` endpoints. `--dry-run` and `--describe` report the startup plan without launching a long-lived server.",
+    long_about = "Start the TOS MCP server from the same registry-backed skill definitions used by `skill list`.\n\n`stdio` is the default MCP transport for clients that spawn the CLI as a child process. `sse` is same-host only and listens on 127.0.0.1:<port>. After binding, it prints a fresh Bearer token once to stderr. Every `/sse` and `/message` request must send it in the Authorization header; URL/query credentials are rejected. The Host header must be exact `127.0.0.1:<port>` or `localhost:<port>`. Native clients may omit Origin; when the Origin header is present, it must be the matching HTTP loopback origin on the same port. `--dry-run` and `--describe` report this startup contract without generating a token or launching a server.",
     after_help = "Examples:\n  ve-tos-cli serve --mcp\n  ve-tos-cli serve --mcp --transport sse --port 9090\n  ve-tos-cli serve --mcp --dry-run --output json\n\nMCP usage:\n  Tool names come from skills, e.g. `ve_tos_ls` for `ve-tos ls` and `ve_tos_bucket_create` for `ve-tos bucket create`.\n  `tools/call` plans by default; pass argument `execute: true` to run the underlying CLI command."
 )]
 pub struct ServeArgs {
@@ -133,7 +134,12 @@ pub struct ServeArgs {
     #[arg(long, default_value = "stdio", value_parser = ["stdio", "sse"])]
     pub transport: String,
     /// Port for SSE transport
-    #[arg(long, default_value = "8080")]
+    // [Review Fix #7] Port zero cannot describe the OS-selected listener port consistently.
+    #[arg(
+        long,
+        default_value = "8080",
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
     pub port: u16,
 }
 

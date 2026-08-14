@@ -117,6 +117,22 @@ export TOS_SECRET_KEY=<your-secret-access-key>
 export TOS_SECURITY_TOKEN=<optional-sts-token>
 ```
 
+`ve-tos-cli` supports `aksk or unified`; `tos-cli` remains AK/SK-only. Unified
+authentication selects the same-name profile managed by the external login
+framework. It ignores local AK/SK in `config.toml` and `credentials.toml`; the
+SDK supplies fresh signing credentials for each HTTP attempt. Login state is
+owned externally, so use `ve login` instead of writing credentials through the
+storage CLI.
+
+```bash
+ve-tos-cli --profile default --auth-mode unified ls
+ve-tos-cli config set auth_mode unified
+ve login
+```
+
+VeTos mode precedence is `--auth-mode` > `[profile.ve-tos].auth_mode` >
+`TOS_AUTH_MODE` > the backward-compatible `aksk` default.
+
 Configure ADrive credentials with environment variables:
 
 ```bash
@@ -125,18 +141,53 @@ export ADRIVE_SECRET_KEY=<your-adrive-secret-access-key>
 export ADRIVE_SECURITY_TOKEN=<optional-sts-token>
 ```
 
-ADrive also has an authentication-mode framework. Existing installations keep
-using `aksk` by default; OAuth service calls are not implemented yet.
+ADrive supports `aksk, oauth, or unified`. Existing installations keep using
+`aksk` by default.
 
 ```bash
 ve-adrive-cli config set auth_mode aksk
-ve-adrive-cli --auth-mode oauth auth status
-ve-adrive-cli auth login   # framework placeholder until OAuth integration lands
+ve-adrive-cli config set auth_mode oauth
+ve-adrive-cli --profile default --auth-mode unified ls
+ve-adrive-cli config set auth_mode unified
+ve login
+ve-adrive-cli config set auth_endpoint https://idsauth.volces.com
+ve-adrive-cli auth login --instance inst-1
+ve-adrive-cli auth status
+ve-adrive-cli auth logout
+ve-adrive-cli --dry-run auth logout
 ```
 
 Mode precedence is `--auth-mode` > `[profile.adrive].auth_mode` >
 `ADRIVE_AUTH_MODE` > the backward-compatible `aksk` default. Once a
 mode is selected, credentials from the other mode are not used as fallback.
+For one-off automation, pass `--auth-mode` without changing the Profile.
+Unified selects the same-name externally managed profile and ignores local
+AK/SK and OAuth tokens. `ve-adrive-cli auth login/logout` does not modify
+Unified state; use `ve login` / `ve logout` through the external framework.
+`auth logout --dry-run` reports whether the selected Profile would be cleared
+without rewriting `credentials.toml` or creating local encryption key material.
+
+`auth login` runs the Device Authorization flow in the foreground: it prints
+the verification URL and then polls until the user finishes or the grant
+expires. It requests the fixed `all` scope and saves
+the returned Access/Refresh Token pair under the current Profile in encrypted
+`credentials.toml`, along with any returned `user_id` identity metadata. OAuth
+user-owned Space creation uses that metadata when `--owner-id` is omitted;
+OAuth group-owned Spaces always require an explicit `--owner-id`. The Auth
+endpoint priority is `--auth-endpoint` > `[profile.adrive].auth_endpoint` >
+`ADRIVE_AUTH_ENDPOINT`; one of these sources is required for every new login.
+
+OAuth resource requests use Bearer authentication. Before each command the CLI
+reuses a valid Access Token or refreshes file-backed credentials when at most 60
+seconds remain. A first resource `401` forces one coordinated refresh and one
+replay; `403` never refreshes. The CLI is not a resident process and does not
+refresh in the background. If Refresh is no longer possible, scripts receive a
+`login_required` error; the CLI never starts an interactive login implicitly.
+
+`ADRIVE_ACCESS_TOKEN` is supported for read-only process-scoped automation when
+no OAuth Token exists in `credentials.toml`. Environment credential groups are
+never mixed with file credentials and cannot be auto-refreshed because rotated
+Refresh Tokens cannot be written back to the parent process environment.
 
 Sensitive credentials are stored separately from normal configuration:
 
@@ -149,17 +200,31 @@ New AK/SK writes from `tos-cli`, `ve-tos-cli`, and `ve-adrive-cli` go only to
 `credentials.toml`. Existing AK/SK values in `config.toml` remain readable for
 compatibility and are not migrated or duplicated automatically. Credential
 precedence is `credentials.toml` > legacy `config.toml` > environment variables.
+Bare credential keys are isolated by command surface:
+
+```bash
+tos-cli config set access_key_id <byte-tos-access-key>
+tos-cli config set secret_access_key <byte-tos-secret-key>
+ve-tos-cli config set access_key_id <volcengine-tos-access-key>
+ve-tos-cli config set secret_access_key <volcengine-tos-secret-key>
+ve-adrive-cli config set access_key_id <adrive-access-key>
+ve-adrive-cli config set secret_access_key <adrive-secret-key>
+```
+
+These commands write `[profile.tos]`, `[profile.ve-tos]`, and
+`[profile.adrive]`, respectively. Use an explicit key such as
+`default.access_key_id` only when shared credentials for `tos-cli` and
+`ve-tos-cli` are intended.
 
 Initialize or inspect local configuration:
 
 ```bash
 ve-tos-cli config init
-ve-tos-cli config set region cn-beijing
-ve-tos-cli config set endpoint https://tos-cn-beijing.volces.com
+# config init writes region=cn-beijing and endpoint=tos-cn-beijing.volces.com
 ve-tos-cli config show --output json
 
 tos-cli config set region cn-beijing
-tos-cli config set endpoint https://tos-cn-beijing.volces.com
+tos-cli config set endpoint https://your-bytetos-endpoint.example.com
 tos-cli config show --output json
 
 ve-adrive-cli config set region cn-beijing
@@ -212,6 +277,30 @@ tos-cli serve --mcp
 ve-adrive-cli serve --mcp
 ```
 
+`stdio` is the default transport and is intended for an Agent that starts the
+CLI as a child process. To use the local SSE transport, the Agent must run on
+the same machine (and in the same network namespace) as the CLI:
+
+```bash
+ve-tos-cli serve --mcp --transport sse --port 9090
+```
+
+After the loopback listener binds, the command writes a fresh credential once
+to stderr:
+
+```text
+MCP SSE listening on http://127.0.0.1:9090/sse
+Authorization: Bearer <TOKEN>
+```
+
+Configure the MCP client to send that value in the `Authorization` header on
+both the `GET /sse` stream and every `POST /message` request. Do not put the
+credential in a URL, query parameter, or MCP payload. The accepted Host values
+are exactly `127.0.0.1:9090` and `localhost:9090`. Native clients may omit
+`Origin`; if present, it must be an HTTP loopback origin on the same port.
+`--dry-run` and `--describe` report this contract without creating a token or
+opening a listener.
+
 ## Common Options
 
 Most commands share these options:
@@ -244,14 +333,18 @@ Credential variables are resolved by the config layer:
 | `TOS_ACCESS_KEY`        | TOS access key ID.                                                             |
 | `TOS_SECRET_KEY`        | TOS secret access key.                                                         |
 | `TOS_SECURITY_TOKEN`    | Optional TOS STS security token.                                               |
+| `TOS_AUTH_MODE`         | VeTos authentication mode: `aksk` or `unified`; ignored by `tos-cli`.          |
 | `ADRIVE_ACCESS_KEY`     | ADrive access key ID.                                                          |
 | `ADRIVE_SECRET_KEY`     | ADrive secret access key.                                                      |
 | `ADRIVE_SECURITY_TOKEN` | Optional ADrive STS security token.                                            |
-| `ADRIVE_REGION`         | ADrive region, used to derive the IDS endpoint when no endpoint is configured. |
-| `ADRIVE_ENDPOINT`       | ADrive IDS endpoint override.                                                  |
-| `ADRIVE_AUTH_MODE`      | Process-scoped ADrive authentication mode: `aksk` or `oauth`.                   |
-| `ADRIVE_ACCESS_TOKEN`   | Process-scoped OAuth access token placeholder for future service integration.   |
-| `ADRIVE_REFRESH_TOKEN`  | Process-scoped OAuth refresh token placeholder for future service integration.  |
+| `ADRIVE_REGION`         | ADrive signing region; required when it cannot be parsed from the configured endpoint. |
+| `ADRIVE_ENDPOINT`       | Required ADrive IDS resource endpoint.                                        |
+| `ADRIVE_AUTH_MODE`      | Process-scoped ADrive authentication mode: `aksk`, `oauth`, or `unified`.        |
+| `ADRIVE_AUTH_ENDPOINT`  | OAuth Authorization Server used by the next explicit login.                      |
+| `ADRIVE_DEFAULT_INSTANCE` | Default IDS Instance used by OAuth login.                                      |
+| `ADRIVE_DEVICE_NAME`    | Device name displayed during OAuth authorization.                                |
+| `ADRIVE_ACCESS_TOKEN`   | Read-only process-scoped OAuth Access Token.                                      |
+| `ADRIVE_REFRESH_TOKEN`  | Process-scoped OAuth group field; it is informational unless an Access Token is also supplied. |
 
 ## Skill Installation
 

@@ -40,6 +40,207 @@ use crate::registry::{
 };
 
 const TOS_CONFIG_BINARY_ENV: &str = "VE_STORAGE_UNI_TOS_CONFIG_BINARY";
+const TOS_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    ("API metadata action name", "API 元数据 action 名称"),
+    ("API metadata group name", "API 元数据 group 名称"),
+    ("Abort incomplete multipart uploads matching the prefix", "中止与前缀匹配的未完成分片上传"),
+    ("Allow overwrite/delete operations without interactive confirmation", "允许无需交互确认执行覆盖/删除操作"),
+    ("Bucket name when URI style is not used", "未使用 URI 形式时的 Bucket 名称"),
+    ("Byte range", "字节范围"),
+    ("Comma-separated output columns", "逗号分隔的输出列"),
+    ("Compare by size only", "仅按大小比较"),
+    ("Content-Type for uploaded or copied objects", "上传或复制对象的 Content-Type"),
+    ("Continuation token returned by a previous listing", "上一次列举返回的 continuation token"),
+    ("Create parent folder markers as needed", "按需创建父文件夹标记"),
+    ("Custom TOS metadata as key=value pairs", "key=value 对形式的自定义 TOS 元数据"),
+    ("Delete every object version and delete marker", "删除每个对象版本和删除标记"),
+    ("Delete extraneous destination objects", "删除目标端多余对象"),
+    ("Destination overwrite strategy", "目标覆盖策略"),
+    ("Directory for transfer checkpoint state", "传输 checkpoint 状态目录"),
+    ("Disable execution progress output", "禁用执行进度输出"),
+    ("Disable listing-phase echo output", "禁用列举阶段回显输出"),
+    ("Disable planned manifest output", "禁用计划 manifest 输出"),
+    ("Enable execution progress output on stderr", "在 stderr 启用执行进度输出"),
+    ("Enable listing-phase echo output on stderr", "在 stderr 启用列举阶段回显输出"),
+    ("Enable resumable transfer or recursive item checkpointing", "启用可恢复传输或递归项目 checkpoint"),
+    ("Exact target confirmation for non-interactive destructive commands", "非交互破坏性命令的精确目标确认"),
+    ("Exclude pattern", "排除匹配模式"),
+    ("Fail when the destination already exists", "目标已存在时失败"),
+    ("File size threshold for checkpoint multipart/range transfer", "触发 checkpoint 分片/范围传输的文件大小阈值"),
+    ("HTTP method: GET or PUT", "HTTP method：GET 或 PUT"),
+    ("Include estimated monthly storage cost", "包含预估月度存储费用"),
+    ("Include pattern", "包含匹配模式"),
+    ("Include the source directory or prefix name under the destination prefix", "在目标前缀下包含源目录或前缀名称"),
+    ("Local path or tos://bucket/key destination", "本地路径或 tos://bucket/key 目标"),
+    ("Local path or tos://bucket/key source", "本地路径或 tos://bucket/key 源"),
+    ("MCP transport: stdio or sse", "MCP transport：stdio 或 sse"),
+    ("Maximum buckets, objects, or prefixes to return", "最多返回的 Bucket、对象或前缀数量"),
+    ("Maximum directory depth", "最大目录深度"),
+    ("Maximum files/items running concurrently in batch commands", "批量命令中并发运行的最大文件/项目数"),
+    ("Maximum parts/ranges running concurrently for one large file", "单个大文件并发运行的最大分片/范围数"),
+    ("Maximum prefixes listed concurrently in recursive batch commands", "递归批量命令中并发列举的最大前缀数"),
+    ("Modification time filter", "修改时间过滤条件"),
+    ("Name pattern", "名称匹配模式"),
+    ("Number of largest/oldest object samples to keep in verbose diagnostics; 0 disables samples", "详细诊断中保留的最大/最旧对象样本数；0 表示禁用样本"),
+    ("Object key or prefix when URI style is not used", "未使用 URI 形式时的对象 key 或前缀"),
+    ("Object version ID", "对象版本 ID"),
+    ("Optional dry-run request JSON or file://path", "可选的 dry-run 请求 JSON 或 file://path"),
+    ("Optional tos://bucket/key or tos://bucket/prefix target", "可选的 tos://bucket/key 或 tos://bucket/prefix 目标"),
+    ("Override storage price as CLASS=PRICE", "以 CLASS=PRICE 覆盖存储价格"),
+    ("Progress granularity: part or byte", "进度粒度：part 或 byte"),
+    ("Recursive listing mode; tos accepts hierarchical listing semantics", "递归列举模式；tos 使用分层列举语义"),
+    ("Render human-readable sizes", "渲染易读大小"),
+    ("SSE listen port", "SSE 监听端口"),
+    ("Shell type: bash, zsh, fish, or powershell", "Shell 类型：bash、zsh、fish 或 powershell"),
+    ("Size filter", "大小过滤条件"),
+    ("Sort field", "排序字段"),
+    ("Start the MCP server instead of returning registry metadata", "启动 MCP 服务，而不是返回 registry 元数据"),
+    ("Stdin size threshold for switching to multipart upload", "切换为分片上传的 stdin 大小阈值"),
+    ("Target object ACL", "目标对象 ACL"),
+    ("Throttle upload/download bandwidth, e.g. 100MB", "限制上传/下载带宽，例如 100MB"),
+    ("Traverse prefixes recursively with delimiter=\"/\"", "使用 delimiter=\"/\" 递归遍历前缀"),
+    ("URL expiration time in seconds", "URL 过期秒数"),
+    ("Use exact timestamps for comparison", "使用精确时间戳比较"),
+    ("Write batch success/failure report to this path", "将批量成功/失败报告写入此路径"),
+    ("Write only failed items to the batch report", "批量报告中仅写入失败项目"),
+    ("Write planned operation manifest to this path", "将计划操作 manifest 写入此路径"),
+    ("ByteCloud TOS CLI high-level object storage workflows and utilities", "ByteCloud TOS CLI 高层对象存储工作流和实用工具"),
+    ("Copy local files, TOS objects, or prefixes", "复制本地文件、TOS 对象或前缀"),
+    ("Move files or objects by copy plus source delete", "通过复制并删除源文件/对象来移动"),
+    ("Synchronize source and destination incrementally", "增量同步源和目标"),
+    ("Create a folder marker", "创建文件夹标记"),
+    ("Delete objects or prefixes", "删除对象或前缀"),
+    ("List object prefixes or objects within a bucket", "列出 Bucket 内的对象前缀或对象"),
+    ("Show bucket or object metadata", "查看 Bucket 或对象元数据"),
+    ("Calculate size statistics for a prefix", "统计前缀大小"),
+    ("Find objects by filters", "按过滤条件查找对象"),
+    ("Stream object content", "流式输出对象内容"),
+    ("Upload stdin to an object", "将 stdin 上传为对象"),
+    ("Generate presigned URL", "生成预签名 URL"),
+    ("Discover CLI capabilities", "发现 CLI 能力"),
+    ("Guarded API metadata and dry-run planning utility", "受保护的 API 元数据与 dry-run 规划工具"),
+    ("Configuration management", "配置管理"),
+    ("Generate shell completion", "生成 shell 补全"),
+    ("Start or plan MCP serving", "启动或规划 MCP 服务"),
+    ("List TOS skill metadata or export Markdown SKILL.md files", "列出 TOS Skill 元数据或导出 Markdown SKILL.md 文件"),
+    ("Environment diagnostics", "环境诊断"),
+    ("High-level object and bucket workflows", "高层对象和 Bucket 工作流"),
+    ("Discovery, configuration, diagnostics, completion, skill, API passthrough, and serve utilities", "发现、配置、诊断、补全、Skill、API passthrough 和服务实用工具"),
+    ("All object/prefix listing scenarios use delimiter=\"/\".", "所有对象/前缀列举场景都使用 delimiter=\"/\"。"),
+    ("Recursive deletes use planned object deletes; bottom-up directory delete ordering is not required.", "递归删除使用计划对象删除；无需按自底向上的目录顺序删除。"),
+    ("Execute the CLI command; false returns a plan only", "执行 CLI 命令；false 仅返回计划"),
+    ("Pass global --dry-run to the CLI command", "将全局 --dry-run 传递给 CLI 命令"),
+    ("Pass global --describe to the CLI command", "将全局 --describe 传递给 CLI 命令"),
+    ("Configuration profile name", "配置 profile 名称"),
+    ("Output format, defaults to json", "输出格式，默认为 json"),
+    ("Optional global region override", "可选的全局 region 覆盖"),
+    ("Optional global endpoint override", "可选的全局 endpoint 覆盖"),
+    ("Include extra diagnostic output where supported", "在支持时包含额外诊断输出"),
+    ("Disable prompts and progress output", "禁用提示和进度输出"),
+];
+
+fn tos_metadata_translation_zh(text: &str) -> Option<&'static str> {
+    TOS_METADATA_TRANSLATIONS_ZH
+        .iter()
+        .find_map(|(english, chinese)| (*english == text).then_some(*chinese))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TosMetadataContext {
+    Structured,
+    HumanText,
+    HumanContainer,
+    SchemaProperties,
+    Machine,
+}
+
+fn tos_child_metadata_context(
+    parent: TosMetadataContext,
+    key: &str,
+    value: &Value,
+) -> TosMetadataContext {
+    // [Review Fix #TosZh2] Production and exhaustive owner audits share this
+    // positive human-field policy, so catalog collisions cannot rewrite flags,
+    // examples, commands, API identifiers, enums, or other machine metadata.
+    if parent == TosMetadataContext::Machine {
+        return TosMetadataContext::Machine;
+    }
+    // [Review Fix #TosZh6] A JSON Schema property name is an identifier, not a
+    // metadata-field role; its child description remains human prose even when
+    // the property is literally named `path`, `command`, `type`, or `name`.
+    if parent == TosMetadataContext::SchemaProperties {
+        return TosMetadataContext::Structured;
+    }
+    if key == "description" && value.is_string() {
+        return TosMetadataContext::HumanText;
+    }
+    if key == "properties" && value.is_object() {
+        return TosMetadataContext::SchemaProperties;
+    }
+    if is_tos_machine_metadata_key(key) {
+        return TosMetadataContext::Machine;
+    }
+    if matches!(key, "high_level_semantics" | "scenario_routing") {
+        return TosMetadataContext::HumanContainer;
+    }
+    if parent == TosMetadataContext::HumanContainer && value.is_string() {
+        return TosMetadataContext::HumanText;
+    }
+    parent
+}
+
+fn is_tos_machine_metadata_key(key: &str) -> bool {
+    matches!(
+        key,
+        "api"
+            | "api_actions"
+            | "code"
+            | "command"
+            | "enum"
+            | "examples"
+            | "group"
+            | "id"
+            | "layer"
+            | "method"
+            | "mode"
+            | "name"
+            | "path"
+            | "risk_level"
+            | "service"
+            | "type"
+            | "uri"
+            | "uri_format"
+            | "wraps_apis"
+            | "low_level_apis"
+    )
+}
+
+/// Localize exact TOS owner prose while preserving machine metadata.
+pub fn localize_tos_documentation_zh(value: &mut Value) {
+    localize_tos_metadata_value_zh(value, TosMetadataContext::Structured);
+}
+
+fn localize_tos_metadata_value_zh(value: &mut Value, context: TosMetadataContext) {
+    match value {
+        Value::String(text) if context == TosMetadataContext::HumanText => {
+            if let Some(chinese) = tos_metadata_translation_zh(text) {
+                *text = chinese.to_string();
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                localize_tos_metadata_value_zh(item, context);
+            }
+        }
+        Value::Object(map) => {
+            for (key, child) in map {
+                let child_context = tos_child_metadata_context(context, key, child);
+                localize_tos_metadata_value_zh(child, child_context);
+            }
+        }
+        _ => {}
+    }
+}
 
 struct EnvGuard {
     previous: Option<String>,
@@ -184,12 +385,22 @@ pub async fn handle_api_command(global: &GlobalArgs, args: &ApiArgs) -> Result<i
         let capability = find_capability("tos api")
             .map(|row| compact_row(&row))
             .unwrap_or_else(|| json!({"command": "tos api", "mode": "guarded_utility"}));
-        let desc = json!({
-            "command": command,
-            "description": format!(
+        let description = if global.uses_chinese_documentation() {
+            // [Review Fix #GlobalZh4] The group/action identifiers remain
+            // verbatim while the explicit dynamic prose template is localized.
+            format!(
+                "受保护的 TOS 工具 API 元数据：{}.{}；tos-cli 仅执行高层工作流",
+                args.group, args.action
+            )
+        } else {
+            format!(
                 "Guarded TOS utility API metadata for {}.{}; tos-cli executes high-level workflows only",
                 args.group, args.action
-            ),
+            )
+        };
+        let mut desc = json!({
+            "command": command,
+            "description": description,
             "service": "tos",
             "capability": capability,
             "mode": "guarded_utility",
@@ -199,6 +410,9 @@ pub async fn handle_api_command(global: &GlobalArgs, args: &ApiArgs) -> Result<i
             "supports_force": false,
             "endpoint_mode_only": true,
         });
+        if global.uses_chinese_documentation() {
+            localize_tos_documentation_zh(&mut desc);
+        }
         ve_tos_cli::handler::common::output_result(global, &Envelope::success(command, desc))?;
         return Ok(0);
     }
@@ -301,6 +515,18 @@ fn serve_plan(args: &ServeArgs) -> Result<Value, CliError> {
         "tcp_listener": is_sse,
         "bind": is_sse.then(|| format!("127.0.0.1:{}", args.port)),
         "endpoints": if is_sse { vec!["/sse", "/message"] } else { Vec::new() },
+        "authentication": if is_sse { "ephemeral_bearer" } else { "process_stdio" },
+        "token_output": is_sse.then_some("stderr_once_after_bind"),
+        "authorization_header_required": is_sse,
+        "allowed_hosts": if is_sse {
+            vec![
+                format!("127.0.0.1:{}", args.port),
+                format!("localhost:{}", args.port),
+            ]
+        } else {
+            Vec::new()
+        },
+        "origin_policy": is_sse.then_some("missing_or_exact_http_loopback_origin_same_port"),
         "tool_source": "In-process tos-cli high-level skill registry; exported Markdown skills are not read by serve.",
         "call_semantics": "tools/call plans by default; include execute=true to run the underlying CLI command.",
         "capabilities": capabilities().len(),
@@ -900,47 +1126,21 @@ fn skill_definitions_for_language(language: DocumentationLanguage) -> Vec<SkillD
 }
 
 fn localized_skill_description_zh(skill: &SkillDefinition) -> String {
-    format!(
-        "用于调用 `{}`。原始英文说明：{}",
-        public_tos_command(&skill.command),
-        skill.description
-    )
+    tos_metadata_translation_zh(&skill.description)
+        .expect("owner audit guarantees every TOS Skill description")
+        .to_string()
 }
 
 fn localized_input_schema(schema: &Value, language: DocumentationLanguage) -> Value {
     match language {
         DocumentationLanguage::En => schema.clone(),
-        DocumentationLanguage::Zh => localize_schema_descriptions_zh(schema),
-    }
-}
-
-fn localize_schema_descriptions_zh(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut localized = serde_json::Map::new();
-            for (key, child) in map {
-                if key == "description" {
-                    if let Some(description) = child.as_str() {
-                        // [Review Fix #ZhDocs1] 中文 skill 文档不能只翻译章节标题；
-                        // schema 参数说明也包装成中文，保留原文避免误译命令契约。
-                        localized.insert(
-                            key.clone(),
-                            Value::String(format!("参数说明：{description}")),
-                        );
-                        continue;
-                    }
-                }
-                localized.insert(key.clone(), localize_schema_descriptions_zh(child));
-            }
-            Value::Object(localized)
+        DocumentationLanguage::Zh => {
+            // [Review Fix #TosZh3] Skill schemas use the same context-aware
+            // localizer as Describe metadata instead of a broader key-only pass.
+            let mut localized = schema.clone();
+            localize_tos_documentation_zh(&mut localized);
+            localized
         }
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(localize_schema_descriptions_zh)
-                .collect::<Vec<_>>(),
-        ),
-        _ => value.clone(),
     }
 }
 
@@ -1686,4 +1886,194 @@ fn string_field<'a>(object: &'a serde_json::Map<String, Value>, key: &str) -> Op
 
 fn bool_field(object: &serde_json::Map<String, Value>, key: &str) -> Option<bool> {
     object.get(key).and_then(Value::as_bool)
+}
+
+#[cfg(test)]
+mod chinese_metadata_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn collect_human_metadata(
+        value: &Value,
+        path: &str,
+        context: TosMetadataContext,
+        prose: &mut Vec<(String, String)>,
+    ) {
+        match value {
+            Value::String(source) if context == TosMetadataContext::HumanText => {
+                prose.push((path.to_string(), source.clone()));
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    collect_human_metadata(item, &format!("{path}[{index}]"), context, prose);
+                }
+            }
+            Value::Object(map) => {
+                for (key, child) in map {
+                    let child_context = tos_child_metadata_context(context, key, child);
+                    collect_human_metadata(child, &format!("{path}.{key}"), child_context, prose);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn missing_chinese(context: &str, document: &Value) -> BTreeSet<String> {
+        let mut prose = Vec::new();
+        collect_human_metadata(document, "$", TosMetadataContext::Structured, &mut prose);
+        prose
+            .into_iter()
+            .filter_map(|(path, source)| {
+                tos_metadata_translation_zh(&source)
+                    .filter(|translation| *translation != source && !translation.contains(&source))
+                    .is_none()
+                    .then(|| format!("command={context}, path={path}, source={source:?}"))
+            })
+            .collect()
+    }
+
+    fn human_metadata_by_path(document: &Value) -> BTreeMap<String, String> {
+        let mut prose = Vec::new();
+        collect_human_metadata(document, "$", TosMetadataContext::Structured, &mut prose);
+        prose.into_iter().collect()
+    }
+
+    fn assert_exact_human_localization(context: &str, english: &Value, chinese: &Value) {
+        let english_prose = human_metadata_by_path(english);
+        let chinese_prose = human_metadata_by_path(chinese);
+        assert_eq!(
+            english_prose.keys().collect::<Vec<_>>(),
+            chinese_prose.keys().collect::<Vec<_>>()
+        );
+        for (path, source) in english_prose {
+            let expected = tos_metadata_translation_zh(&source).unwrap_or_else(|| {
+                panic!("command={context}, path={path}, missing source={source:?}")
+            });
+            assert_eq!(
+                chinese_prose.get(&path).map(String::as_str),
+                Some(expected),
+                "command={context}, path={path}, source={source:?}"
+            );
+        }
+    }
+
+    fn describe_documents() -> Vec<(String, Value)> {
+        let mut documents = vec![(
+            "tos root".to_string(),
+            json!({
+                "description": "ByteCloud TOS CLI high-level object storage workflows and utilities",
+            }),
+        )];
+        documents.extend(
+            group_rows(&capabilities().iter().collect::<Vec<_>>())
+                .into_iter()
+                .map(|value| ("tos group".to_string(), value)),
+        );
+        documents.extend(capabilities().iter().filter_map(|row| {
+            describe_tos_command_metadata(row.command).map(|document| {
+                (
+                    row.command.to_string(),
+                    serde_json::to_value(document).unwrap(),
+                )
+            })
+        }));
+        documents
+    }
+
+    #[test]
+    fn chinese_catalog_recursively_covers_tos_describe_metadata() {
+        let mut missing = BTreeSet::new();
+        for (command, document) in describe_documents() {
+            missing.extend(missing_chinese(&command, &document));
+            let mut localized = document.clone();
+            localize_tos_documentation_zh(&mut localized);
+            assert_exact_human_localization(&command, &document, &localized);
+        }
+        assert!(
+            missing.is_empty(),
+            "missing TOS Describe translations:\n{}",
+            missing.into_iter().collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    #[test]
+    fn chinese_catalog_covers_every_skill_description_and_schema() {
+        let mut missing = BTreeSet::new();
+        let english = skill_definitions_for_language(DocumentationLanguage::En);
+        let chinese = skill_definitions_for_language(DocumentationLanguage::Zh);
+        for english_skill in english {
+            let chinese_skill = chinese
+                .iter()
+                .find(|skill| skill.command == english_skill.command)
+                .unwrap_or_else(|| {
+                    panic!("missing Chinese Skill command={}", english_skill.command)
+                });
+            let document = serde_json::to_value(&english_skill).unwrap();
+            let localized = serde_json::to_value(chinese_skill).unwrap();
+            missing.extend(missing_chinese(&english_skill.command, &document));
+            assert_exact_human_localization(&english_skill.command, &document, &localized);
+        }
+        assert!(
+            missing.is_empty(),
+            "missing TOS Skill translations:\n{}",
+            missing.into_iter().collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    #[test]
+    fn chinese_catalog_sources_are_unique() {
+        let mut sources = BTreeSet::new();
+        for (english, chinese) in TOS_METADATA_TRANSLATIONS_ZH {
+            assert!(
+                sources.insert(*english),
+                "duplicate English source={english:?}"
+            );
+            assert_ne!(english, chinese, "untranslated source={english:?}");
+        }
+    }
+
+    #[test]
+    fn chinese_localizer_preserves_machine_field_catalog_collisions() {
+        let mut document = json!({
+            "description": "Copy local files, TOS objects, or prefixes",
+            "command": "Copy local files, TOS objects, or prefixes",
+            "name": "Configuration management",
+            "type": "Copy local files, TOS objects, or prefixes",
+            "examples": ["Copy local files, TOS objects, or prefixes"],
+        });
+        localize_tos_documentation_zh(&mut document);
+        assert_eq!(document["description"], "复制本地文件、TOS 对象或前缀");
+        assert_eq!(
+            document["command"],
+            "Copy local files, TOS objects, or prefixes"
+        );
+        assert_eq!(document["name"], "Configuration management");
+        assert_eq!(
+            document["type"],
+            "Copy local files, TOS objects, or prefixes"
+        );
+        assert_eq!(
+            document["examples"][0],
+            "Copy local files, TOS objects, or prefixes"
+        );
+    }
+
+    #[test]
+    fn chinese_localizer_audits_schema_properties_named_like_machine_fields() {
+        let mut schema = json!({
+            "properties": {
+                "path": {"description": "Optional tos://bucket/key or tos://bucket/prefix target"},
+                "command": {"description": "Execute the CLI command; false returns a plan only"},
+            }
+        });
+        localize_tos_documentation_zh(&mut schema);
+        assert_eq!(
+            schema["properties"]["path"]["description"],
+            "可选的 tos://bucket/key 或 tos://bucket/prefix 目标"
+        );
+        assert_eq!(
+            schema["properties"]["command"]["description"],
+            "执行 CLI 命令；false 仅返回计划"
+        );
+    }
 }

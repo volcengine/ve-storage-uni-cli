@@ -140,7 +140,7 @@ pub const DEFAULT_MULTIPART_CONCURRENCY: usize = 4;
 pub const DEFAULT_PROGRESS_GRANULARITY: &str = "part";
 pub const DEFAULT_OVERWRITE_STRATEGY: &str = "force";
 pub const DEFAULT_HTTP_MAX_RETRY_COUNT: u32 = 3;
-pub const DEFAULT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 60;
+pub const DEFAULT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 300;
 pub const DEFAULT_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 10;
 pub const DEFAULT_HTTP_MAX_CONNECTIONS: usize = 100;
 
@@ -161,6 +161,8 @@ fn is_secret_field(name: &str) -> bool {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TosOverride {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -268,6 +270,11 @@ pub struct AdriveOverride {
     pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    // [Review Fix #1] This public field is an Authorization Server origin,
+    // not the ADrive Resource Server endpoint above.
+    /// OAuth Authorization Server base URL used for ADrive login.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access_key_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -389,14 +396,49 @@ pub struct Profile {
 }
 
 impl Profile {
+    fn clear_aksk_credentials(&mut self) {
+        self.access_key_id = None;
+        self.secret_access_key = None;
+        self.security_token = None;
+        for settings in [&mut self.tos, &mut self.ve_tos].into_iter().flatten() {
+            settings.access_key_id = None;
+            settings.secret_access_key = None;
+            settings.security_token = None;
+        }
+        if let Some(settings) = self.tosvector.as_mut() {
+            settings.access_key_id = None;
+            settings.secret_access_key = None;
+            settings.security_token = None;
+        }
+        if let Some(settings) = self.tostable.as_mut() {
+            settings.access_key_id = None;
+            settings.secret_access_key = None;
+            settings.security_token = None;
+        }
+        if let Some(settings) = self.adrive.as_mut() {
+            settings.access_key_id = None;
+            settings.secret_access_key = None;
+            settings.security_token = None;
+        }
+    }
+
     /// 从环境变量构建 Profile（shared 字段）。
     pub fn from_env() -> Self {
-        Self::from_env_with_prefix("TOS")
+        Self::from_env_with_prefix("TOS", true)
+    }
+
+    /// Build a TOS environment profile without accessing credential variables.
+    ///
+    /// Resource, timeout, and runtime-control fields are retained while
+    /// `TOS_ACCESS_KEY`, `TOS_SECRET_KEY`, and `TOS_SECURITY_TOKEN` are never
+    /// queried. This is the environment source for credential-free auth modes.
+    pub fn from_env_without_credentials() -> Self {
+        Self::from_env_with_prefix("TOS", false)
     }
 
     /// 从 ByteCloud TOS 专属环境变量构建 Profile。
     pub fn from_byte_tos_env() -> Self {
-        let mut profile = Self::from_env_with_prefix("BYTE_TOS");
+        let mut profile = Self::from_env_with_prefix("BYTE_TOS", true);
         // [Review Fix #1] Blank BYTE_TOS_PSM must not activate IDC/cluster/addr_family.
         profile.psm = env_var("BYTE_TOS", "PSM").filter(|value| !value.trim().is_empty());
         if profile.psm.is_some() {
@@ -407,12 +449,23 @@ impl Profile {
         profile
     }
 
-    fn from_env_with_prefix(prefix: &str) -> Self {
+    fn from_env_with_prefix(prefix: &str, include_credentials: bool) -> Self {
+        // [Review Fix #4] Unified auth must not even query unselected
+        // credential variables; clearing a fully populated profile is too late.
+        let (access_key_id, secret_access_key, security_token) = if include_credentials {
+            (
+                env_var(prefix, "ACCESS_KEY"),
+                env_var(prefix, "SECRET_KEY"),
+                env_var(prefix, "SECURITY_TOKEN"),
+            )
+        } else {
+            (None, None, None)
+        };
         Self {
             region: env_var(prefix, "REGION"),
-            access_key_id: env_var(prefix, "ACCESS_KEY"),
-            secret_access_key: env_var(prefix, "SECRET_KEY"),
-            security_token: env_var(prefix, "SECURITY_TOKEN"),
+            access_key_id,
+            secret_access_key,
+            security_token,
             endpoint: env_var(prefix, "ENDPOINT"),
             psm: None,
             idc: None,
@@ -638,6 +691,9 @@ pub struct EffectiveProfile {
     pub binary: String,
     pub region: TracedField<String>,
     pub endpoint: TracedField<String>,
+    /// adrive 专属：OAuth Authorization Server endpoint。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_endpoint: Option<TracedField<String>>,
     #[serde(skip_serializing_if = "TracedField::is_unset")]
     pub psm: TracedField<String>,
     #[serde(skip_serializing_if = "TracedField::is_unset")]
@@ -665,7 +721,9 @@ pub struct EffectiveProfile {
     pub access_key_id: TracedField<String>,
     pub secret_access_key: TracedField<String>,
     pub security_token: TracedField<String>,
-    /// adrive 专属：认证策略。
+    // [Review Fix #1] Authentication mode is exposed only for the two binaries
+    // whose schemas support explicit mode selection.
+    /// ve-tos 与 adrive 专属：认证策略。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<TracedField<String>>,
     /// adrive 专属：OAuth access token，仅用于脱敏配置检查。
@@ -830,14 +888,34 @@ impl ConfigFile {
                 e
             ))
         })?;
-        let config: ConfigFile = toml::from_str(&content).map_err(|e| {
+        let config: ConfigFile = toml::from_str(&content).map_err(|_error| {
+            // [Review Fix #6] TOML parser diagnostics quote the offending
+            // source line, which can contain a plaintext credential.
             CliError::ValidationError(format!(
-                "Failed to parse config file {}: {}",
-                path.display(),
-                e
+                "Failed to parse config file {}; validate its TOML syntax and schema",
+                path.display()
             ))
         })?;
+        config.validate_tos_auth_mode_absent()?;
         Ok(config)
+    }
+
+    fn validate_tos_auth_mode_absent(&self) -> Result<(), CliError> {
+        // [Review Fix #5] The tos namespace ban is structural and global, while
+        // supported-mode values are validated only for the selected profile.
+        for (profile_name, profile) in &self.profiles {
+            if profile
+                .tos
+                .as_ref()
+                .and_then(|tos_override| tos_override.auth_mode.as_ref())
+                .is_some()
+            {
+                return Err(CliError::ValidationError(format!(
+                    "auth_mode is not supported in [{profile_name}.tos]; use [{profile_name}.ve-tos]"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// 将当前 ConfigFile 持久化到默认路径；敏感字段若为明文自动加密为 `ENC:...`。
@@ -876,23 +954,7 @@ impl ConfigFile {
 
         let content = toml::to_string_pretty(&to_write)
             .map_err(|e| CliError::ValidationError(format!("Failed to serialize config: {}", e)))?;
-        std::fs::write(path, content).map_err(|e| {
-            CliError::Io(std::io::Error::new(
-                e.kind(),
-                format!("Failed to write config file {}: {}", path.display(), e),
-            ))
-        })?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(path) {
-                let mut perm = meta.permissions();
-                perm.set_mode(0o600);
-                let _ = std::fs::set_permissions(path, perm);
-            }
-        }
-        Ok(())
+        super::atomic_file::write_owner_only_atomic(path, content.as_bytes())
     }
 
     /// 获取 profile（只读）。
@@ -996,6 +1058,7 @@ impl ConfigFile {
         let mut security_token =
             TracedField::shared(strip_placeholder(profile.security_token.clone()));
 
+        let mut auth_endpoint: Option<TracedField<String>> = None;
         let mut account_id: Option<TracedField<String>> = None;
         let mut default_instance: Option<TracedField<String>> = None;
         let mut default_space: Option<TracedField<String>> = None;
@@ -1010,6 +1073,20 @@ impl ConfigFile {
                 } else {
                     profile.ve_tos.as_ref()
                 };
+                if binary == Binary::VeTos {
+                    let configured_auth_mode = tos_override
+                        .and_then(|tos_override| tos_override.auth_mode.as_deref())
+                        .map(normalize_ve_tos_auth_mode)
+                        .transpose()?;
+                    auth_mode = Some(TracedField {
+                        source: if configured_auth_mode.is_some() {
+                            FieldSource::BinaryOverride
+                        } else {
+                            FieldSource::Unset
+                        },
+                        value: configured_auth_mode,
+                    });
+                }
                 if let Some(o) = tos_override {
                     region = TracedField::override_with(region, o.region.clone());
                     endpoint = TracedField::override_with(endpoint, o.endpoint.clone());
@@ -1099,16 +1176,29 @@ impl ConfigFile {
             }
             Binary::Adrive => {
                 if let Some(o) = &profile.adrive {
+                    let configured_auth_mode = o
+                        .auth_mode
+                        .as_deref()
+                        .map(normalize_adrive_auth_mode)
+                        .transpose()?;
                     auth_mode = Some(TracedField {
-                        source: if o.auth_mode.is_some() {
+                        source: if configured_auth_mode.is_some() {
                             FieldSource::BinaryOverride
                         } else {
                             FieldSource::Unset
                         },
-                        value: o.auth_mode.clone(),
+                        value: configured_auth_mode,
                     });
                     region = TracedField::override_with(region, o.region.clone());
                     endpoint = TracedField::override_with(endpoint, o.endpoint.clone());
+                    auth_endpoint = Some(TracedField {
+                        source: if o.auth_endpoint.is_some() {
+                            FieldSource::BinaryOverride
+                        } else {
+                            FieldSource::Unset
+                        },
+                        value: o.auth_endpoint.clone(),
+                    });
                     checkpoint_dir =
                         TracedField::override_with(checkpoint_dir, o.checkpoint_dir.clone());
                     batch_report_dir =
@@ -1174,6 +1264,10 @@ impl ConfigFile {
                     });
                 } else {
                     auth_mode = Some(TracedField {
+                        value: None,
+                        source: FieldSource::Unset,
+                    });
+                    auth_endpoint = Some(TracedField {
                         value: None,
                         source: FieldSource::Unset,
                     });
@@ -1276,6 +1370,7 @@ impl ConfigFile {
             binary: binary.as_str().to_string(),
             region,
             endpoint,
+            auth_endpoint,
             psm,
             idc,
             cluster,
@@ -1305,6 +1400,31 @@ impl ConfigFile {
             default_instance,
             default_space,
         })
+    }
+
+    /// Compute an effective profile without materializing local AK/SK/session credentials.
+    ///
+    /// Resource, transport, control-plane, and authentication-mode settings
+    /// are retained. Credential fields are cleared before the normal resolver
+    /// reaches its decryption phase, so this method never reads a local
+    /// encryption key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError::ConfigMissing`] when `profile_name` is absent or
+    /// isolated to a sibling TOS namespace, and returns validation errors for
+    /// invalid settings in the selected effective profile.
+    pub fn get_effective_profile_without_credentials_in_dir(
+        &self,
+        profile_name: &str,
+        binary: Binary,
+        config_dir: &Path,
+    ) -> Result<EffectiveProfile, CliError> {
+        let mut non_secret_config = self.clone();
+        if let Some(profile) = non_secret_config.profiles.get_mut(profile_name) {
+            profile.clear_aksk_credentials();
+        }
+        non_secret_config.get_effective_profile_in_dir(profile_name, binary, config_dir)
     }
 }
 
@@ -1660,11 +1780,11 @@ fn set_binary_field(
     match bin {
         Binary::Tos => {
             let o = profile.tos.get_or_insert_with(TosOverride::default);
-            set_tos_override(o, key, value)
+            set_tos_override(o, key, value, false)
         }
         Binary::VeTos => {
             let o = profile.ve_tos.get_or_insert_with(TosOverride::default);
-            set_tos_override(o, key, value)
+            set_tos_override(o, key, value, true)
         }
         Binary::TosVector => {
             let o = profile
@@ -1685,8 +1805,21 @@ fn set_binary_field(
     }
 }
 
-fn set_tos_override(o: &mut TosOverride, key: &str, value: &str) -> Result<(), CliError> {
+fn set_tos_override(
+    o: &mut TosOverride,
+    key: &str,
+    value: &str,
+    supports_auth_mode: bool,
+) -> Result<(), CliError> {
     match canonical_config_key(key) {
+        "auth_mode" if supports_auth_mode => {
+            o.auth_mode = Some(normalize_ve_tos_auth_mode(value)?);
+        }
+        "auth_mode" => {
+            return Err(CliError::ValidationError(
+                "auth_mode is not supported by tos; use the ve-tos config namespace".to_string(),
+            ));
+        }
         "region" => o.region = Some(value.into()),
         "endpoint" => o.endpoint = Some(value.into()),
         "psm" => o.psm = Some(value.into()),
@@ -1773,17 +1906,11 @@ fn set_tostable_override(o: &mut TosTableOverride, key: &str, value: &str) -> Re
 fn set_adrive_override(o: &mut AdriveOverride, key: &str, value: &str) -> Result<(), CliError> {
     match canonical_config_key(key) {
         "auth_mode" => {
-            let normalized = value.trim().to_ascii_lowercase();
-            if !matches!(normalized.as_str(), "aksk" | "oauth") {
-                return Err(CliError::ValidationError(format!(
-                    "invalid ADrive auth_mode '{}': expected aksk or oauth",
-                    value
-                )));
-            }
-            o.auth_mode = Some(normalized);
+            o.auth_mode = Some(normalize_adrive_auth_mode(value)?);
         }
         "region" => o.region = Some(value.into()),
         "endpoint" => o.endpoint = Some(value.into()),
+        "auth_endpoint" => o.auth_endpoint = Some(value.into()),
         "access_key_id" => o.access_key_id = Some(value.into()),
         "secret_access_key" => o.secret_access_key = Some(value.into()),
         "security_token" => o.security_token = Some(value.into()),
@@ -1814,6 +1941,28 @@ fn set_adrive_override(o: &mut AdriveOverride, key: &str, value: &str) -> Result
         }
     }
     Ok(())
+}
+
+fn normalize_ve_tos_auth_mode(value: &str) -> Result<String, CliError> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "aksk" | "unified") {
+        return Ok(normalized);
+    }
+    Err(CliError::ValidationError(format!(
+        "invalid ve-tos auth_mode '{}': expected aksk or unified",
+        value
+    )))
+}
+
+fn normalize_adrive_auth_mode(value: &str) -> Result<String, CliError> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "aksk" | "oauth" | "unified") {
+        return Ok(normalized);
+    }
+    Err(CliError::ValidationError(format!(
+        "invalid ADrive auth_mode '{}': expected aksk, oauth, or unified",
+        value
+    )))
 }
 
 /// 将一个密文/明文字符串遮蔽为 `****xxxx` 样式；`ENC:` 前缀会被保留替换为 `ENC:****`。
@@ -1866,6 +2015,393 @@ impl ConfigFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static PROFILE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvironmentRestore {
+        values: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvironmentRestore {
+        fn capture(names: &[&'static str]) -> Self {
+            Self {
+                values: names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvironmentRestore {
+        fn drop(&mut self) {
+            for (name, value) in self.values.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_secret_env_profile_retains_resources_and_excludes_credentials() {
+        let _lock = PROFILE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let names = [
+            "TOS_REGION",
+            "TOS_ENDPOINT",
+            "TOS_BATCH_CONCURRENCY",
+            "TOS_ACCESS_KEY",
+            "TOS_SECRET_KEY",
+            "TOS_SECURITY_TOKEN",
+        ];
+        let _restore = EnvironmentRestore::capture(&names);
+        std::env::set_var("TOS_REGION", "cn-beijing");
+        std::env::set_var("TOS_ENDPOINT", "https://tos.example.com");
+        std::env::set_var("TOS_BATCH_CONCURRENCY", "7");
+        std::env::set_var("TOS_ACCESS_KEY", "must-not-be-selected");
+        std::env::set_var("TOS_SECRET_KEY", "must-not-be-selected");
+        std::env::set_var("TOS_SECURITY_TOKEN", "must-not-be-selected");
+
+        let profile = Profile::from_env_without_credentials();
+
+        assert_eq!(profile.region.as_deref(), Some("cn-beijing"));
+        assert_eq!(profile.endpoint.as_deref(), Some("https://tos.example.com"));
+        assert_eq!(profile.batch_concurrency, Some(7));
+        assert!(profile.access_key_id.is_none());
+        assert!(profile.secret_access_key.is_none());
+        assert!(profile.security_token.is_none());
+    }
+
+    #[test]
+    fn no_credentials_effective_profile_retains_resources_without_decrypting() {
+        let directory = std::env::temp_dir().join(format!(
+            "ve-tos-non-secret-profile-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut config = ConfigFile::default();
+        let profile = config.get_or_insert_profile("selected");
+        profile.region = Some("cn-beijing".to_string());
+        profile.access_key_id = Some("ENC:not-valid".to_string());
+        profile.secret_access_key = Some("ENC:not-valid".to_string());
+        profile.security_token = Some("ENC:not-valid".to_string());
+        profile.ve_tos = Some(TosOverride {
+            auth_mode: Some("unified".to_string()),
+            endpoint: Some("https://tos.example.com".to_string()),
+            control_endpoint: Some("https://tos-control.example.com".to_string()),
+            max_retry_count: Some(7),
+            access_key_id: Some("ENC:not-valid".to_string()),
+            secret_access_key: Some("ENC:not-valid".to_string()),
+            security_token: Some("ENC:not-valid".to_string()),
+            ..TosOverride::default()
+        });
+
+        let effective = config
+            .get_effective_profile_without_credentials_in_dir("selected", Binary::VeTos, &directory)
+            .unwrap();
+
+        assert_eq!(effective.region.value.as_deref(), Some("cn-beijing"));
+        assert_eq!(
+            effective.endpoint.value.as_deref(),
+            Some("https://tos.example.com")
+        );
+        assert_eq!(
+            effective.control_endpoint.value.as_deref(),
+            Some("https://tos-control.example.com")
+        );
+        assert_eq!(effective.max_retry_count.value, Some(7));
+        assert_eq!(
+            effective.auth_mode.and_then(|field| field.value).as_deref(),
+            Some("unified")
+        );
+        assert!(effective.access_key_id.value.is_none());
+        assert!(effective.secret_access_key.value.is_none());
+        assert!(effective.security_token.value.is_none());
+        assert!(!directory.join(".key").exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn config_parse_error_does_not_echo_secret_source_line() {
+        let directory = std::env::temp_dir().join(format!(
+            "tos-config-parse-redaction-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.toml");
+        std::fs::write(
+            &path,
+            "[default.adrive]\nsecret_access_key = \"SECRET_MUST_NOT_LEAK\n",
+        )
+        .unwrap();
+
+        let error = ConfigFile::load_from(&path).err().expect("parse error");
+
+        assert!(!error.to_string().contains("SECRET_MUST_NOT_LEAK"));
+        assert!(error.to_string().contains(&path.display().to_string()));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn ve_tos_auth_mode_setter_normalizes_and_populates_effective_profile() {
+        let mut config = ConfigFile::default();
+
+        config
+            .set_by_path(&["default", "ve-tos", "auth_mode"], "  UNIFIED  ")
+            .unwrap();
+
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("[default.ve-tos]"));
+        assert!(serialized.contains("auth_mode = \"unified\""));
+        assert!(!serialized.contains("[default.tos]"));
+
+        let effective = config
+            .get_effective_profile("default", Binary::VeTos)
+            .unwrap();
+        let auth_mode = effective.auth_mode.expect("ve-tos auth mode");
+        assert_eq!(auth_mode.value.as_deref(), Some("unified"));
+        assert_eq!(auth_mode.source, FieldSource::BinaryOverride);
+    }
+
+    #[test]
+    fn ve_tos_auth_mode_setter_rejects_other_values() {
+        let error = ConfigFile::default()
+            .set_by_path(&["default", "ve-tos", "auth_mode"], "oauth")
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Validation error: invalid ve-tos auth_mode 'oauth': expected aksk or unified"
+        );
+    }
+
+    #[test]
+    fn tos_auth_mode_setter_is_rejected() {
+        let mut config = ConfigFile::default();
+
+        let error = config
+            .set_by_path(&["default", "tos", "auth_mode"], "unified")
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Validation error: auth_mode is not supported by tos; use the ve-tos config namespace"
+        );
+    }
+
+    #[test]
+    fn handwritten_tos_auth_mode_is_rejected_after_deserialization() {
+        let directory = std::env::temp_dir().join(format!(
+            "tos-config-auth-mode-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.toml");
+        std::fs::write(&path, "[default.tos]\nauth_mode = \"unified\"\n").unwrap();
+
+        let error = ConfigFile::load_from(&path).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Validation error: auth_mode is not supported in [default.tos]; use [default.ve-tos]"
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn handwritten_ve_tos_auth_mode_is_normalized_and_validated() {
+        let directory = std::env::temp_dir().join(format!(
+            "ve-tos-config-auth-mode-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.toml");
+        std::fs::write(&path, "[default.ve-tos]\nauth_mode = \"  UNIFIED  \"\n").unwrap();
+
+        let config = ConfigFile::load_from(&path).unwrap();
+        let effective = config
+            .get_effective_profile("default", Binary::VeTos)
+            .unwrap();
+
+        assert_eq!(
+            effective.auth_mode.and_then(|field| field.value).as_deref(),
+            Some("unified")
+        );
+
+        std::fs::write(&path, "[default.ve-tos]\nauth_mode = \"oauth\"\n").unwrap();
+        let config = ConfigFile::load_from(&path).unwrap();
+        let error = config
+            .get_effective_profile("default", Binary::VeTos)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Validation error: invalid ve-tos auth_mode 'oauth': expected aksk or unified"
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn handwritten_invalid_adrive_auth_mode_is_rejected() {
+        let directory = std::env::temp_dir().join(format!(
+            "adrive-config-auth-mode-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.toml");
+        std::fs::write(&path, "[default.adrive]\nauth_mode = \"oidc\"\n").unwrap();
+
+        let config = ConfigFile::load_from(&path).unwrap();
+        let error = config
+            .get_effective_profile("default", Binary::Adrive)
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Validation error: invalid ADrive auth_mode 'oidc': expected aksk, oauth, or unified"
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn invalid_unselected_auth_modes_do_not_block_other_profile_resolution() {
+        let directory = std::env::temp_dir().join(format!(
+            "unselected-config-auth-mode-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.toml");
+        std::fs::write(
+            &path,
+            concat!(
+                "[default.tos]\n",
+                "endpoint = \"tos.example.com\"\n",
+                "[staging.adrive]\n",
+                "auth_mode = \"oidc\"\n",
+                "[preview.ve-tos]\n",
+                "auth_mode = \"oauth\"\n",
+            ),
+        )
+        .unwrap();
+
+        let config = ConfigFile::load_from(&path).unwrap();
+        let effective = config
+            .get_effective_profile("default", Binary::Tos)
+            .unwrap();
+
+        assert_eq!(effective.endpoint.value.as_deref(), Some("tos.example.com"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn tos_and_ve_tos_auth_mode_namespaces_remain_isolated() {
+        let mut config = ConfigFile::default();
+        config
+            .set_by_path(&["default", "tos", "endpoint"], "byte-tos-endpoint")
+            .unwrap();
+        config
+            .set_by_path(&["default", "ve-tos", "endpoint"], "ve-tos-endpoint")
+            .unwrap();
+        config
+            .set_by_path(&["default", "ve-tos", "auth_mode"], "unified")
+            .unwrap();
+
+        let tos = config
+            .get_effective_profile("default", Binary::Tos)
+            .unwrap();
+        let ve_tos = config
+            .get_effective_profile("default", Binary::VeTos)
+            .unwrap();
+
+        assert_eq!(tos.endpoint.value.as_deref(), Some("byte-tos-endpoint"));
+        assert!(tos.auth_mode.is_none());
+        assert_eq!(ve_tos.endpoint.value.as_deref(), Some("ve-tos-endpoint"));
+        assert_eq!(
+            ve_tos.auth_mode.and_then(|field| field.value).as_deref(),
+            Some("unified")
+        );
+    }
+
+    #[test]
+    fn adrive_auth_mode_setter_accepts_all_exact_modes_and_rejects_others() {
+        for mode in ["aksk", "oauth", "unified"] {
+            let mut config = ConfigFile::default();
+            config
+                .set_by_path(&["default", "adrive", "auth_mode"], mode)
+                .unwrap();
+            assert_eq!(
+                config
+                    .get_effective_profile("default", Binary::Adrive)
+                    .unwrap()
+                    .auth_mode
+                    .and_then(|field| field.value)
+                    .as_deref(),
+                Some(mode)
+            );
+        }
+
+        let error = ConfigFile::default()
+            .set_by_path(&["default", "adrive", "auth_mode"], "oidc")
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Validation error: invalid ADrive auth_mode 'oidc': expected aksk, oauth, or unified"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_save_replaces_file_atomically() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "tos-config-atomic-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        let path = directory.join("config.toml");
+        let mut config = ConfigFile::default();
+        config
+            .set_by_path(&["default", "region"], "cn-beijing")
+            .unwrap();
+        config.save_to_path(&path).unwrap();
+        let first_inode = std::fs::metadata(&path).unwrap().ino();
+
+        config
+            .set_by_path(&["default", "region"], "cn-shanghai")
+            .unwrap();
+        config.save_to_path(&path).unwrap();
+        let second_inode = std::fs::metadata(&path).unwrap().ino();
+
+        assert_ne!(first_inode, second_inode);
+        assert_eq!(
+            ConfigFile::load_from(&path)
+                .unwrap()
+                .get_profile("default")
+                .unwrap()
+                .region
+                .as_deref(),
+            Some("cn-shanghai")
+        );
+        let has_temporary_file = std::fs::read_dir(&directory).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("config.tmp-")
+        });
+        assert!(!has_temporary_file);
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn effective_shared_only() {
@@ -1887,6 +2423,9 @@ mod tests {
             Some("tos-control-cn-beijing.volces.com")
         );
         assert_eq!(eff.control_endpoint.source, FieldSource::Derived);
+        let auth_mode = eff.auth_mode.expect("ve-tos auth mode field");
+        assert_eq!(auth_mode.value, None);
+        assert_eq!(auth_mode.source, FieldSource::Unset);
     }
 
     #[test]
@@ -2012,6 +2551,32 @@ mod tests {
             p.adrive.as_ref().unwrap().account_id.as_deref(),
             Some("2100")
         );
+    }
+
+    #[test]
+    fn adrive_auth_endpoint_is_binary_specific() {
+        let mut config = ConfigFile::default();
+        config
+            .set_by_path(
+                &["default", "adrive", "auth_endpoint"],
+                "https://idsauth.volces.com",
+            )
+            .unwrap();
+
+        let adrive = config
+            .get_effective_profile("default", Binary::Adrive)
+            .unwrap();
+        assert_eq!(
+            adrive
+                .auth_endpoint
+                .and_then(|field| field.value)
+                .as_deref(),
+            Some("https://idsauth.volces.com")
+        );
+        let tos = config
+            .get_effective_profile("default", Binary::Tos)
+            .unwrap();
+        assert!(tos.auth_endpoint.is_none());
     }
 
     #[test]

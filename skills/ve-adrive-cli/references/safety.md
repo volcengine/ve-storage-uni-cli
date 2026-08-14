@@ -8,5 +8,6 @@
   instance, space, and path. Preserve required confirmation flags.
 - Never print access keys, secret keys, session tokens, authorization headers,
   or complete signed URLs in logs or final answers.
-- Do not infer region or endpoint for write operations. Ask or inspect config.
+- Use only the documented public OAuth and Resource endpoints and signing
+  region. Do not invent alternate endpoint or region values.
 - Quote paths and A-Drive URIs that contain spaces, wildcards, or user input.

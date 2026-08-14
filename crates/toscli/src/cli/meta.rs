@@ -34,7 +34,7 @@ pub struct CompletionArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    long_about = "Start the ByteTOS MCP server from the same registry-backed skill definitions used by `skill list`.\n\n`stdio` is the default MCP transport for clients that spawn the CLI as a child process. `sse` starts a local HTTP/SSE listener on 127.0.0.1:<port> with rmcp's standard `/sse` and `/message` endpoints. `--dry-run` and `--describe` report the startup plan without launching a long-lived server.",
+    long_about = "Start the ByteTOS MCP server from the same registry-backed skill definitions used by `skill list`.\n\n`stdio` is the default MCP transport for clients that spawn the CLI as a child process. `sse` is same-host only and listens on 127.0.0.1:<port>. After binding, it prints a fresh Bearer token once to stderr. Every `/sse` and `/message` request must send it in the Authorization header; URL/query credentials are rejected. The Host header must be exact `127.0.0.1:<port>` or `localhost:<port>`. Native clients may omit Origin; when the Origin header is present, it must be the matching HTTP loopback origin on the same port. `--dry-run` and `--describe` report this startup contract without generating a token or launching a server.",
     after_help = "Examples:\n  tos serve --mcp\n  tos serve --mcp --transport sse --port 9090\n  tos serve --mcp --dry-run --output json\n\nMCP usage:\n  Tool names come from skills, e.g. `tos_ls` for `tos ls` and `tos_cp` for `tos cp`.\n  `tools/call` plans by default; pass argument `execute: true` to run the underlying CLI command."
 )]
 pub struct ServeArgs {
@@ -45,7 +45,12 @@ pub struct ServeArgs {
     #[arg(long, default_value = "stdio", value_parser = ["stdio", "sse"])]
     pub transport: String,
     /// Port for SSE transport
-    #[arg(long, default_value = "8080")]
+    // [Review Fix #7] Port zero cannot describe the OS-selected listener port consistently.
+    #[arg(
+        long,
+        default_value = "8080",
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
     pub port: u16,
 }
 

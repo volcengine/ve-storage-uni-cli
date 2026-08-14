@@ -19,8 +19,8 @@
 
 use tos_core::infra::config::{
     derive_tos_control_endpoint, Binary, ConfigFile, FieldSource, Profile, TosOverride,
-    DEFAULT_TOS_BATCH_REPORT_DIR, DEFAULT_TOS_BATCH_REPORT_FORMAT, DEFAULT_TOS_CHECKPOINT_DIR,
-    DEFAULT_TOS_PROGRESS_ENABLED,
+    DEFAULT_HTTP_REQUEST_TIMEOUT_SECONDS, DEFAULT_TOS_BATCH_REPORT_DIR,
+    DEFAULT_TOS_BATCH_REPORT_FORMAT, DEFAULT_TOS_CHECKPOINT_DIR, DEFAULT_TOS_PROGRESS_ENABLED,
 };
 
 static BYTE_TOS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -307,6 +307,9 @@ fn test_tos_high_level_path_defaults_are_available() {
         Some(DEFAULT_TOS_PROGRESS_ENABLED)
     );
     assert_eq!(effective.progress_enabled.source, FieldSource::Derived);
+    assert_eq!(DEFAULT_HTTP_REQUEST_TIMEOUT_SECONDS, 300);
+    assert_eq!(effective.requesttimeout.value, Some(300));
+    assert_eq!(effective.requesttimeout.source, FieldSource::Derived);
 }
 
 #[test]
@@ -324,6 +327,9 @@ fn test_tos_high_level_path_defaults_can_be_overridden() {
     config
         .set_by_path(&["default", "tos", "batch_report_format"], "csv")
         .unwrap();
+    config
+        .set_by_path(&["default", "tos", "requesttimeout"], "60")
+        .unwrap();
 
     let effective = config
         .get_effective_profile("default", Binary::Tos)
@@ -339,6 +345,8 @@ fn test_tos_high_level_path_defaults_can_be_overridden() {
         Some("/var/tos/reports")
     );
     assert_eq!(effective.batch_report_format.value.as_deref(), Some("csv"));
+    assert_eq!(effective.requesttimeout.value, Some(60));
+    assert_eq!(effective.requesttimeout.source, FieldSource::BinaryOverride);
 }
 
 #[test]

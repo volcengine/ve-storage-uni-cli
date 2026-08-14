@@ -45,6 +45,34 @@ const BY_NAME_PARAMETER: RegistryParameter = RegistryParameter {
     description: "Treat ADrive instance/space target segments as names and resolve them to IDs",
 };
 
+const AUTH_PARAMS: &[RegistryParameter] = &[
+    RegistryParameter {
+        name: "auth-mode",
+        required: false,
+        description: "Per-invocation override: --auth-mode <MODE>; supported values are aksk, oauth, or unified. ADRIVE_AUTH_MODE supplies the environment value",
+    },
+    RegistryParameter {
+        name: "action",
+        required: false,
+        description: "Authentication action: status (default), login, or logout",
+    },
+    RegistryParameter {
+        name: "instance",
+        required: false,
+        description: "OAuth login Instance; required unless the selected profile or ADRIVE_DEFAULT_INSTANCE supplies it",
+    },
+    RegistryParameter {
+        name: "auth-endpoint",
+        required: false,
+        description: "OAuth Authorization Server for login; required unless the selected profile or ADRIVE_AUTH_ENDPOINT supplies it",
+    },
+    RegistryParameter {
+        name: "device-name",
+        required: false,
+        description: "Human-readable device name shown during OAuth authorization",
+    },
+];
+
 const TARGET_PARAMS: &[RegistryParameter] = &[
     BY_NAME_PARAMETER,
     RegistryParameter {
@@ -616,6 +644,21 @@ const CREATE_PARAMS: &[RegistryParameter] = &[
         required: false,
         description: "Enable search indexing for a newly-created space",
     },
+    RegistryParameter {
+        name: "service-type",
+        required: false,
+        description: "Instance service type: saas, paas, or arkclaw; default is arkclaw for AK/SK and paas for OAuth",
+    },
+    RegistryParameter {
+        name: "owner-type",
+        required: false,
+        description: "Space owner type: user or group; OAuth defaults to user and group requires --owner-id",
+    },
+    RegistryParameter {
+        name: "owner-id",
+        required: false,
+        description: "Space owner identifier; OAuth user ownership defaults to the logged-in user_id, while OAuth group ownership requires this option",
+    },
 ];
 
 const DELETE_PARAMS: &[RegistryParameter] = &[
@@ -787,6 +830,11 @@ const LS_PARAMS: &[RegistryParameter] = &[
         name: "marker",
         required: false,
         description: "Pagination marker returned by a previous listing",
+    },
+    RegistryParameter {
+        name: "owner-type",
+        required: false,
+        description: "OAuth Space collection: user (default) or group",
     },
     RegistryParameter {
         name: "human-readable",
@@ -1065,6 +1113,8 @@ pub const CAPABILITIES: &[CapabilityRow] = &[
             "get_space",
             "list_instances",
             "list_spaces",
+            "list_my_spaces",
+            "list_my_group_spaces",
             "list_files",
         ],
         parameters: LS_PARAMS,
@@ -1285,16 +1335,23 @@ pub const CAPABILITIES: &[CapabilityRow] = &[
         domain: "auth",
         group: "Capabilities / Utilities",
         layer: "utility",
-        description: "Inspect or manage the selected ADrive authentication strategy",
+        description: "Inspect authentication status or manage OAuth. Unified uses the same-name external profile, ignores local AK/SK and OAuth credentials, and delegates login/logout to `ve login` / `ve logout`",
         risk_level: "low",
         destructive: false,
         supports_force: false,
-        supports_dry_run: false,
+        supports_dry_run: true,
         api_actions: &[],
-        parameters: &[],
+        // [Review Fix #27] Keep registry-backed --describe output aligned with
+        // the now-explicit OAuth login inputs advertised by clap help.
+        parameters: AUTH_PARAMS,
         examples: &[
             "ve-adrive-cli auth status",
-            "ve-adrive-cli --auth-mode oauth auth login",
+            "ve-adrive-cli --auth-mode oauth auth login --instance inst-1 --auth-endpoint https://idsauth.volces.com",
+            "ve-adrive-cli --auth-mode oauth auth logout",
+            "ve-adrive-cli --dry-run --auth-mode oauth auth logout",
+            "ve-adrive-cli --profile default --auth-mode unified ls",
+            "ve-adrive-cli config set auth_mode unified",
+            "ve login",
         ],
     },
 ];
@@ -1425,5 +1482,73 @@ mod tests {
         assert!(ls_params.contains(&"human-readable"));
         assert!(ls_params.contains(&"sort"));
         assert!(ls_params.contains(&"columns"));
+    }
+
+    #[test]
+    fn registry_exposes_adrive_ownership_parameters_and_space_apis() {
+        let create = find_capability("ve-adrive crt").unwrap();
+        let create_params = parameter_names("ve-adrive crt");
+        assert!(create_params.contains(&"service-type"));
+        assert!(create_params.contains(&"owner-type"));
+        assert!(create_params.contains(&"owner-id"));
+        let owner_id = create
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == "owner-id")
+            .unwrap();
+        assert!(owner_id.description.contains("logged-in user_id"));
+        assert!(owner_id.description.contains("group ownership requires"));
+        let service_type = create
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == "service-type")
+            .unwrap();
+        assert!(service_type.description.contains("AK/SK"));
+        assert!(service_type.description.contains("OAuth"));
+
+        let list = find_capability("ve-adrive ls").unwrap();
+        assert!(parameter_names("ve-adrive ls").contains(&"owner-type"));
+        assert!(list.api_actions.contains(&"list_spaces"));
+        assert!(list.api_actions.contains(&"list_my_spaces"));
+        assert!(list.api_actions.contains(&"list_my_group_spaces"));
+    }
+
+    #[test]
+    fn registry_exposes_explicit_oauth_login_inputs() {
+        let parameters = parameter_names("ve-adrive auth");
+
+        assert!(parameters.contains(&"instance"));
+        assert!(parameters.contains(&"auth-endpoint"));
+        assert!(parameters.contains(&"device-name"));
+    }
+
+    #[test]
+    fn unified_auth_metadata_is_synchronized_for_adrive() {
+        let auth = find_capability("ve-adrive auth").expect("auth capability");
+        let registry = serde_json::to_string(auth).unwrap();
+        for expected in [
+            "--auth-mode <MODE>",
+            "aksk, oauth, or unified",
+            "ADRIVE_AUTH_MODE",
+            "ve login",
+            "ve-adrive-cli --profile default --auth-mode unified ls",
+            "ve-adrive-cli config set auth_mode unified",
+        ] {
+            assert!(registry.contains(expected), "registry missing {expected}");
+        }
+
+        let skill = include_str!("../../../skills/ve-adrive-cli/SKILL.md");
+        let readme = include_str!("../../../README.md");
+        for surface in [skill, readme] {
+            for expected in [
+                "aksk, oauth, or unified",
+                "ADRIVE_AUTH_MODE",
+                "ve login",
+                "ve-adrive-cli --profile default --auth-mode unified ls",
+                "ve-adrive-cli config set auth_mode unified",
+            ] {
+                assert!(surface.contains(expected), "surface missing {expected}");
+            }
+        }
     }
 }

@@ -40,6 +40,8 @@ jmespath = { workspace = true }
 ulid = { workspace = true }
 strsim = { workspace = true }
 reqwest = { workspace = true }
+url = { workspace = true }
+fs2 = { workspace = true }
 indicatif = { workspace = true }
 futures = { workspace = true }
 chrono = { workspace = true }

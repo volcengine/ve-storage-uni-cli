@@ -71,5 +71,32 @@ def test_public_cli_skills_are_self_contained_for_individual_install():
         assert (skill_dir / "references" / "safety.md").exists()
 
 
+def test_adrive_skill_documents_oauth_space_ownership_workflows():
+    content = (REPO_ROOT / "skills" / "ve-adrive-cli" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "description: Use when" in content
+    assert "auth login" in content
+    assert "--service-type" in content
+    assert "--owner-type user" in content
+    assert "--owner-type group" in content
+    # [Review Fix #2] Retrieval must include an executable missing-identity
+    # remedy and make the OAuth-bound Instance placeholder unambiguous.
+    assert "does not provide `user_id`" in content
+    assert (
+        "run `ve-adrive-cli --auth-mode oauth auth login --instance instance-id` again"
+        in content
+    )
+    assert "run `ve-adrive-cli --auth-mode oauth auth login` again" not in content
+    assert "pass `--owner-id` explicitly" in content
+    assert "OAuth-authorized Instance ID" in content
+    assert "ve-adrive-cli --auth-mode oauth ls adrive://instance-id" in content
+    assert (
+        "ve-adrive-cli --auth-mode oauth ls adrive://instance-id --owner-type group"
+        in content
+    )
+
+
 def test_legacy_generated_skill_catalog_is_not_checked_in_as_installable_skill():
     assert not (REPO_ROOT / "skill" / "SKILL.md").exists()

@@ -154,7 +154,8 @@ Execute 阶段的批量任务默认并发 `16`。`sync --delete`、`rm --recursi
 
 批量命令应在内存中维护 `BatchReport`，并在配置或参数指定的 report 路径中以 CSV 分片持久化：
 
-- `operation`：`upload`、`download`、`copy`、`delete`、`skip`。
+- `command`：记录实际入口命令；`tos` 入口写 `tos ...`，`ve-tos` 入口写 `ve-tos ...`。
+- `operation`：`cp` 按传输方向记录 `upload`、`download`、`copy` 或 `local-copy`；其他批量命令记录各自的动作类型。
 - `source` / `destination`：原始用户路径，敏感信息不得写入。
 - `bucket` / `key`：规范化 TOS 目标。
 - `bytes`、`etag`、`version_id`、`request_id`：成功项可观测字段。

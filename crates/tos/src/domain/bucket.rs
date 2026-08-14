@@ -20,7 +20,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use tos_core::agent::envelope::{Envelope, PaginationInfo};
 use tos_core::agent::error::CliError;
-use tos_core::infra::client::TosClient;
+use tos_core::infra::client::{ReplayableRequest, TosClient};
+
+use crate::domain::core;
 
 // ===== Request / Response 结构体 =====
 
@@ -292,25 +294,34 @@ pub async fn list_buckets(
         headers.insert("x-tos-bucket-type".to_string(), bt.to_string());
     }
 
-    let resp = client
-        .send_request(Method::GET, &url, "/", BTreeMap::new(), headers, None)
-        .await?;
-
-    let request_id = extract_request_id(&resp);
-    let resp = client.check_response(resp).await?;
-    let body = resp.text().await.map_err(CliError::Http)?;
-
-    let data: ListBucketsResponse = serde_json::from_str(&body).map_err(|e| {
-        CliError::Unknown(format!(
-            "Failed to parse ListBuckets response: {} -- body: {}",
-            e,
-            &body[..200.min(body.len())]
-        ))
-    })?;
+    let response = core::send_resolved_request_parsed(
+        client,
+        ReplayableRequest {
+            method: Method::GET,
+            url,
+            path: "/".to_string(),
+            query_params: BTreeMap::new(),
+            extra_headers: headers,
+            body: None,
+        },
+        |body| {
+            serde_json::from_str::<ListBucketsResponse>(body).map_err(|error| {
+                // [Review Fix #5] Build diagnostics by Unicode scalar count instead of
+                // slicing arbitrary UTF-8 byte offsets when a malformed body is returned.
+                let body_preview = body.chars().take(200).collect::<String>();
+                CliError::Unknown(format!(
+                    "Failed to parse ListBuckets response: {} -- body: {}",
+                    error, body_preview
+                ))
+            })
+        },
+    )
+    .await?;
+    let data = response.value;
 
     let total = data.buckets.len() as u64;
     Ok(Envelope::success("ve-tos bucket list", data)
-        .with_request_id(request_id)
+        .with_request_id(response.request_id)
         .with_pagination(PaginationInfo {
             next_token: None,
             next_marker: None,
@@ -323,24 +334,30 @@ pub async fn get_bucket_location(
     client: &TosClient,
     bucket: &str,
 ) -> Result<Envelope<GetBucketLocationResponse>, CliError> {
-    let url = client.bucket_endpoint(bucket)?;
-    let path = client.bucket_request_path(bucket)?;
     let mut query = BTreeMap::new();
     query.insert("location".to_string(), String::new());
 
-    let resp = client
-        .send_request(Method::GET, &url, &path, query, BTreeMap::new(), None)
-        .await?;
+    let response = core::send_bucket_request_parsed(
+        client,
+        core::ReplayableBucketBytesRequest {
+            method: Method::GET,
+            bucket,
+            query,
+            headers: BTreeMap::new(),
+            body: None,
+        },
+        |body| {
+            serde_json::from_str::<GetBucketLocationResponse>(body).map_err(|error| {
+                CliError::Unknown(format!(
+                    "Failed to parse GetBucketLocation response: {error}"
+                ))
+            })
+        },
+    )
+    .await?;
+    let data = response.value;
 
-    let request_id = extract_request_id(&resp);
-    let resp = client.check_response(resp).await?;
-    let body = resp.text().await.map_err(CliError::Http)?;
-
-    let data: GetBucketLocationResponse = serde_json::from_str(&body).map_err(|e| {
-        CliError::Unknown(format!("Failed to parse GetBucketLocation response: {}", e))
-    })?;
-
-    Ok(Envelope::success("ve-tos bucket location", data).with_request_id(request_id))
+    Ok(Envelope::success("ve-tos bucket location", data).with_request_id(response.request_id))
 }
 
 /// GetBucketStat - 获取桶统计信息
@@ -365,21 +382,24 @@ async fn get_bucket_json(
     query_flag: &str,
     command: &str,
 ) -> Result<Envelope<Value>, CliError> {
-    let url = client.bucket_endpoint(bucket)?;
-    let path = client.bucket_request_path(bucket)?;
     let mut query = BTreeMap::new();
     query.insert(query_flag.to_string(), String::new());
 
-    let resp = client
-        .send_request(Method::GET, &url, &path, query, BTreeMap::new(), None)
-        .await?;
+    let response = core::send_bucket_request_text(
+        client,
+        core::ReplayableBucketBytesRequest {
+            method: Method::GET,
+            bucket,
+            query,
+            headers: BTreeMap::new(),
+            body: None,
+        },
+    )
+    .await?;
+    let data = serde_json::from_str::<Value>(&response.body)
+        .unwrap_or_else(|_| Value::String(response.body));
 
-    let request_id = extract_request_id(&resp);
-    let resp = client.check_response(resp).await?;
-    let body = resp.text().await.map_err(CliError::Http)?;
-    let data = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| Value::String(body));
-
-    Ok(Envelope::success(command, data).with_request_id(request_id))
+    Ok(Envelope::success(command, data).with_request_id(response.request_id))
 }
 
 // 辅助函数
@@ -387,8 +407,10 @@ fn extract_request_id(resp: &reqwest::Response) -> String {
     resp.headers()
         .get("x-tos-request-id")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string()
+        // [Review Fix #7] Keep bucket response metadata from bypassing the
+        // shared request-ID sanitizer at the successful Envelope boundary.
+        .and_then(tos_core::agent::request_id::sanitize_request_id)
+        .unwrap_or_default()
 }
 
 fn get_header_value(resp: &reqwest::Response, keys: &[&str]) -> Option<String> {

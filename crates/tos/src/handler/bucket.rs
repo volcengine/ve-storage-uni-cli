@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use crate::cli::low_level::*;
 use crate::domain::bucket;
 use crate::handler::common::{
-    build_profile as build_runtime_profile, ensure_force_for_destructive,
-    output_result as render_common_output, output_result_with_columns, parse_bucket_name,
+    build_runtime, ensure_force_for_destructive, output_result as render_common_output,
+    output_result_with_columns, parse_bucket_name, TosRuntime,
 };
 use tos_core::agent::describe::{
     CommandDescription, CommandLayer, CommandParameter, ParameterLocation, RelatedCommands,
@@ -97,11 +97,11 @@ pub async fn handle_bucket_command(
     }
 
     // 构建 Profile（从全局参数 + 环境变量）并创建 Client
-    let profile = build_runtime_profile(global)?;
-    let client = TosClient::new(&profile, "tos")?;
+    let runtime = build_runtime(global)?;
+    let client = runtime.client(global, "tos")?;
 
     match action {
-        BucketAction::Create(args) => handle_create(global, &client, args).await,
+        BucketAction::Create(args) => handle_create(global, &runtime, &client, args).await,
         BucketAction::Head(args) => handle_head(global, &client, args).await,
         BucketAction::Delete(args) => handle_delete(global, &client, args).await,
         BucketAction::List(args) => handle_list(global, &client, args).await,
@@ -344,16 +344,17 @@ fn handle_dry_run(global: &GlobalArgs, action: &BucketAction) -> Result<i32, Cli
 
 async fn handle_create(
     global: &GlobalArgs,
+    runtime: &TosRuntime,
     client: &TosClient,
     args: &BucketCreateArgs,
 ) -> Result<i32, CliError> {
     validate_bucket_create_args(args)?;
-    let profile = build_bucket_create_profile(global, args)?;
+    let profile = build_bucket_create_profile(&runtime.profile, args);
     let override_client;
     let effective_client = if args.region.is_some() {
         // [Review Fix #7] `ve-tos bucket create --region` 必须真正影响签名地域和目标服务端点，
         // 不能只出现在 help 中却被运行时忽略。
-        override_client = Some(TosClient::new(&profile, "tos")?);
+        override_client = Some(runtime.client_with_profile(global, "tos", &profile)?);
         override_client.as_ref().unwrap()
     } else {
         client
@@ -685,15 +686,12 @@ pub fn describe_bucket_group() -> serde_json::Value {
 
 // ===== 辅助函数 =====
 
-fn build_bucket_create_profile(
-    global: &GlobalArgs,
-    args: &BucketCreateArgs,
-) -> Result<Profile, CliError> {
-    let mut profile = build_runtime_profile(global)?;
+fn build_bucket_create_profile(runtime_profile: &Profile, args: &BucketCreateArgs) -> Profile {
+    let mut profile = runtime_profile.clone();
     if let Some(region) = &args.region {
         profile.region = Some(region.clone());
     }
-    Ok(profile)
+    profile
 }
 
 fn parse_bucket_arg(uri: Option<&str>, bucket_name: Option<&str>) -> Result<String, CliError> {
@@ -956,9 +954,12 @@ mod tests {
             trace_redact: "strict".to_string(),
             yes: false,
             confirm: None,
+            request_trace: Default::default(),
+            ve_tos_auth_mode: None,
+            documentation_language: None,
         };
 
-        let merged = build_runtime_profile(&global).unwrap();
+        let merged = crate::handler::common::build_profile(&global).unwrap();
 
         assert_eq!(merged.region.as_deref(), Some("cli-region"));
         // Config endpoint (from `[staging.tos]`) wins over the env-supplied
@@ -1023,6 +1024,9 @@ mod tests {
             trace_redact: "strict".to_string(),
             yes: false,
             confirm: None,
+            request_trace: Default::default(),
+            ve_tos_auth_mode: None,
+            documentation_language: None,
         };
         let args = BucketCreateArgs {
             uri: Some("demo-bucket".to_string()),
@@ -1043,7 +1047,8 @@ mod tests {
             tagging: None,
         };
 
-        let merged = build_bucket_create_profile(&global, &args).unwrap();
+        let runtime_profile = crate::handler::common::build_profile(&global).unwrap();
+        let merged = build_bucket_create_profile(&runtime_profile, &args);
 
         assert_eq!(merged.region.as_deref(), Some("cmd-region"));
         assert_eq!(

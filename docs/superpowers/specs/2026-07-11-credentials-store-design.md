@@ -113,8 +113,12 @@ OAuth tokens.
 
 For the credential keys `access_key_id`, `secret_access_key`, and
 `security_token`, all three existing `config set` surfaces route new writes to
-the corresponding profile and surface in `credentials.toml`. Non-sensitive
-keys continue to write only to `config.toml`.
+the corresponding profile and surface in `credentials.toml`: bare keys use
+`[profile.tos]`, `[profile.ve-tos]`, or `[profile.adrive]` according to the
+active CLI. An explicit two-segment key such as `default.access_key_id` retains
+the shared `[default]` write behavior for compatibility; shared root credentials
+are inherited only by `tos-cli` and `ve-tos-cli`. Non-sensitive keys continue to
+write only to `config.toml`.
 
 OAuth login will eventually write the ADrive OAuth section. In this phase the
 store exposes read/write/delete APIs and the auth handlers remain offline

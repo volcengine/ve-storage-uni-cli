@@ -41,7 +41,9 @@ manifest row order.
 
 Each planned operation receives an action ID before execution.
 
-- `cp`: one `copy` action per object.
+- `cp`: one direction-specific action per item: `upload` for local-to-TOS,
+  `download` for TOS-to-local, `copy` for TOS-to-TOS, and `local-copy` for
+  local-to-local.
 - `sync`: one `sync-copy` action per copied object and one `delete-extra`
   action per extra destination object.
 - `mv`: one `copy` action followed by one conditional `delete-source` action.
@@ -51,6 +53,12 @@ Each planned operation receives an action ID before execution.
 If an `mv` copy fails, its dependent delete action is recorded as skipped. This
 keeps the manifest and report action sets reconcilable without relying on
 physical line order.
+
+The persisted `command` column always uses the public CLI surface that started
+the operation. Shared internal command IDs such as `ve-tos cp` are written as
+`tos cp` when invoked through `tos`, while native `ve-tos` invocations keep
+`ve-tos cp`. Manifest and report rows use the same public command and concrete
+operation so their action fingerprints remain aligned.
 
 ## Streaming Report Writer
 
@@ -94,6 +102,10 @@ manifest.
 - New schema fields are appended.
 - Existing 50 MiB rolling and part naming are retained.
 - CLI flags and defaults do not change.
+- `command` reflects the invoking public surface instead of the shared
+  handler's internal command ID.
+- `cp` operation values reflect transfer direction instead of collapsing every
+  item to `copy`.
 - Package version does not change.
 - Exact-column-count consumers must allow the appended fields.
 
@@ -110,4 +122,7 @@ Tests cover:
 7. report writer failure blocks destructive follow-up actions;
 8. existing CSV fields retain their order;
 9. existing transfer and sync regression suites still pass;
-10. the package version remains unchanged.
+10. `tos` and `ve-tos` persist their own public command names;
+11. recursive `cp` manifests and reports agree on direction-specific operation
+    values in both manifest-backed and `--no-manifest` modes;
+12. the package version remains unchanged.

@@ -876,7 +876,9 @@ fn test_high_level_cp_recursive_local_partial_failure_outputs_single_summary() {
         "stderr should not include a second transfer_failed envelope: {stderr}"
     );
     let report_body = fs::read_to_string(csv_part_path(&report_path)).expect("read csv report");
-    assert!(report_body.contains(",copy,"));
+    // [Review Fix #4] Local-to-local transfers use the operation name fixed by
+    // d5b3ba0; keep this integration assertion aligned with the public report.
+    assert!(report_body.contains(",local-copy,"));
     assert!(report_body.contains(",failed,"));
 }
 
