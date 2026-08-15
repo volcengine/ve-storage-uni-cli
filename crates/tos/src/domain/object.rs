@@ -36,7 +36,7 @@ use tos_core::agent::envelope::{Envelope, PaginationInfo};
 use tos_core::agent::error::CliError;
 use tos_core::infra::client::TosClient;
 
-use crate::domain::core::extract_request_id;
+use crate::domain::core;
 
 // ===== ListObjects (V2) =====
 
@@ -185,9 +185,6 @@ pub async fn list_objects(
     max_keys: u32,
     continuation_token: Option<&str>,
 ) -> Result<Envelope<ListObjectsResponse>, CliError> {
-    let url = client.bucket_endpoint(bucket)?;
-    let path = client.bucket_request_path(bucket)?;
-
     let mut query: BTreeMap<String, String> = BTreeMap::new();
     query.insert("list-type".to_string(), "2".to_string());
     if let Some(p) = prefix {
@@ -207,15 +204,19 @@ pub async fn list_objects(
         }
     }
 
-    let resp = client
-        .send_request(Method::GET, &url, &path, query, BTreeMap::new(), None)
-        .await?;
-
-    let request_id = extract_request_id(&resp);
-    let resp = client.check_response(resp).await?;
-    let body = resp.text().await.map_err(CliError::Http)?;
-
-    let data: ListObjectsResponse = parse_list_response(&body, "ListObjectsV2")?;
+    let response = core::send_bucket_request_parsed(
+        client,
+        core::ReplayableBucketBytesRequest {
+            method: Method::GET,
+            bucket,
+            query,
+            headers: BTreeMap::new(),
+            body: None,
+        },
+        |body| parse_list_response::<ListObjectsResponse>(body, "ListObjectsV2"),
+    )
+    .await?;
+    let data = response.value;
 
     let next_token = if data.is_truncated {
         data.next_continuation_token.clone()
@@ -225,7 +226,7 @@ pub async fn list_objects(
     let total = data.contents.len() as u64;
 
     Ok(Envelope::success("ve-tos object list", data)
-        .with_request_id(request_id)
+        .with_request_id(response.request_id)
         .with_pagination(PaginationInfo {
             next_token,
             next_marker: None,
@@ -239,9 +240,6 @@ pub async fn list_object_versions(
     bucket: &str,
     prefix: Option<&str>,
 ) -> Result<Envelope<ListVersionsResponse>, CliError> {
-    let url = client.bucket_endpoint(bucket)?;
-    let path = client.bucket_request_path(bucket)?;
-
     let mut query: BTreeMap<String, String> = BTreeMap::new();
     query.insert("versions".to_string(), String::new());
     if let Some(p) = prefix {
@@ -250,15 +248,19 @@ pub async fn list_object_versions(
         }
     }
 
-    let resp = client
-        .send_request(Method::GET, &url, &path, query, BTreeMap::new(), None)
-        .await?;
-
-    let request_id = extract_request_id(&resp);
-    let resp = client.check_response(resp).await?;
-    let body = resp.text().await.map_err(CliError::Http)?;
-
-    let data: ListVersionsResponse = parse_list_response(&body, "ListObjectVersions")?;
+    let response = core::send_bucket_request_parsed(
+        client,
+        core::ReplayableBucketBytesRequest {
+            method: Method::GET,
+            bucket,
+            query,
+            headers: BTreeMap::new(),
+            body: None,
+        },
+        |body| parse_list_response::<ListVersionsResponse>(body, "ListObjectVersions"),
+    )
+    .await?;
+    let data = response.value;
 
     let next_token = if data.is_truncated {
         data.next_key_marker.clone()
@@ -268,7 +270,7 @@ pub async fn list_object_versions(
     let total = (data.versions.len() + data.delete_markers.len()) as u64;
 
     Ok(Envelope::success("ve-tos object list-versions", data)
-        .with_request_id(request_id)
+        .with_request_id(response.request_id)
         .with_pagination(PaginationInfo {
             next_token,
             next_marker: None,
@@ -296,7 +298,9 @@ fn parse_list_response<T: for<'de> Deserialize<'de>>(body: &str, api: &str) -> R
         serde_json::from_str::<T>(body).map_err(|e| format!("json: {}", e))
     };
     result.map_err(|e| {
-        let preview = &body[..200.min(body.len())];
+        // [Review Fix #8] Keep malformed Unicode diagnostics panic-free while
+        // the caller retries typed response decoding inside the HTTP attempt.
+        let preview = body.chars().take(200).collect::<String>();
         CliError::Unknown(format!(
             "Failed to parse {} response: {} -- body: {}",
             api, e, preview

@@ -14,20 +14,25 @@
  * limitations under the License.
  */
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
+#[cfg(test)]
+use std::sync::Arc;
 use tos_core::agent::envelope::Envelope;
-use tos_core::agent::error::CliError;
+use tos_core::agent::error::{AgentErrorCategory, CliError};
 use tos_core::agent::global_args::GlobalArgs;
 use tos_core::agent::output::{format_markdown, format_table, format_xml, OutputFormat};
 use tos_core::infra::config::{Binary, ConfigFile, FieldSource, Profile};
 use tos_core::infra::credentials::{CredentialSection, CredentialsFile};
+use tos_core::infra::unified_credentials::UnifiedCredentialProvider;
 
 use crate::domain::auth::{
     AkskAuthProvider, AuthMode, AuthModeSource, AuthProvider, CredentialAvailability,
-    OAuthCredentials, ResolvedAuthMode,
+    OAuthAuthProvider, OAuthCredentials, ResolvedAuthMode, UnifiedAuthProvider,
 };
 use crate::domain::client::{Client as IdsClient, ClientOptions, Error as IdsError};
+use crate::domain::token_manager::{OAuthTokenManager, ACCESS_TOKEN_REFRESH_WINDOW_SECONDS};
 
 /// Build the effective runtime profile for ADrive commands.
 ///
@@ -100,11 +105,24 @@ pub(crate) fn build_profile(global: &GlobalArgs) -> Result<Profile, CliError> {
     };
     stored_credentials.apply_to_profile(&mut config_profile);
 
-    let env_profile = Profile {
+    let env_profile = adrive_environment_profile(true);
+    let cli_profile = adrive_cli_profile(global);
+    // Priority: CLI > Config > Env (applies uniformly to all fields).
+    Ok(env_profile.merge(&config_profile).merge(&cli_profile))
+}
+
+fn adrive_environment_profile(include_credentials: bool) -> Profile {
+    Profile {
         region: std::env::var("ADRIVE_REGION").ok(),
-        access_key_id: std::env::var("ADRIVE_ACCESS_KEY").ok(),
-        secret_access_key: std::env::var("ADRIVE_SECRET_KEY").ok(),
-        security_token: std::env::var("ADRIVE_SECURITY_TOKEN").ok(),
+        access_key_id: include_credentials
+            .then(|| std::env::var("ADRIVE_ACCESS_KEY").ok())
+            .flatten(),
+        secret_access_key: include_credentials
+            .then(|| std::env::var("ADRIVE_SECRET_KEY").ok())
+            .flatten(),
+        security_token: include_credentials
+            .then(|| std::env::var("ADRIVE_SECURITY_TOKEN").ok())
+            .flatten(),
         endpoint: std::env::var("ADRIVE_ENDPOINT").ok(),
         psm: None,
         idc: None,
@@ -138,10 +156,13 @@ pub(crate) fn build_profile(global: &GlobalArgs) -> Result<Profile, CliError> {
         tosvector: None,
         tostable: None,
         adrive: None,
-    };
+    }
+}
+
+fn adrive_cli_profile(global: &GlobalArgs) -> Profile {
     // global.region / global.endpoint / global.account_id are now pure CLI flags
     // (their TOS_* env bindings were removed), so they are safe to use here.
-    let cli_profile = Profile {
+    Profile {
         region: global.region.clone(),
         access_key_id: None,
         secret_access_key: None,
@@ -172,9 +193,7 @@ pub(crate) fn build_profile(global: &GlobalArgs) -> Result<Profile, CliError> {
         tosvector: None,
         tostable: None,
         adrive: None,
-    };
-    // Priority: CLI > Config > Env (applies uniformly to all fields).
-    Ok(env_profile.merge(&config_profile).merge(&cli_profile))
+    }
 }
 
 /// Resolve the effective ADrive auth mode without changing any credential state.
@@ -182,26 +201,46 @@ pub(crate) fn resolve_auth_mode(
     global: &GlobalArgs,
     command_line_mode: Option<AuthMode>,
 ) -> Result<ResolvedAuthMode, CliError> {
+    // [Review Fix #3] Reject an empty selected profile before honoring the CLI
+    // mode. The Unified SDK treats an empty name as a fallback request, which
+    // would inspect a different identity than the one selected by this CLI.
+    if global.profile.is_empty() {
+        return Err(CliError::ValidationError(
+            "Invalid profile name: profile must not be empty".to_string(),
+        ));
+    }
     if let Some(mode) = command_line_mode {
         return Ok(ResolvedAuthMode {
             mode,
             source: AuthModeSource::CommandLine,
         });
     }
-    if global.profile.is_empty() {
-        return Err(CliError::ValidationError(
-            "Invalid profile name: profile must not be empty".to_string(),
-        ));
-    }
     let config_path = global.existing_runtime_config_path()?;
-    let config_dir = ConfigFile::config_dir_from_path(&config_path);
     let config = ConfigFile::load_from(&config_path)?;
-    if config.profiles.contains_key(&global.profile) {
-        let effective =
-            config.get_effective_profile_in_dir(&global.profile, Binary::Adrive, &config_dir)?;
-        if let Some(value) = effective.auth_mode.and_then(|field| field.value) {
+    resolve_auth_mode_from_config(global, None, &config)
+}
+
+fn resolve_auth_mode_from_config(
+    global: &GlobalArgs,
+    command_line_mode: Option<AuthMode>,
+    config: &ConfigFile,
+) -> Result<ResolvedAuthMode, CliError> {
+    if let Some(mode) = command_line_mode {
+        return Ok(ResolvedAuthMode {
+            mode,
+            source: AuthModeSource::CommandLine,
+        });
+    }
+    if let Some(profile) = config.profiles.get(&global.profile) {
+        // [Review Fix #5] Auth Mode is non-secret ADrive metadata. Read it
+        // directly so selecting OAuth never decrypts unselected AK/SK fields.
+        if let Some(value) = profile
+            .adrive
+            .as_ref()
+            .and_then(|settings| settings.auth_mode.as_deref())
+        {
             return Ok(ResolvedAuthMode {
-                mode: AuthMode::parse(&value, "profile config")?,
+                mode: AuthMode::parse(value, "profile config")?,
                 source: AuthModeSource::Config,
             });
         }
@@ -224,12 +263,31 @@ pub(crate) fn build_auth_provider(
     global: &GlobalArgs,
     command_line_mode: Option<AuthMode>,
 ) -> Result<AuthProvider, CliError> {
-    let resolved = resolve_auth_mode(global, command_line_mode)?;
-    if resolved.mode == AuthMode::Oauth {
-        return Ok(AuthProvider::OAuth(resolve_oauth_credentials(global)?));
+    if global.profile.is_empty() {
+        return Err(CliError::ValidationError(
+            "Invalid profile name: profile must not be empty".to_string(),
+        ));
+    }
+    let config_path = global.existing_runtime_config_path()?;
+    let config = ConfigFile::load_from(&config_path)?;
+    let resolved = resolve_auth_mode_from_config(global, command_line_mode, &config)?;
+    match resolved.mode {
+        AuthMode::Oauth => return Ok(AuthProvider::OAuth(build_oauth_auth_provider(global)?)),
+        AuthMode::Unified => {
+            let profile = build_unified_profile(global, &config_path, &config)?;
+            let client_options = client_options_from_profile(&profile);
+            return Ok(AuthProvider::Unified(UnifiedAuthProvider {
+                credential_provider: UnifiedCredentialProvider::new(global.profile.clone()),
+                endpoint: profile.endpoint,
+                region: profile.region,
+                client_options,
+            }));
+        }
+        AuthMode::Aksk => {}
     }
 
     let profile = build_profile(global)?;
+    let client_options = client_options_from_profile(&profile);
     let access_key = profile
         .access_key_id
         .ok_or_else(|| CliError::ConfigMissing("ADRIVE_ACCESS_KEY is required".to_string()))?;
@@ -243,13 +301,317 @@ pub(crate) fn build_auth_provider(
         security_token: profile.security_token,
         endpoint: profile.endpoint,
         region: profile.region,
-        client_options: ClientOptions {
-            max_retry_count: profile.max_retry_count,
-            requesttimeout: profile.requesttimeout,
-            connecttimeout: profile.connecttimeout,
-            maxconnections: profile.maxconnections,
-        },
+        client_options,
     }))
+}
+
+fn build_unified_profile(
+    global: &GlobalArgs,
+    config_path: &std::path::Path,
+    config: &ConfigFile,
+) -> Result<Profile, CliError> {
+    let config_dir = ConfigFile::config_dir_from_path(config_path);
+    let config_profile = if config.profiles.is_empty() && global.profile == "default" {
+        Profile::default()
+    } else {
+        let effective = config.get_effective_profile_without_credentials_in_dir(
+            &global.profile,
+            Binary::Adrive,
+            &config_dir,
+        )?;
+        let mut flat = effective.into_flat_profile();
+        // ADrive resource settings are isolated from shared TOS settings.
+        if effective.region.source == FieldSource::Shared {
+            flat.region = None;
+        }
+        if effective.endpoint.source == FieldSource::Shared {
+            flat.endpoint = None;
+        }
+        if effective.control_endpoint.source == FieldSource::Shared {
+            flat.control_endpoint = None;
+        }
+        flat
+    };
+    Ok(adrive_environment_profile(false)
+        .merge(&config_profile)
+        .merge(&adrive_cli_profile(global)))
+}
+
+fn build_oauth_runtime_profile(
+    global: &GlobalArgs,
+    config_path: &std::path::Path,
+    config: &ConfigFile,
+) -> Result<Profile, CliError> {
+    let has_config_profile = config.profiles.contains_key(&global.profile);
+    let is_implicit_default = config.profiles.is_empty() && global.profile == "default";
+    if has_config_profile || is_implicit_default {
+        return build_unified_profile(global, config_path, config);
+    }
+
+    let credentials_path = global.existing_runtime_credentials_path()?;
+    let oauth = CredentialsFile::load_from(&credentials_path)?
+        .adrive_oauth(&global.profile, &credentials_path)?;
+    if oauth.is_empty() {
+        return build_unified_profile(global, config_path, config);
+    }
+
+    // [Review Fix #6] OAuth historically accepts a named profile stored only
+    // in credentials.toml. Preserve that rule without resolving AK/SK fields;
+    // non-secret runtime controls still come from ADrive env and CLI overlays.
+    Ok(adrive_environment_profile(false)
+        .merge(&Profile::default())
+        .merge(&adrive_cli_profile(global)))
+}
+
+fn client_options_from_profile(profile: &Profile) -> ClientOptions {
+    ClientOptions {
+        max_retry_count: profile.max_retry_count,
+        requesttimeout: profile.requesttimeout,
+        connecttimeout: profile.connecttimeout,
+        maxconnections: profile.maxconnections,
+    }
+}
+
+/// Build runtime controls for a mode that has already been selected.
+///
+/// Unified and OAuth resolve only their non-AK/SK configuration layers. AK/SK
+/// retains the legacy credential-bearing profile path for compatibility.
+pub(crate) fn build_runtime_profile(
+    global: &GlobalArgs,
+    mode: AuthMode,
+) -> Result<Profile, CliError> {
+    if global.profile.is_empty() {
+        return Err(CliError::ValidationError(
+            "Invalid profile name: profile must not be empty".to_string(),
+        ));
+    }
+    if mode == AuthMode::Aksk {
+        return build_profile(global);
+    }
+
+    let config_path = global.existing_runtime_config_path()?;
+    let config = ConfigFile::load_from(&config_path)?;
+    match mode {
+        AuthMode::Unified => build_unified_profile(global, &config_path, &config),
+        AuthMode::Oauth => build_oauth_runtime_profile(global, &config_path, &config),
+        AuthMode::Aksk => unreachable!("AK/SK returned before non-secret resolution"),
+    }
+}
+
+#[cfg(test)]
+type TestUnifiedInspectionResolver = dyn Fn() -> Result<tos_core::infra::unified_credentials::UnifiedCredentialValue, CliError>
+    + Send
+    + Sync
+    + 'static;
+
+enum UnifiedInspectionSource {
+    Provider(UnifiedCredentialProvider),
+    #[cfg(test)]
+    Resolver(Arc<TestUnifiedInspectionResolver>),
+}
+
+impl UnifiedInspectionSource {
+    async fn get(
+        &self,
+    ) -> Result<tos_core::infra::unified_credentials::UnifiedCredentialValue, CliError> {
+        match self {
+            Self::Provider(provider) => provider.get().await,
+            #[cfg(test)]
+            Self::Resolver(resolver) => resolver(),
+        }
+    }
+}
+
+/// Secret-free result of one Unified credential SDK inspection.
+pub(crate) struct UnifiedCredentialInspection {
+    /// Non-secret SDK provider identifier returned with the credential triple.
+    pub(crate) provider_name: Option<String>,
+    /// Whether the returned credential triple contains a session token.
+    pub(crate) has_session_token: bool,
+    /// Whether all fields required for request signing are present.
+    pub(crate) ready: bool,
+    /// Sanitized SDK error code when credential resolution failed.
+    pub(crate) sdk_code: Option<String>,
+}
+
+/// Inspect the selected profile's Unified credentials exactly once.
+pub(crate) async fn inspect_unified_credentials_for_profile(
+    profile_name: &str,
+) -> UnifiedCredentialInspection {
+    inspect_unified_credentials(UnifiedInspectionSource::Provider(
+        UnifiedCredentialProvider::new(profile_name.to_string()),
+    ))
+    .await
+}
+
+async fn inspect_unified_credentials(
+    source: UnifiedInspectionSource,
+) -> UnifiedCredentialInspection {
+    match source.get().await {
+        Ok(credentials) => {
+            let has_access_key = !credentials.access_key_id.trim().is_empty();
+            let has_secret_key = !credentials.secret_access_key.trim().is_empty();
+            let has_session_token = !credentials.session_token.trim().is_empty();
+            let provider_name = (!credentials.provider_name.trim().is_empty())
+                .then(|| credentials.provider_name.trim().to_string());
+            UnifiedCredentialInspection {
+                provider_name,
+                has_session_token,
+                // [Review Fix #1] Session tokens are optional for both static
+                // and Unified HMAC credentials; AK/SK alone is ready to sign.
+                ready: has_access_key && has_secret_key,
+                sdk_code: None,
+            }
+        }
+        Err(error) => UnifiedCredentialInspection {
+            provider_name: None,
+            has_session_token: false,
+            ready: false,
+            sdk_code: Some(sanitized_unified_sdk_code(&error)),
+        },
+    }
+}
+
+fn sanitized_unified_sdk_code(error: &CliError) -> String {
+    let message = error.to_string();
+    message
+        .split_once('[')
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(code, _)| code)
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+        .unwrap_or("UnifiedCredentialUnavailable")
+        .to_string()
+}
+
+/// Authentication, resource client, and non-secret controls resolved for one
+/// high-level ADrive invocation.
+pub(crate) struct ADriveRuntime {
+    /// Effective non-secret resource and transfer settings.
+    pub(crate) profile: Profile,
+    /// IDS client using the authentication mode selected by this snapshot.
+    pub(crate) client: IdsClient,
+    /// Authentication mode selected by the same configuration snapshot.
+    pub(crate) resolved_auth_mode: ResolvedAuthMode,
+}
+
+/// Dry-run authentication snapshot. Unified fields are populated together
+/// from one configuration read; legacy modes keep their prior lazy behavior.
+pub(crate) struct ADriveDryRunRuntime {
+    /// Authentication mode selected for the plan.
+    pub(crate) resolved_auth_mode: ResolvedAuthMode,
+    /// Unified non-secret controls, when Unified was selected.
+    pub(crate) unified_profile: Option<Profile>,
+    /// Unified client when its non-secret resource settings are complete.
+    pub(crate) unified_client: Option<IdsClient>,
+}
+
+/// Resolve the dry-run authentication snapshot without resolving credentials.
+pub(crate) fn build_adrive_dry_run_runtime(
+    global: &GlobalArgs,
+    command_line_mode: Option<AuthMode>,
+) -> Result<ADriveDryRunRuntime, CliError> {
+    if global.profile.is_empty() {
+        return Err(CliError::ValidationError(
+            "Invalid profile name: profile must not be empty".to_string(),
+        ));
+    }
+    let config_path = global.existing_runtime_config_path()?;
+    let config = ConfigFile::load_from(&config_path)?;
+    let resolved_auth_mode = resolve_auth_mode_from_config(global, command_line_mode, &config)?;
+    if resolved_auth_mode.mode != AuthMode::Unified {
+        return Ok(ADriveDryRunRuntime {
+            resolved_auth_mode,
+            unified_profile: None,
+            unified_client: None,
+        });
+    }
+
+    let profile = build_unified_profile(global, &config_path, &config)?;
+    let provider = AuthProvider::Unified(UnifiedAuthProvider {
+        credential_provider: UnifiedCredentialProvider::new(global.profile.clone()),
+        endpoint: profile.endpoint.clone(),
+        region: profile.region.clone(),
+        client_options: client_options_from_profile(&profile),
+    });
+    let unified_client = build_ids_client_from_provider(global, provider).ok();
+    Ok(ADriveDryRunRuntime {
+        resolved_auth_mode,
+        unified_profile: Some(profile),
+        unified_client,
+    })
+}
+
+/// Build one high-level ADrive runtime from a single authentication snapshot.
+///
+/// Unified mode derives both its non-secret profile and client from the one
+/// loaded [`ConfigFile`]. Existing AK/SK and OAuth construction remains on its
+/// compatibility path.
+pub(crate) fn build_adrive_runtime(
+    global: &GlobalArgs,
+    command_line_mode: Option<AuthMode>,
+) -> Result<ADriveRuntime, CliError> {
+    if global.profile.is_empty() {
+        return Err(CliError::ValidationError(
+            "Invalid profile name: profile must not be empty".to_string(),
+        ));
+    }
+    let config_path = global.existing_runtime_config_path()?;
+    let config = ConfigFile::load_from(&config_path)?;
+    let resolved_auth_mode = resolve_auth_mode_from_config(global, command_line_mode, &config)?;
+    // [Review Fix #2] Unified authentication and all high-level controls must
+    // be derived from this one snapshot so a concurrent config change cannot
+    // switch the invocation to a local secret-bearing mode.
+    build_adrive_runtime_from_snapshot(
+        global,
+        command_line_mode,
+        &config_path,
+        &config,
+        resolved_auth_mode,
+    )
+}
+
+fn build_adrive_runtime_from_snapshot(
+    global: &GlobalArgs,
+    command_line_mode: Option<AuthMode>,
+    config_path: &std::path::Path,
+    config: &ConfigFile,
+    resolved_auth_mode: ResolvedAuthMode,
+) -> Result<ADriveRuntime, CliError> {
+    if resolved_auth_mode.mode == AuthMode::Unified {
+        let profile = build_unified_profile(global, config_path, config)?;
+        let provider = AuthProvider::Unified(UnifiedAuthProvider {
+            credential_provider: UnifiedCredentialProvider::new(global.profile.clone()),
+            endpoint: profile.endpoint.clone(),
+            region: profile.region.clone(),
+            client_options: client_options_from_profile(&profile),
+        });
+        let client = build_ids_client_from_provider(global, provider)?;
+        return Ok(ADriveRuntime {
+            profile,
+            client,
+            resolved_auth_mode,
+        });
+    }
+
+    // [Review Fix #4] OAuth must carry non-secret runtime controls without
+    // loading or decrypting the unselected AK/SK credential family.
+    let profile = if resolved_auth_mode.mode == AuthMode::Oauth {
+        build_oauth_runtime_profile(global, config_path, config)?
+    } else {
+        build_profile(global)?
+    };
+    let client = build_ids_client(global, command_line_mode)?;
+    Ok(ADriveRuntime {
+        profile,
+        client,
+        resolved_auth_mode,
+    })
 }
 
 /// Inspect only the credential family selected for this invocation.
@@ -259,43 +621,163 @@ pub(crate) fn inspect_selected_credentials(
 ) -> Result<CredentialAvailability, CliError> {
     // [Review Fix #6] Strict mode selection also applies to diagnostics: an
     // OAuth check must not parse or depend on legacy AK/SK profile values.
-    if mode == AuthMode::Oauth {
-        let (oauth, credential_source) = resolve_oauth_credentials_with_source(global)?;
-        return Ok(CredentialAvailability {
-            has_access_key: None,
-            has_secret_key: None,
-            has_security_token: None,
-            has_access_token: Some(oauth.has_access_token()),
-            has_refresh_token: Some(oauth.has_refresh_token()),
-            oauth_service_integration: "not_implemented",
-            credential_source,
-        });
+    match mode {
+        AuthMode::Oauth => return inspect_oauth_credentials(global),
+        AuthMode::Unified => {
+            if global.profile.is_empty() {
+                return Err(CliError::ValidationError(
+                    "Invalid profile name: profile must not be empty".to_string(),
+                ));
+            }
+            return Ok(CredentialAvailability {
+                has_access_key: None,
+                has_secret_key: None,
+                has_security_token: None,
+                access_key_source: None,
+                secret_key_source: None,
+                security_token_source: None,
+                has_access_token: None,
+                has_refresh_token: None,
+                access_token_expiry: None,
+                expires_at: None,
+                scope: None,
+                instance_id: None,
+                ready: true,
+                oauth_service_integration: "not_applicable",
+                credential_source: "unified_sdk",
+            });
+        }
+        AuthMode::Aksk => {}
     }
 
     let profile = build_profile(global)?;
+    let sources = inspect_aksk_credential_sources(global)?;
+    let has_access_key = profile.access_key_id.is_some();
+    let has_secret_key = profile.secret_access_key.is_some();
     Ok(CredentialAvailability {
-        has_access_key: Some(profile.access_key_id.is_some()),
-        has_secret_key: Some(profile.secret_access_key.is_some()),
+        has_access_key: Some(has_access_key),
+        has_secret_key: Some(has_secret_key),
         has_security_token: Some(profile.security_token.is_some()),
+        access_key_source: Some(sources.access_key),
+        secret_key_source: Some(sources.secret_key),
+        security_token_source: Some(sources.security_token),
         has_access_token: None,
         has_refresh_token: None,
+        access_token_expiry: None,
+        expires_at: None,
+        scope: None,
+        instance_id: None,
+        ready: has_access_key && has_secret_key,
         oauth_service_integration: "not_applicable",
-        credential_source: "resolved_profile",
+        credential_source: sources.aggregate(),
     })
 }
 
-fn resolve_oauth_credentials(global: &GlobalArgs) -> Result<OAuthCredentials, CliError> {
-    resolve_oauth_credentials_with_source(global).map(|(credentials, _source)| credentials)
+#[derive(Clone, Copy)]
+struct AkskCredentialSources {
+    access_key: &'static str,
+    secret_key: &'static str,
+    security_token: &'static str,
 }
 
-fn resolve_oauth_credentials_with_source(
+impl AkskCredentialSources {
+    fn aggregate(self) -> &'static str {
+        let mut present_sources = [self.access_key, self.secret_key, self.security_token]
+            .into_iter()
+            .filter(|source| *source != "none");
+        let Some(first_source) = present_sources.next() else {
+            return "none";
+        };
+        if present_sources.all(|source| source == first_source) {
+            first_source
+        } else {
+            "mixed"
+        }
+    }
+}
+
+fn inspect_aksk_credential_sources(global: &GlobalArgs) -> Result<AkskCredentialSources, CliError> {
+    let config_path = global.existing_runtime_config_path()?;
+    let config_dir = ConfigFile::config_dir_from_path(&config_path);
+    let config = ConfigFile::load_from(&config_path)?;
+    let credentials_path = global.existing_runtime_credentials_path()?;
+    let stored = CredentialsFile::load_from(&credentials_path)?.effective_aksk(
+        &global.profile,
+        CredentialSection::ADrive,
+        &credentials_path,
+    )?;
+    let config_fields =
+        inspect_config_aksk_fields(&config, global, &config_dir, !stored.is_empty())?;
+    Ok(AkskCredentialSources {
+        access_key: credential_field_source(
+            stored.access_key_id.is_some(),
+            config_fields.0,
+            "ADRIVE_ACCESS_KEY",
+        ),
+        secret_key: credential_field_source(
+            stored.secret_access_key.is_some(),
+            config_fields.1,
+            "ADRIVE_SECRET_KEY",
+        ),
+        security_token: credential_field_source(
+            stored.security_token.is_some(),
+            config_fields.2,
+            "ADRIVE_SECURITY_TOKEN",
+        ),
+    })
+}
+
+fn inspect_config_aksk_fields(
+    config: &ConfigFile,
     global: &GlobalArgs,
-) -> Result<(OAuthCredentials, &'static str), CliError> {
+    config_dir: &std::path::Path,
+    has_stored_credentials: bool,
+) -> Result<(bool, bool, bool), CliError> {
+    if config.profiles.is_empty() && global.profile == "default" {
+        return Ok((false, false, false));
+    }
+    let effective =
+        match config.get_effective_profile_in_dir(&global.profile, Binary::Adrive, config_dir) {
+            Ok(effective) => effective,
+            Err(CliError::ConfigMissing(_)) if has_stored_credentials => {
+                return Ok((false, false, false));
+            }
+            Err(error) => return Err(error),
+        };
+    Ok((
+        effective.access_key_id.value.is_some()
+            && effective.access_key_id.source == FieldSource::BinaryOverride,
+        effective.secret_access_key.value.is_some()
+            && effective.secret_access_key.source == FieldSource::BinaryOverride,
+        effective.security_token.value.is_some()
+            && effective.security_token.source == FieldSource::BinaryOverride,
+    ))
+}
+
+fn credential_field_source(
+    has_stored_value: bool,
+    has_config_value: bool,
+    environment_key: &str,
+) -> &'static str {
+    if has_stored_value {
+        "credentials_file"
+    } else if has_config_value {
+        "config_file"
+    // [Review Fix #1] Match the runtime resolver exactly: non-UTF-8 values are
+    // ignored by `std::env::var(...).ok()` and must not be reported as active.
+    } else if std::env::var(environment_key).is_ok() {
+        "environment"
+    } else {
+        "none"
+    }
+}
+
+fn inspect_oauth_credentials(global: &GlobalArgs) -> Result<CredentialAvailability, CliError> {
     let credentials_path = global.existing_runtime_credentials_path()?;
     let stored = CredentialsFile::load_from(&credentials_path)?
         .adrive_oauth(&global.profile, &credentials_path)?;
     let has_stored_token = !stored.is_empty();
-    let credentials = OAuthCredentials::from_stored(stored);
+    let credentials = OAuthCredentials::from_stored(stored.clone());
     let source = if has_stored_token {
         "credentials_file"
     } else if credentials.has_access_token() || credentials.has_refresh_token() {
@@ -303,7 +785,173 @@ fn resolve_oauth_credentials_with_source(
     } else {
         "none"
     };
-    Ok((credentials, source))
+    let has_access_token = credentials.has_access_token();
+    let has_refresh_token = credentials.has_refresh_token();
+    let ready = if has_stored_token {
+        stored_oauth_is_ready(&stored, has_access_token, has_refresh_token)
+    } else {
+        // [Review Fix #6] Process environment credentials are read-only.
+        // A Refresh Token alone cannot be rotated or persisted by the CLI.
+        has_access_token
+    };
+    Ok(CredentialAvailability {
+        has_access_key: None,
+        has_secret_key: None,
+        has_security_token: None,
+        access_key_source: None,
+        secret_key_source: None,
+        security_token_source: None,
+        has_access_token: Some(has_access_token),
+        has_refresh_token: Some(has_refresh_token),
+        access_token_expiry: Some(oauth_expiry_state(
+            has_access_token,
+            has_stored_token
+                .then_some(stored.expires_at.as_deref())
+                .flatten(),
+        )),
+        expires_at: has_stored_token.then_some(stored.expires_at).flatten(),
+        scope: (has_stored_token && !stored.scope.is_empty()).then_some(stored.scope),
+        instance_id: has_stored_token.then_some(stored.instance_id).flatten(),
+        ready,
+        oauth_service_integration: "enabled",
+        credential_source: source,
+    })
+}
+
+fn stored_oauth_is_ready(
+    stored: &tos_core::infra::credentials::StoredOAuthCredentials,
+    has_access_token: bool,
+    has_refresh_token: bool,
+) -> bool {
+    let can_refresh = has_refresh_token
+        && has_nonempty(&stored.instance_id)
+        && has_nonempty(&stored.auth_endpoint);
+    if !has_access_token {
+        return can_refresh;
+    }
+    let Some(expires_at) = stored.expires_at.as_deref() else {
+        return true;
+    };
+    let Ok(expiry) = DateTime::parse_from_rfc3339(expires_at) else {
+        return false;
+    };
+    expiry.with_timezone(&Utc)
+        > Utc::now() + chrono::Duration::seconds(ACCESS_TOKEN_REFRESH_WINDOW_SECONDS)
+        || can_refresh
+}
+
+fn has_nonempty(value: &Option<String>) -> bool {
+    value
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn oauth_expiry_state(has_access_token: bool, expires_at: Option<&str>) -> String {
+    if !has_access_token {
+        return "missing".to_string();
+    }
+    let Some(expires_at) = expires_at else {
+        return "unknown".to_string();
+    };
+    match DateTime::parse_from_rfc3339(expires_at) {
+        Ok(expiry) if expiry.with_timezone(&Utc) <= Utc::now() => "expired".to_string(),
+        Ok(_) => "valid".to_string(),
+        Err(_) => "invalid".to_string(),
+    }
+}
+
+fn build_oauth_auth_provider(global: &GlobalArgs) -> Result<OAuthAuthProvider, CliError> {
+    let credentials_path = global.existing_runtime_credentials_path()?;
+    let (endpoint, region, client_options) =
+        resolve_oauth_runtime_settings(global, &credentials_path)?;
+    // [Review Fix #25] Preserve the OAuth remediation order: a command without
+    // usable OAuth credentials must direct the user to login after validating
+    // profile selection but before the independent Resource Server endpoint.
+    if !inspect_oauth_credentials(global)?.ready {
+        return Err(CliError::ConfigMissing(
+            "[login_required] usable OAuth credentials are required; run ve-adrive auth login"
+                .to_string(),
+        ));
+    }
+    let token_manager = OAuthTokenManager::new(
+        credentials_path,
+        global.profile.clone(),
+        client_options.clone(),
+    )?;
+    Ok(OAuthAuthProvider {
+        token_manager,
+        endpoint,
+        region,
+        client_options,
+    })
+}
+
+fn resolve_oauth_runtime_settings(
+    global: &GlobalArgs,
+    credentials_path: &std::path::Path,
+) -> Result<(Option<String>, Option<String>, ClientOptions), CliError> {
+    let config_path = global.existing_runtime_config_path()?;
+    let config = ConfigFile::load_from(&config_path)?;
+    let stored = CredentialsFile::load_from(credentials_path)?
+        .adrive_oauth(&global.profile, credentials_path)?;
+    let profile = config.profiles.get(&global.profile);
+    if profile.is_none()
+        && !((config.profiles.is_empty() && global.profile == "default") || !stored.is_empty())
+    {
+        return Err(CliError::ConfigMissing(format!(
+            "Profile '{}' not found in {}",
+            global.profile,
+            config_path.display()
+        )));
+    }
+    let adrive = profile.and_then(|profile| profile.adrive.as_ref());
+    let endpoint = global
+        .endpoint
+        .clone()
+        .or_else(|| adrive.and_then(|settings| settings.endpoint.clone()))
+        .or_else(|| std::env::var("ADRIVE_ENDPOINT").ok());
+    let region = global
+        .region
+        .clone()
+        .or_else(|| adrive.and_then(|settings| settings.region.clone()))
+        .or_else(|| std::env::var("ADRIVE_REGION").ok());
+    let client_options = oauth_client_options(profile, adrive);
+    Ok((endpoint, region, client_options))
+}
+
+pub(crate) fn oauth_client_options(
+    profile: Option<&Profile>,
+    adrive: Option<&tos_core::infra::config::AdriveOverride>,
+) -> ClientOptions {
+    ClientOptions {
+        max_retry_count: adrive
+            .and_then(|settings| settings.max_retry_count)
+            .or_else(|| profile.and_then(|profile| profile.max_retry_count))
+            .or_else(|| {
+                env_var_any(&["ADRIVE_MAX_RETRY_COUNT"]).and_then(|value| parse_u32_env(&value))
+            }),
+        requesttimeout: adrive
+            .and_then(|settings| settings.requesttimeout)
+            .or_else(|| profile.and_then(|profile| profile.requesttimeout))
+            .or_else(|| {
+                env_var_any(&["ADRIVE_REQUESTTIMEOUT", "ADRIVE_REQUEST_TIMEOUT"])
+                    .and_then(|value| parse_positive_u64_env(&value))
+            }),
+        connecttimeout: adrive
+            .and_then(|settings| settings.connecttimeout)
+            .or_else(|| profile.and_then(|profile| profile.connecttimeout))
+            .or_else(|| {
+                env_var_any(&["ADRIVE_CONNECTTIMEOUT", "ADRIVE_CONNECT_TIMEOUT"])
+                    .and_then(|value| parse_positive_u64_env(&value))
+            }),
+        maxconnections: adrive
+            .and_then(|settings| settings.maxconnections)
+            .or_else(|| profile.and_then(|profile| profile.maxconnections))
+            .or_else(|| {
+                env_var_any(&["ADRIVE_MAXCONNECTIONS", "ADRIVE_MAX_CONNECTIONS"])
+                    .and_then(|value| parse_positive_usize_env(&value))
+            }),
+    }
 }
 
 /// Build a real IDS REST client for ADrive operations.
@@ -312,31 +960,55 @@ pub(crate) fn build_ids_client(
     command_line_mode: Option<AuthMode>,
 ) -> Result<IdsClient, CliError> {
     let provider = build_auth_provider(global, command_line_mode)?;
-    let AuthProvider::Aksk(credentials) = provider else {
-        return Err(CliError::ValidationError(
-            "OAuth resource authentication is not implemented yet".to_string(),
-        ));
-    };
+    build_ids_client_from_provider(global, provider)
+}
 
-    // [Review Fix #4] The AK/SK provider carries the already-resolved runtime
-    // inputs so the legacy profile is loaded exactly once per client build.
-    IdsClient::new(
-        credentials.access_key,
-        credentials.secret_key,
-        credentials.security_token,
-        credentials.endpoint,
-        credentials.region,
-        credentials.client_options,
-    )
-    .map_err(|err| match err {
-        IdsError::Client(message) if message.contains("ADRIVE_REGION") => {
-            CliError::ConfigMissing(message)
-        }
-        other => CliError::Unknown(format!("failed to build IDS client: {other}")),
-    })
+fn build_ids_client_from_provider(
+    global: &GlobalArgs,
+    provider: AuthProvider,
+) -> Result<IdsClient, CliError> {
+    let client = match provider {
+        AuthProvider::Aksk(credentials) => IdsClient::new(
+            credentials.access_key,
+            credentials.secret_key,
+            credentials.security_token,
+            credentials.endpoint,
+            credentials.region,
+            credentials.client_options,
+        ),
+        AuthProvider::OAuth(credentials) => IdsClient::new_oauth(
+            credentials.token_manager,
+            credentials.endpoint,
+            credentials.region,
+            credentials.client_options,
+        ),
+        AuthProvider::Unified(credentials) => IdsClient::new_unified(
+            credentials.credential_provider,
+            credentials.endpoint,
+            credentials.region,
+            credentials.client_options,
+        ),
+    };
+    client
+        .map(|client| client.with_request_trace(std::sync::Arc::clone(&global.request_trace)))
+        .map_err(|err| match err {
+            IdsError::Cli(error) | IdsError::UnifiedCredential(error) => error,
+            IdsError::Client(message)
+                if message.contains("ADRIVE_ENDPOINT") || message.contains("ADRIVE_REGION") =>
+            {
+                // [Review Fix #1] Keep resource setup distinct from a missing
+                // OAuth login so the error wrapper can recommend the right command.
+                CliError::ConfigMissing(format!("[missing_resource_config] {message}"))
+            }
+            other => CliError::Unknown(format!("failed to build IDS client: {other}")),
+        })
 }
 
 pub(crate) fn map_ids_error(err: IdsError) -> CliError {
+    let err = match err {
+        IdsError::Cli(error) | IdsError::UnifiedCredential(error) => return error,
+        other => other,
+    };
     match &err {
         IdsError::Server(server) => match server.status_code {
             Some(401) => CliError::AuthFailed(err.to_string()),
@@ -351,6 +1023,321 @@ pub(crate) fn map_ids_error(err: IdsError) -> CliError {
         IdsError::Json(_) | IdsError::Client(_) | IdsError::InvalidResponse(_) => {
             CliError::ValidationError(err.to_string())
         }
+        IdsError::Cli(_) | IdsError::UnifiedCredential(_) => {
+            unreachable!("credential error returned above")
+        }
+    }
+}
+
+/// Actionable remediation fields for one ADrive runtime error.
+pub struct AdriveErrorGuidance {
+    /// Human-readable action that explains the remediation.
+    pub suggested_action: String,
+    /// Direct repair command or command template when one is known.
+    pub fix_command: Option<String>,
+    /// Focused Doctor command for additional diagnosis.
+    pub doctor_hint: Option<String>,
+}
+
+/// Select mode-aware ADrive remediation without changing configuration or credentials.
+pub fn adrive_error_guidance(
+    global: &GlobalArgs,
+    requested_mode: Option<AuthMode>,
+    error: &CliError,
+    command_path: &str,
+) -> AdriveErrorGuidance {
+    let semantics = error.agent_semantics();
+    let mode = error_auth_mode(global, requested_mode);
+    if mode == Some(AuthMode::Oauth)
+        && semantics.code == "oauth_instance_required"
+        && command_path == "ve-adrive ls"
+    {
+        return guidance(
+            "Specify the ADrive Instance bound to the OAuth Access Token",
+            Some("ve-adrive ls --instance <instance_id>"),
+            Some("ve-adrive doctor --check auth"),
+        );
+    }
+    if let Some(guidance) = auth_error_guidance(mode, error, &semantics.code) {
+        return guidance;
+    }
+    match error {
+        CliError::AuthFailed(_) => guidance(
+            &semantics.suggested_action,
+            None,
+            Some("ve-adrive doctor --check auth"),
+        ),
+        CliError::ValidationError(message) if message.contains("raw API execution") => guidance(
+            &semantics.suggested_action,
+            Some("ve-adrive api <group> <action> --dry-run"),
+            None,
+        ),
+        CliError::ValidationError(_) => guidance(
+            &semantics.suggested_action,
+            Some(&format!("{command_path} --help")),
+            None,
+        ),
+        CliError::Http(_) | CliError::TransferFailed(_) | CliError::RateLimited(_) => guidance(
+            &semantics.suggested_action,
+            None,
+            Some("ve-adrive doctor --check network --live-network"),
+        ),
+        _ => guidance(&semantics.suggested_action, None, Some("ve-adrive doctor")),
+    }
+}
+
+/// Return an ADrive OAuth-specific category without changing the shared TOS classifier.
+pub fn adrive_error_category(
+    global: &GlobalArgs,
+    requested_mode: Option<AuthMode>,
+    error: &CliError,
+) -> Option<AgentErrorCategory> {
+    if error_auth_mode(global, requested_mode) != Some(AuthMode::Oauth) {
+        return None;
+    }
+    let code = error.agent_semantics().code;
+    oauth_error_descriptor(&code).map(|descriptor| descriptor.category)
+}
+
+fn error_auth_mode(global: &GlobalArgs, requested_mode: Option<AuthMode>) -> Option<AuthMode> {
+    requested_mode.or_else(|| {
+        resolve_auth_mode(global, None)
+            .ok()
+            .map(|resolved| resolved.mode)
+    })
+}
+
+fn auth_error_guidance(
+    mode: Option<AuthMode>,
+    error: &CliError,
+    code: &str,
+) -> Option<AdriveErrorGuidance> {
+    // [Review Fix #4] Logout is also owned externally, but its repair action
+    // must not tell users to create or refresh a login session.
+    if mode == Some(AuthMode::Unified) && code == "unified_logout_managed_externally" {
+        return Some(guidance(
+            "Log out the selected profile through the externally managed Unified login framework",
+            Some("ve logout"),
+            Some("ve-adrive doctor --check auth"),
+        ));
+    }
+    if mode == Some(AuthMode::Unified)
+        && (code == "unified_login_managed_externally"
+            || error.to_string().contains("unified login credential"))
+    {
+        return Some(guidance(
+            "Refresh the selected profile's externally managed Unified login",
+            Some("ve login"),
+            Some("ve-adrive doctor --check auth"),
+        ));
+    }
+    if mode == Some(AuthMode::Oauth) && code == "oauth_user_id_required" {
+        // [Review Fix #2] `auth login` requires the target Instance on this CLI surface.
+        return Some(guidance(
+            "Run ve-adrive auth login --instance <instance_id> to refresh the selected user identity, or pass --owner-id explicitly",
+            Some("ve-adrive auth login --instance <instance_id>"),
+            Some("ve-adrive doctor --check auth"),
+        ));
+    }
+    if mode == Some(AuthMode::Oauth) && code == "oauth_instance_required" {
+        return Some(guidance(
+            "Select the ADrive Instance to authorize",
+            Some("ve-adrive auth login --instance <instance_id>"),
+            Some("ve-adrive doctor --check config"),
+        ));
+    }
+    if mode == Some(AuthMode::Oauth) && code == "oauth_auth_endpoint_required" {
+        return Some(guidance(
+            "Configure the OAuth Authorization Server before starting login",
+            Some("ve-adrive config set auth_endpoint <url>"),
+            Some("ve-adrive doctor --check config"),
+        ));
+    }
+    if code == "missing_resource_config" {
+        return Some(guidance(
+            "Configure the ADrive resource endpoint and a region when it cannot be parsed from that endpoint",
+            Some("ve-adrive config set endpoint <endpoint>"),
+            Some("ve-adrive doctor --check config"),
+        ));
+    }
+    if mode == Some(AuthMode::Oauth) && oauth_login_will_repair(code) {
+        return Some(guidance(
+            "Log in to ADrive with OAuth",
+            Some("ve-adrive auth login"),
+            Some("ve-adrive doctor --check auth"),
+        ));
+    }
+    if mode == Some(AuthMode::Oauth) {
+        if let Some(guidance) = oauth_error_guidance(code) {
+            return Some(guidance);
+        }
+    }
+    if mode == Some(AuthMode::Aksk) {
+        if let Some(guidance) = aksk_error_guidance(error, code) {
+            return Some(guidance);
+        }
+    }
+    match (mode, error) {
+        (_, CliError::ConfigMissing(_)) => Some(guidance(
+            "Initialize the ADrive profile and credentials",
+            Some("ve-adrive config init"),
+            Some("ve-adrive doctor --check config"),
+        )),
+        (Some(AuthMode::Aksk), CliError::AuthFailed(_)) => Some(guidance(
+            "Reconfigure the ADrive AK/SK credentials",
+            Some("ve-adrive config init"),
+            Some("ve-adrive doctor --check auth"),
+        )),
+        _ => None,
+    }
+}
+
+fn aksk_error_guidance(error: &CliError, code: &str) -> Option<AdriveErrorGuidance> {
+    if let CliError::ConfigMissing(message) = error {
+        if message.contains("ADRIVE_ACCESS_KEY is required") {
+            return Some(guidance(
+                "Configure the ADrive Access Key",
+                Some("ve-adrive config set access_key_id <access_key_id>"),
+                Some("ve-adrive doctor --check auth"),
+            ));
+        }
+        if message.contains("ADRIVE_SECRET_KEY is required") {
+            return Some(guidance(
+                "Configure the ADrive Secret Key",
+                Some("ve-adrive config set secret_access_key <secret_access_key>"),
+                Some("ve-adrive doctor --check auth"),
+            ));
+        }
+    }
+    match normalize_adrive_error_code(code).as_str() {
+        "invalidaccesskeyid" => Some(guidance(
+            "Update the ADrive Access Key",
+            Some("ve-adrive config set access_key_id <access_key_id>"),
+            Some("ve-adrive doctor --check auth"),
+        )),
+        "invalidsecretkey" | "signaturenotmatch" => Some(guidance(
+            "Verify the ADrive AK/SK pair and update the Secret Key",
+            Some("ve-adrive config set secret_access_key <secret_access_key>"),
+            Some("ve-adrive doctor --check auth"),
+        )),
+        "invalidsecuritytoken" => Some(guidance(
+            "Update or clear the ADrive Security Token; remove ADRIVE_SECURITY_TOKEN when the AK/SK pair does not require one",
+            Some("ve-adrive config set security_token <security_token>"),
+            Some("ve-adrive doctor --check auth"),
+        )),
+        "invalidcredential" => Some(guidance(
+            "Verify that the configured ADrive Access Key and Secret Key belong to the same credential pair",
+            Some("ve-adrive config init"),
+            Some("ve-adrive doctor --check auth"),
+        )),
+        _ => None,
+    }
+}
+
+fn normalize_adrive_error_code(code: &str) -> String {
+    code.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn oauth_error_guidance(code: &str) -> Option<AdriveErrorGuidance> {
+    let descriptor = oauth_error_descriptor(code)?;
+    Some(AdriveErrorGuidance {
+        suggested_action: descriptor.suggested_action.to_string(),
+        fix_command: None,
+        doctor_hint: Some(descriptor.doctor_hint.to_string()),
+    })
+}
+
+#[derive(Clone, Copy)]
+struct OAuthErrorDescriptor {
+    code: &'static str,
+    category: AgentErrorCategory,
+    suggested_action: &'static str,
+    doctor_hint: &'static str,
+}
+
+fn oauth_error_descriptor(code: &str) -> Option<OAuthErrorDescriptor> {
+    OAUTH_ERROR_DESCRIPTORS
+        .iter()
+        .copied()
+        .find(|descriptor| descriptor.code == code)
+}
+
+// [Review Fix #2] Keep OAuth overrides outside the public guidance struct so
+// adding ADrive semantics does not break consumers constructing that struct.
+const OAUTH_ERROR_DESCRIPTORS: &[OAuthErrorDescriptor] = &[
+    OAuthErrorDescriptor {
+        code: "invalid_request",
+        category: AgentErrorCategory::InvalidParam,
+        suggested_action: "Verify the OAuth request, Auth Endpoint, and stored authorization metadata; use the request_id to diagnose a persistent contract error",
+        doctor_hint: "ve-adrive doctor --check auth",
+    },
+    OAuthErrorDescriptor {
+        code: "invalid_client",
+        category: AgentErrorCategory::AuthError,
+        suggested_action: "Verify the OAuth Client registration; test environments must use the same ADRIVE_OAUTH_CLIENT_ID for login and refresh",
+        doctor_hint: "ve-adrive doctor --check auth",
+    },
+    OAuthErrorDescriptor {
+        code: "unauthorized_client",
+        category: AgentErrorCategory::AuthError,
+        suggested_action: "Verify the OAuth application status, grant type, and authorization for the target ADrive Instance",
+        doctor_hint: "ve-adrive doctor --check auth",
+    },
+    OAuthErrorDescriptor {
+        code: "invalid_scope",
+        category: AgentErrorCategory::InvalidParam,
+        // [Review Fix #3] This message must be correct for both login and refresh failures.
+        suggested_action: "Verify that scope=all is allowed for this OAuth Client; Refresh requests do not send scope, so a refresh failure indicates a Client/Server contract mismatch",
+        doctor_hint: "ve-adrive doctor --check auth",
+    },
+    OAuthErrorDescriptor {
+        code: "access_denied",
+        category: AgentErrorCategory::AuthError,
+        suggested_action: "Verify that the account can sign in and the OAuth application can access the target ADrive Instance",
+        doctor_hint: "ve-adrive doctor --check auth",
+    },
+    OAuthErrorDescriptor {
+        code: "unsupported_response_type",
+        category: AgentErrorCategory::InvalidParam,
+        suggested_action: "Report an OAuth Client/Server contract mismatch using the request_id; Device Authorization does not use an authorization response type",
+        doctor_hint: "ve-adrive doctor --check auth",
+    },
+    OAuthErrorDescriptor {
+        code: "unsupported_grant_type",
+        category: AgentErrorCategory::InvalidParam,
+        suggested_action: "Verify that the OAuth server supports the Device Authorization or Refresh Token grant type used by ve-adrive",
+        doctor_hint: "ve-adrive doctor --check auth",
+    },
+    OAuthErrorDescriptor {
+        code: "temporarily_unavailable",
+        category: AgentErrorCategory::Retryable,
+        suggested_action: "Retry the command later; the OAuth service is temporarily unavailable",
+        doctor_hint: "ve-adrive doctor --check network --live-network",
+    },
+    OAuthErrorDescriptor {
+        code: "server_error",
+        category: AgentErrorCategory::Retryable,
+        suggested_action: "Retry the command later; use the request_id to diagnose a persistent OAuth service error",
+        doctor_hint: "ve-adrive doctor --check network --live-network",
+    },
+];
+
+fn oauth_login_will_repair(code: &str) -> bool {
+    matches!(code, "login_required" | "invalid_grant" | "expired_token")
+}
+
+fn guidance(
+    suggested_action: &str,
+    fix_command: Option<&str>,
+    doctor_hint: Option<&str>,
+) -> AdriveErrorGuidance {
+    AdriveErrorGuidance {
+        suggested_action: suggested_action.to_string(),
+        fix_command: fix_command.map(ToString::to_string),
+        doctor_hint: doctor_hint.map(ToString::to_string),
     }
 }
 
@@ -382,7 +1369,7 @@ fn parse_positive_usize_env(value: &str) -> Option<usize> {
 ///
 /// This is the single entry point for all ADrive command output. It:
 /// 1. Auto-wraps in Envelope if not already envelope-shaped
-/// 2. Injects a request_id (from env or generated ULID)
+/// 2. Injects an invocation-traced request_id or generated ULID
 /// 3. Applies `--query` JMESPath filter if present
 /// 4. Routes to the correct output format (json/yaml/xml/table/csv/markdown)
 pub(crate) fn output_result<T: Serialize>(global: &GlobalArgs, data: &T) -> Result<(), CliError> {
@@ -421,6 +1408,10 @@ fn ensure_envelope(global: &GlobalArgs, value: Value) -> Value {
         let envelope = Envelope::success(command, value);
         serde_json::to_value(envelope).unwrap_or(Value::Null)
     };
+    tos_core::agent::request_id::apply_service_trace_to_success_envelope(
+        &mut value,
+        &global.request_trace.snapshot(),
+    );
     inject_request_id(&mut value);
     value
 }
@@ -517,7 +1508,7 @@ fn publicize_adrive_output_field(key: &str, value: &mut Value) {
 // ─── Request ID Injection ───────────────────────────────────────────────────
 
 /// Ensure the Envelope carries a request_id.
-/// Priority: existing non-empty request_id > explicit null > TOS_LAST_REQUEST_ID env > generated ULID.
+/// Priority: existing safe request_id > explicit null > generated ULID.
 fn inject_request_id(value: &mut Value) {
     let Value::Object(map) = value else {
         return;
@@ -530,11 +1521,12 @@ fn inject_request_id(value: &mut Value) {
     if !needs_id {
         return;
     }
-    let id = std::env::var("TOS_LAST_REQUEST_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| ulid::Ulid::new().to_string());
-    map.insert("request_id".to_string(), Value::String(id));
+    // [Review Fix #5] Never treat the process-wide compatibility mirror as an
+    // authoritative source for successful ADrive output.
+    map.insert(
+        "request_id".to_string(),
+        Value::String(ulid::Ulid::new().to_string()),
+    );
 }
 
 // ─── JMESPath Query ─────────────────────────────────────────────────────────
@@ -841,6 +1833,726 @@ fn csv_escape(value: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tos_core::infra::credentials::StoredOAuthCredentials;
+
+    #[test]
+    fn unified_mode_ignores_local_secrets_and_keeps_resource_settings() {
+        let directory = std::env::temp_dir().join(format!(
+            "ve-adrive-unified-isolation-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.toml");
+        let credentials_path = directory.join("credentials.toml");
+        std::fs::write(
+            &config_path,
+            r#"[selected.adrive]
+auth_mode = "unified"
+endpoint = "https://resource.example.com"
+region = "cn-test"
+access_key_id = "ENC:not-valid"
+secret_access_key = "ENC:not-valid"
+security_token = "ENC:not-valid"
+max_retry_count = 7
+checkpoint_threshold = "64MiB"
+"#,
+        )
+        .unwrap();
+        std::fs::write(&credentials_path, "not valid toml = [").unwrap();
+        let global = GlobalArgs {
+            profile: "selected".to_string(),
+            config_path: Some(config_path),
+            credentials_path: Some(credentials_path),
+            ..GlobalArgs::default()
+        };
+
+        let AuthProvider::Unified(provider) = build_auth_provider(&global, None).unwrap() else {
+            panic!("unified mode must build a Unified provider")
+        };
+        assert_eq!(
+            provider.endpoint.as_deref(),
+            Some("https://resource.example.com")
+        );
+        assert_eq!(provider.region.as_deref(), Some("cn-test"));
+        assert_eq!(provider.client_options.max_retry_count, Some(7));
+        assert!(!directory.join(".key").exists());
+
+        let client = build_ids_client(&global, None).unwrap();
+        assert_eq!(
+            client.instance_listing_scope().unwrap(),
+            crate::domain::client::InstanceListingScope::All
+        );
+        assert!(!client.uses_oauth());
+        assert_eq!(client.oauth_user_id().unwrap(), None);
+        assert!(!directory.join(".key").exists());
+
+        let runtime = build_adrive_runtime(&global, None).unwrap();
+        assert_eq!(
+            runtime.profile.checkpoint_threshold.as_deref(),
+            Some("64MiB")
+        );
+        assert!(!directory.join(".key").exists());
+
+        let inspection = inspect_selected_credentials(&global, AuthMode::Unified).unwrap();
+        assert!(inspection.ready);
+        assert_eq!(inspection.credential_source, "unified_sdk");
+        assert!(!directory.join(".key").exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn unified_runtime_survives_config_removal_after_its_selected_snapshot() {
+        let directory = std::env::temp_dir().join(format!(
+            "ve-adrive-unified-single-snapshot-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[selected.adrive]
+auth_mode = "unified"
+endpoint = "https://resource.example.com"
+region = "cn-test"
+checkpoint_threshold = "32MiB"
+access_key_id = "ENC:not-valid"
+secret_access_key = "ENC:not-valid"
+"#,
+        )
+        .unwrap();
+        let global = GlobalArgs {
+            profile: "selected".to_string(),
+            config_path: Some(config_path.clone()),
+            credentials_path: Some(directory.join("missing-credentials.toml")),
+            ..GlobalArgs::default()
+        };
+        let config = ConfigFile::load_from(&config_path).unwrap();
+        let resolved = resolve_auth_mode_from_config(&global, None, &config).unwrap();
+        std::fs::remove_file(&config_path).unwrap();
+
+        let runtime =
+            build_adrive_runtime_from_snapshot(&global, None, &config_path, &config, resolved)
+                .unwrap();
+
+        assert_eq!(runtime.resolved_auth_mode.mode, AuthMode::Unified);
+        assert_eq!(
+            runtime.profile.checkpoint_threshold.as_deref(),
+            Some("32MiB")
+        );
+        assert_eq!(
+            runtime.client.instance_listing_scope().unwrap(),
+            crate::domain::client::InstanceListingScope::All
+        );
+        assert!(!directory.join(".key").exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn oauth_runtime_ignores_unselected_malformed_aksk_credentials() {
+        let directory = std::env::temp_dir().join(format!(
+            "ve-adrive-oauth-runtime-isolation-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.toml");
+        let credentials_path = directory.join("credentials.toml");
+        std::fs::write(
+            &config_path,
+            r#"[selected.adrive]
+auth_mode = "oauth"
+endpoint = "https://resource.example.com"
+region = "cn-test"
+access_key_id = "ENC:not-valid"
+secret_access_key = "ENC:not-valid"
+checkpoint_threshold = "32MiB"
+"#,
+        )
+        .unwrap();
+        let mut credentials = CredentialsFile::default();
+        credentials
+            .set_adrive_oauth(
+                "selected",
+                StoredOAuthCredentials {
+                    access_token: Some("oauth-access".to_string()),
+                    expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+                    auth_endpoint: Some("https://auth.example.com".to_string()),
+                    ..StoredOAuthCredentials::default()
+                },
+            )
+            .unwrap();
+        credentials.save_to_path(&credentials_path).unwrap();
+        let global = GlobalArgs {
+            profile: "selected".to_string(),
+            config_path: Some(config_path),
+            credentials_path: Some(credentials_path),
+            ..GlobalArgs::default()
+        };
+
+        let runtime = build_adrive_runtime(&global, None)
+            .expect("OAuth runtime must ignore unselected malformed AK/SK");
+
+        assert_eq!(runtime.resolved_auth_mode.mode, AuthMode::Oauth);
+        assert_eq!(
+            runtime.profile.checkpoint_threshold.as_deref(),
+            Some("32MiB")
+        );
+        assert!(runtime.client.uses_oauth());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn explicit_oauth_runtime_accepts_credentials_only_named_profile() {
+        let directory = std::env::temp_dir().join(format!(
+            "ve-adrive-oauth-credentials-only-runtime-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.toml");
+        let credentials_path = directory.join("credentials.toml");
+        std::fs::write(
+            &config_path,
+            r#"[unrelated.adrive]
+auth_mode = "aksk"
+"#,
+        )
+        .unwrap();
+        let mut credentials = CredentialsFile::default();
+        credentials
+            .set_adrive_oauth(
+                "oauth-only",
+                StoredOAuthCredentials {
+                    access_token: Some("oauth-access".to_string()),
+                    expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+                    auth_endpoint: Some("https://auth.example.com".to_string()),
+                    ..StoredOAuthCredentials::default()
+                },
+            )
+            .unwrap();
+        credentials.save_to_path(&credentials_path).unwrap();
+        let global = GlobalArgs {
+            profile: "oauth-only".to_string(),
+            config_path: Some(config_path),
+            credentials_path: Some(credentials_path),
+            endpoint: Some("https://cli-resource.example.com".to_string()),
+            region: Some("cn-cli".to_string()),
+            ..GlobalArgs::default()
+        };
+
+        let runtime = build_adrive_runtime(&global, Some(AuthMode::Oauth))
+            .expect("explicit OAuth must retain credentials-only named profile support");
+
+        assert_eq!(runtime.resolved_auth_mode.mode, AuthMode::Oauth);
+        assert_eq!(
+            runtime.profile.endpoint.as_deref(),
+            Some("https://cli-resource.example.com")
+        );
+        assert_eq!(runtime.profile.region.as_deref(), Some("cn-cli"));
+        assert!(runtime.client.uses_oauth());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn unified_credential_inspection_gets_once_and_projects_only_safe_metadata() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let inspection =
+            inspect_unified_credentials(UnifiedInspectionSource::Resolver(Arc::new(move || {
+                resolver_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(
+                    tos_core::infra::unified_credentials::UnifiedCredentialValue::new(
+                        "SECRET_AK",
+                        "SECRET_SK",
+                        "SECRET_SESSION_TOKEN",
+                        "safe-provider",
+                    ),
+                )
+            })))
+            .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(inspection.provider_name.as_deref(), Some("safe-provider"));
+        assert!(inspection.has_session_token);
+        assert!(inspection.ready);
+        assert_eq!(inspection.sdk_code, None);
+    }
+
+    #[tokio::test]
+    async fn unified_credential_inspection_treats_session_token_as_optional() {
+        let inspection =
+            inspect_unified_credentials(UnifiedInspectionSource::Resolver(Arc::new(|| {
+                Ok(
+                    tos_core::infra::unified_credentials::UnifiedCredentialValue::new(
+                        "SECRET_AK",
+                        "SECRET_SK",
+                        "",
+                        "safe-provider",
+                    ),
+                )
+            })))
+            .await;
+
+        assert!(inspection.ready);
+        assert!(!inspection.has_session_token);
+    }
+
+    #[tokio::test]
+    async fn unified_credential_inspection_sanitizes_sdk_failure_without_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let inspection =
+            inspect_unified_credentials(UnifiedInspectionSource::Resolver(Arc::new(move || {
+                resolver_calls.fetch_add(1, Ordering::SeqCst);
+                Err(CliError::AuthFailed(
+                    "[CredentialExpired] secret-value must not escape".to_string(),
+                ))
+            })))
+            .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(inspection.provider_name, None);
+        assert!(!inspection.has_session_token);
+        assert!(!inspection.ready);
+        assert_eq!(inspection.sdk_code.as_deref(), Some("CredentialExpired"));
+    }
+
+    #[test]
+    fn unified_sdk_and_external_login_errors_recommend_ve_login() {
+        let global = GlobalArgs::default();
+        for error in [
+            CliError::ConfigMissing(
+                "[CliConfigLoginSessionMissing] unified login credentials are unavailable"
+                    .to_string(),
+            ),
+            CliError::ValidationError(
+                "[unified_login_managed_externally] managed externally".to_string(),
+            ),
+        ] {
+            let guidance = adrive_error_guidance(
+                &global,
+                Some(AuthMode::Unified),
+                &error,
+                "ve-adrive auth login",
+            );
+            assert_eq!(guidance.fix_command.as_deref(), Some("ve login"));
+            assert_eq!(
+                guidance.doctor_hint.as_deref(),
+                Some("ve-adrive doctor --check auth")
+            );
+            assert!(!guidance.suggested_action.contains("AK/SK"));
+            assert!(!guidance.suggested_action.contains("config init"));
+        }
+    }
+
+    #[test]
+    fn unified_external_logout_error_recommends_ve_logout() {
+        let guidance = adrive_error_guidance(
+            &GlobalArgs::default(),
+            Some(AuthMode::Unified),
+            &CliError::ValidationError(
+                "[unified_logout_managed_externally] managed externally".to_string(),
+            ),
+            "ve-adrive auth logout",
+        );
+
+        assert_eq!(guidance.fix_command.as_deref(), Some("ve logout"));
+        assert_eq!(
+            guidance.doctor_hint.as_deref(),
+            Some("ve-adrive doctor --check auth")
+        );
+    }
+
+    #[test]
+    fn ensure_envelope_prefers_invocation_service_request_id() {
+        let global = GlobalArgs::default();
+        global
+            .request_trace
+            .record_response(Some("ids-service-id"), true);
+        let envelope = json!({
+            "success": true,
+            "status": "success",
+            "command": "ve-adrive ls",
+            "request_id": "generated-id",
+            "data": {"files": []},
+        });
+
+        let out = ensure_envelope(&global, envelope);
+
+        assert_eq!(out["request_id"], "ids-service-id");
+    }
+
+    #[test]
+    fn oauth_root_ls_missing_instance_points_to_explicit_target() {
+        let guidance = adrive_error_guidance(
+            &GlobalArgs::default(),
+            Some(AuthMode::Oauth),
+            &CliError::ConfigMissing(
+                "[oauth_instance_required] OAuth credentials have no bound Instance".to_string(),
+            ),
+            "ve-adrive ls",
+        );
+
+        assert_eq!(
+            guidance.fix_command.as_deref(),
+            Some("ve-adrive ls --instance <instance_id>")
+        );
+        assert_eq!(
+            guidance.doctor_hint.as_deref(),
+            Some("ve-adrive doctor --check auth")
+        );
+    }
+
+    #[test]
+    fn oauth_user_id_required_guidance_recommends_login_or_explicit_owner() {
+        // [Review Fix #2] Keep the stable envelope code and executable remediation together.
+        let error = CliError::ValidationError(
+            "[oauth_user_id_required] OAuth Space creation requires --owner-id or ve-adrive auth login --instance <instance_id>"
+                .to_string(),
+        );
+        let semantics = error.agent_semantics();
+        let guidance = adrive_error_guidance(
+            &GlobalArgs::default(),
+            Some(AuthMode::Oauth),
+            &error,
+            "ve-adrive crt",
+        );
+
+        assert_eq!(semantics.code, "oauth_user_id_required");
+        assert_eq!(semantics.category, AgentErrorCategory::InvalidParam);
+        assert_eq!(
+            guidance.fix_command.as_deref(),
+            Some("ve-adrive auth login --instance <instance_id>")
+        );
+        assert_eq!(
+            guidance.doctor_hint.as_deref(),
+            Some("ve-adrive doctor --check auth")
+        );
+        assert!(guidance.suggested_action.contains("--owner-id"));
+        assert!(guidance
+            .suggested_action
+            .contains("ve-adrive auth login --instance <instance_id>"));
+    }
+
+    #[test]
+    fn oauth_login_missing_instance_keeps_login_fix_command() {
+        let guidance = adrive_error_guidance(
+            &GlobalArgs::default(),
+            Some(AuthMode::Oauth),
+            &CliError::ConfigMissing(
+                "[oauth_instance_required] ADrive OAuth instance is required".to_string(),
+            ),
+            "ve-adrive auth login",
+        );
+
+        assert_eq!(
+            guidance.fix_command.as_deref(),
+            Some("ve-adrive auth login --instance <instance_id>")
+        );
+    }
+
+    #[test]
+    fn oauth_login_missing_auth_endpoint_recommends_configuring_it() {
+        let guidance = adrive_error_guidance(
+            &GlobalArgs::default(),
+            Some(AuthMode::Oauth),
+            &CliError::ConfigMissing(
+                "[oauth_auth_endpoint_required] ADrive OAuth auth endpoint is required".to_string(),
+            ),
+            "ve-adrive auth login",
+        );
+
+        assert_eq!(
+            guidance.fix_command.as_deref(),
+            Some("ve-adrive config set auth_endpoint <url>")
+        );
+        assert_eq!(
+            guidance.doctor_hint.as_deref(),
+            Some("ve-adrive doctor --check config")
+        );
+    }
+
+    #[test]
+    fn missing_resource_endpoint_recommends_endpoint_for_both_auth_modes() {
+        for mode in [AuthMode::Aksk, AuthMode::Oauth] {
+            let guidance = adrive_error_guidance(
+                &GlobalArgs::default(),
+                Some(mode),
+                &CliError::ConfigMissing(
+                    "[missing_resource_config] ADRIVE_ENDPOINT is required".to_string(),
+                ),
+                "ve-adrive ls",
+            );
+
+            assert_eq!(
+                guidance.fix_command.as_deref(),
+                Some("ve-adrive config set endpoint <endpoint>"),
+                "mode={mode:?}"
+            );
+            assert_eq!(
+                guidance.doctor_hint.as_deref(),
+                Some("ve-adrive doctor --check config")
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_invalid_client_guidance_identifies_client_registration() {
+        let guidance = adrive_error_guidance(
+            &GlobalArgs::default(),
+            Some(AuthMode::Oauth),
+            &CliError::AuthFailed(
+                "HTTP 400 [invalid_client] OAuth Token refresh failed (RequestId: req-1)"
+                    .to_string(),
+            ),
+            "ve-adrive ls",
+        );
+
+        assert_eq!(
+            adrive_error_category(
+                &GlobalArgs::default(),
+                Some(AuthMode::Oauth),
+                &CliError::AuthFailed(
+                    "HTTP 400 [invalid_client] OAuth Token refresh failed".to_string(),
+                ),
+            ),
+            Some(tos_core::agent::error::AgentErrorCategory::AuthError)
+        );
+        assert!(guidance.suggested_action.contains("ADRIVE_OAUTH_CLIENT_ID"));
+        assert!(guidance.fix_command.is_none());
+        assert_eq!(
+            guidance.doctor_hint.as_deref(),
+            Some("ve-adrive doctor --check auth")
+        );
+    }
+
+    #[test]
+    fn oauth_terminal_error_guidance_matches_the_frozen_contract() {
+        let cases = [
+            (
+                "unauthorized_client",
+                tos_core::agent::error::AgentErrorCategory::AuthError,
+                "application status",
+            ),
+            (
+                "invalid_scope",
+                tos_core::agent::error::AgentErrorCategory::InvalidParam,
+                "do not send scope",
+            ),
+            (
+                "access_denied",
+                tos_core::agent::error::AgentErrorCategory::AuthError,
+                "account",
+            ),
+            (
+                "unsupported_grant_type",
+                tos_core::agent::error::AgentErrorCategory::InvalidParam,
+                "grant type",
+            ),
+            (
+                "server_error",
+                tos_core::agent::error::AgentErrorCategory::Retryable,
+                "request_id",
+            ),
+        ];
+
+        for (code, category, action_fragment) in cases {
+            let guidance = adrive_error_guidance(
+                &GlobalArgs::default(),
+                Some(AuthMode::Oauth),
+                &CliError::AuthFailed(format!(
+                    "HTTP 400 [{code}] OAuth Token refresh failed (RequestId: req-1)"
+                )),
+                "ve-adrive ls",
+            );
+
+            assert_eq!(
+                adrive_error_category(
+                    &GlobalArgs::default(),
+                    Some(AuthMode::Oauth),
+                    &CliError::AuthFailed(format!("HTTP 400 [{code}] OAuth Token refresh failed")),
+                ),
+                Some(category),
+                "code={code}"
+            );
+            assert!(
+                guidance.suggested_action.contains(action_fragment),
+                "code={code}, action={}",
+                guidance.suggested_action
+            );
+            assert!(guidance.fix_command.is_none(), "code={code}");
+        }
+    }
+
+    #[test]
+    fn aksk_runtime_errors_recommend_the_affected_credential_field() {
+        let cases = [
+            (
+                "InvalidAccessKeyId",
+                "Access Key",
+                "ve-adrive config set access_key_id <access_key_id>",
+            ),
+            (
+                "SignatureNotMatch",
+                "AK/SK pair",
+                "ve-adrive config set secret_access_key <secret_access_key>",
+            ),
+            (
+                "InvalidSecurityToken",
+                "Security Token",
+                "ve-adrive config set security_token <security_token>",
+            ),
+        ];
+
+        for (code, action_fragment, fix_command) in cases {
+            let guidance = adrive_error_guidance(
+                &GlobalArgs::default(),
+                Some(AuthMode::Aksk),
+                &CliError::AuthFailed(format!("HTTP 401 [{code}] request rejected")),
+                "ve-adrive ls",
+            );
+
+            assert!(
+                guidance.suggested_action.contains(action_fragment),
+                "code={code}, action={}",
+                guidance.suggested_action
+            );
+            assert_eq!(guidance.fix_command.as_deref(), Some(fix_command));
+            assert_eq!(
+                guidance.doctor_hint.as_deref(),
+                Some("ve-adrive doctor --check auth")
+            );
+        }
+    }
+
+    #[test]
+    fn aksk_missing_field_errors_recommend_only_the_missing_field() {
+        let cases = [
+            (
+                "ADRIVE_ACCESS_KEY is required",
+                "ve-adrive config set access_key_id <access_key_id>",
+            ),
+            (
+                "ADRIVE_SECRET_KEY is required",
+                "ve-adrive config set secret_access_key <secret_access_key>",
+            ),
+        ];
+
+        for (message, fix_command) in cases {
+            let guidance = adrive_error_guidance(
+                &GlobalArgs::default(),
+                Some(AuthMode::Aksk),
+                &CliError::ConfigMissing(message.to_string()),
+                "ve-adrive ls",
+            );
+
+            assert_eq!(guidance.fix_command.as_deref(), Some(fix_command));
+            assert_eq!(
+                guidance.doctor_hint.as_deref(),
+                Some("ve-adrive doctor --check auth")
+            );
+        }
+    }
+
+    #[test]
+    fn aksk_forbidden_auth_code_still_gets_targeted_guidance() {
+        let guidance = adrive_error_guidance(
+            &GlobalArgs::default(),
+            Some(AuthMode::Aksk),
+            &CliError::PermissionDenied(
+                "HTTP 403 [InvalidAccessKeyId] request rejected".to_string(),
+            ),
+            "ve-adrive ls",
+        );
+
+        assert_eq!(
+            guidance.fix_command.as_deref(),
+            Some("ve-adrive config set access_key_id <access_key_id>")
+        );
+    }
+
+    #[test]
+    fn persisted_oauth_status_reports_metadata_and_readiness() {
+        let directory = std::env::temp_dir().join(format!(
+            "ve-adrive-oauth-status-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let credentials_path = directory.join("credentials.toml");
+        let mut credentials = CredentialsFile::default();
+        credentials
+            .set_adrive_oauth(
+                "default",
+                StoredOAuthCredentials {
+                    access_token: Some("ACCESS_TOKEN_MUST_NOT_LEAK".to_string()),
+                    refresh_token: Some("REFRESH_TOKEN_MUST_NOT_LEAK".to_string()),
+                    expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+                    token_type: Some("Bearer".to_string()),
+                    scope: vec!["all".to_string()],
+                    legacy_client_id: None,
+                    instance_id: Some("inst-1".to_string()),
+                    user_id: None,
+                    auth_endpoint: Some("https://auth.example.com".to_string()),
+                },
+            )
+            .unwrap();
+        credentials.save_to_path(&credentials_path).unwrap();
+        let global = GlobalArgs {
+            credentials_path: Some(credentials_path),
+            ..GlobalArgs::default()
+        };
+
+        let status = inspect_selected_credentials(&global, AuthMode::Oauth).unwrap();
+
+        assert_eq!(status.access_token_expiry.as_deref(), Some("valid"));
+        assert_eq!(status.scope, Some(vec!["all".to_string()]));
+        assert_eq!(status.instance_id.as_deref(), Some("inst-1"));
+        assert!(status.ready);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn oauth_mode_resolution_does_not_decrypt_unselected_aksk_fields() {
+        let directory = std::env::temp_dir().join(format!(
+            "ve-adrive-auth-mode-isolation-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[default.adrive]\nauth_mode = \"oauth\"\nsecret_access_key = \"ENC:not-valid\"\n",
+        )
+        .unwrap();
+        let global = GlobalArgs {
+            config_path: Some(config_path),
+            ..GlobalArgs::default()
+        };
+
+        let resolved = resolve_auth_mode(&global, None).unwrap();
+
+        assert_eq!(resolved.mode, AuthMode::Oauth);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn explicit_unified_mode_rejects_empty_profile_before_sdk_fallback() {
+        let global = GlobalArgs {
+            profile: String::new(),
+            ..GlobalArgs::default()
+        };
+
+        let error = resolve_auth_mode(&global, Some(AuthMode::Unified))
+            .expect_err("an empty CLI profile must never reach the Unified SDK");
+
+        assert!(error.to_string().contains("profile must not be empty"));
+    }
 
     #[test]
     fn table_output_uses_declared_columns_for_empty_payloads() {

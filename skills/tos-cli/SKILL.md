@@ -35,6 +35,26 @@ tos-cli doctor --output json
 tos-cli config show --output json
 ```
 
+## Connection configuration
+
+`tos-cli config init` does not choose a region, endpoint, or PSM. Configure an
+endpoint explicitly; a recognizable endpoint may supply the signing region,
+while a custom endpoint also needs an explicit region. For ByteTOS PSM mode,
+configure both region and PSM and do not configure endpoint.
+
+```bash
+tos-cli config set access_key_id <byte-tos-access-key>
+tos-cli config set secret_access_key <byte-tos-secret-key>
+tos-cli config set endpoint https://your-bytetos-endpoint.example.com
+tos-cli config set region cn-beijing
+# Alternative PSM mode in another profile (no endpoint in that profile):
+tos-cli config set psm-profile.region cn-beijing
+tos-cli config set psm-profile.psm toutiao.tos.tosapi
+```
+
+Bare AK/SK keys are stored under the active profile's `[profile.tos]`
+credentials section, independently from `ve-tos-cli` credentials.
+
 ## Common Commands
 
 ```bash

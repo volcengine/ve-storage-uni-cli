@@ -17,7 +17,7 @@
 #![recursion_limit = "256"]
 
 use clap::{error::ErrorKind as ClapErrorKind, Parser, Subcommand};
-use std::fmt::Write as _;
+use std::{fmt::Write as _, sync::OnceLock};
 use tos_core::agent::global_args::GlobalArgs;
 use tos_core::infra::client::USER_AGENT_NAME_ENV;
 
@@ -79,6 +79,8 @@ enum ToolCommand {
     /// TOS Object Storage commands (high-level + low-level + utilities)
     #[command(name = "ve-tos")]
     Tos {
+        #[command(flatten)]
+        auth: ve_tos_cli::VeTosAuthArgs,
         #[command(subcommand)]
         command: Option<ve_tos_cli::TosCommand>,
     },
@@ -90,6 +92,68 @@ enum ToolCommand {
         #[command(subcommand)]
         command: ve_adrive_cli::ADriveCommand,
     },
+}
+
+#[cfg(test)]
+mod auth_mode_parser_tests {
+    use super::{adrive_grouped_help_zh, byted_tos_grouped_help_zh, tos_grouped_help_zh};
+    use super::{Cli, ToolCommand};
+    use clap::Parser;
+    use ve_tos_cli::domain::auth::AuthMode;
+
+    #[test]
+    fn ve_tos_auth_mode_is_tool_scoped() {
+        for arguments in [
+            [
+                "ve-storage-uni-cli",
+                "ve-tos",
+                "--auth-mode",
+                "unified",
+                "ls",
+            ],
+            [
+                "ve-storage-uni-cli",
+                "ve-tos",
+                "ls",
+                "--auth-mode",
+                "unified",
+            ],
+        ] {
+            let parsed = Cli::try_parse_from(arguments).expect("ve-tos mode should parse");
+            let ToolCommand::Tos { auth, .. } = parsed.tool else {
+                panic!("expected ve-tos command");
+            };
+            assert_eq!(auth.auth_mode, Some(AuthMode::Unified));
+        }
+
+        for arguments in [
+            ["ve-storage-uni-cli", "tos", "--auth-mode", "unified", "ls"],
+            ["ve-storage-uni-cli", "tos", "ls", "--auth-mode", "unified"],
+        ] {
+            assert!(
+                Cli::try_parse_from(arguments).is_err(),
+                "tos must reject ve-tos authentication options"
+            );
+        }
+    }
+
+    #[test]
+    fn localized_grouped_help_keeps_unified_tool_scoped() {
+        let ve_tos_help = tos_grouped_help_zh();
+        assert!(ve_tos_help.contains("--auth-mode <MODE>"));
+        assert!(ve_tos_help.contains("TOS_AUTH_MODE"));
+        assert!(ve_tos_help.contains("ve login"));
+
+        let adrive_help = adrive_grouped_help_zh();
+        assert!(adrive_help.contains("--auth-mode <MODE>"));
+        assert!(adrive_help.contains("ADRIVE_AUTH_MODE"));
+        assert!(adrive_help.contains("ve login"));
+        assert!(adrive_help.contains("ve logout"));
+
+        let tos_help = byted_tos_grouped_help_zh();
+        assert!(!tos_help.contains("--auth-mode"));
+        assert!(!tos_help.to_ascii_lowercase().contains("unified"));
+    }
 }
 
 fn normalize_help_aliases(args: &[String]) -> Vec<String> {
@@ -362,14 +426,1115 @@ fn localize_clap_help_zh(help: &str) -> String {
 }
 
 fn translate_help_phrases_zh(text: &str) -> String {
-    let mut translated = text.to_string();
-    for (english, chinese) in HELP_TRANSLATIONS_ZH {
-        translated = translated.replace(english, chinese);
+    let translations = help_translations_zh_longest_first();
+    let mut translated = String::with_capacity(text.len());
+    let mut offset = 0;
+    while offset < text.len() {
+        let remaining = &text[offset..];
+        if let Some((english, chinese)) = translations
+            .iter()
+            .find(|(english, _)| remaining.starts_with(english))
+        {
+            translated.push_str(chinese);
+            offset += english.len();
+            continue;
+        }
+        let character = remaining
+            .chars()
+            .next()
+            .expect("remaining text is non-empty");
+        translated.push(character);
+        offset += character.len_utf8();
     }
     translated
 }
 
+fn help_translations_zh_longest_first() -> &'static [(&'static str, &'static str)] {
+    // [Review Fix #6] The exhaustive audit renders hundreds of phrases, so
+    // build the deterministic longest-first index once instead of per phrase.
+    static SORTED_TRANSLATIONS: OnceLock<Vec<(&str, &str)>> = OnceLock::new();
+    SORTED_TRANSLATIONS.get_or_init(|| {
+        let mut translations = HELP_TRANSLATIONS_ZH.to_vec();
+        // [Review Fix #2] Stable ordering keeps the first catalog definition
+        // authoritative when legacy entries duplicate an equally long source.
+        translations.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+        translations
+    })
+}
+
 const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    // [Review Fix #9] Preserve each aligned root invocation verbatim while
+    // translating its separately audited human-facing service description.
+    (
+        "ByteCloud TOS Object Storage",
+        "ByteCloud TOS 对象存储",
+    ),
+    ("TOS Object Storage", "TOS 对象存储"),
+    ("A-Drive", "A-Drive 文件存储"),
+    // [Review Fix #7] Shell examples are machine syntax only before `#`;
+    // localize their human comments while preserving auth modes and tier identifiers.
+    (
+        "AK/SK Instance default: arkclaw",
+        "AK/SK Instance 默认值：arkclaw",
+    ),
+    ("OAuth Instance default: paas", "OAuth Instance 默认值：paas"),
+    (
+        "OAuth user Space default: logged-in user_id",
+        "OAuth 用户 Space 默认值：已登录 user_id",
+    ),
+    // [Review Fix #1] A line beginning with a flag can still contain prose;
+    // cover the entire line instead of treating every `--...` line as machine-only.
+    (
+        "--language <en|zh>      Help output language, e.g. --help --language zh",
+        "--language <en|zh>      帮助输出语言，例如 --help --language zh",
+    ),
+    // [Review Fix #3] Config keys stay unchanged, but their surrounding
+    // routing explanations are human prose and require exact translations.
+    (
+        "- active profile key: `region` (uses `--profile`, defaulting to `default`)",
+        "- 当前 profile 键：`region`（使用 `--profile`，默认为 `default`）",
+    ),
+    (
+        "- binary override: `staging.ve-tos.endpoint` or `staging.tos.psm`",
+        "- 二进制覆盖：`staging.ve-tos.endpoint` 或 `staging.tos.psm`",
+    ),
+    ("- control_endpoint (ve-tos only)", "- control_endpoint（仅 ve-tos）"),
+    ("- named profile: `staging.region`", "- 指定 profile：`staging.region`"),
+    (
+        "- psm / idc / cluster / addr_family (tos only)",
+        "- psm / idc / cluster / addr_family（仅 tos）",
+    ),
+    (
+        "<profile>.access_key_id / secret_access_key -> explicitly write shared credentials to [<profile>]",
+        "<profile>.access_key_id / secret_access_key -> 显式将共享凭证写入 [<profile>]",
+    ),
+    (
+        "<profile>.account_id        -> write to [<profile>.ve-tos]",
+        "<profile>.account_id        -> 写入 [<profile>.ve-tos]",
+    ),
+    (
+        "<profile>.control_endpoint (ve-tos only) -> write to [<profile>.ve-tos]",
+        "<profile>.control_endpoint（仅 ve-tos）-> 写入 [<profile>.ve-tos]",
+    ),
+    (
+        "<profile>.endpoint          -> write to the active TOS binary section",
+        "<profile>.endpoint          -> 写入当前 TOS 二进制 section",
+    ),
+    (
+        "<profile>.psm (tos only)    -> write to [<profile>.tos]",
+        "<profile>.psm（仅 tos）     -> 写入 [<profile>.tos]",
+    ),
+    (
+        "<profile>.region            -> write to [<profile>]",
+        "<profile>.region            -> 写入 [<profile>]",
+    ),
+    (
+        "<profile>.tos.psm           -> write to [<profile>.tos]",
+        "<profile>.tos.psm           -> 写入 [<profile>.tos]",
+    ),
+    (
+        "<profile>.ve-tos.endpoint   -> write to [<profile>.ve-tos]",
+        "<profile>.ve-tos.endpoint   -> 写入 [<profile>.ve-tos]",
+    ),
+    (
+        "access_key_id / secret_access_key / security_token -> write to the active TOS binary credentials",
+        "access_key_id / secret_access_key / security_token -> 写入当前 TOS 二进制凭证",
+    ),
+    (
+        "account_id                  -> write to [active-profile.ve-tos]",
+        "account_id                  -> 写入 [active-profile.ve-tos]",
+    ),
+    (
+        "checkpoint_dir / progress_enabled -> write to the active TOS binary section",
+        "checkpoint_dir / progress_enabled -> 写入当前 TOS 二进制 section",
+    ),
+    (
+        "control_endpoint (ve-tos only) -> write to [active-profile.ve-tos]",
+        "control_endpoint（仅 ve-tos）-> 写入 [active-profile.ve-tos]",
+    ),
+    (
+        "endpoint                    -> write to [active-profile.ve-tos] or [active-profile.tos]",
+        "endpoint                    -> 写入 [active-profile.ve-tos] 或 [active-profile.tos]",
+    ),
+    (
+        "max_retry_count / requesttimeout / connecttimeout / maxconnections -> write to the active TOS binary section",
+        "max_retry_count / requesttimeout / connecttimeout / maxconnections -> 写入当前 TOS 二进制 section",
+    ),
+    (
+        "psm / idc / cluster / addr_family (tos only) -> write to [active-profile.tos]",
+        "psm / idc / cluster / addr_family（仅 tos）-> 写入 [active-profile.tos]",
+    ),
+    (
+        "region                      -> write to [active-profile]",
+        "region                      -> 写入 [active-profile]",
+    ),
+    // [Review Fix #4] Header names are machine identifiers, but the trailing
+    // word "header" is prose; preserve each identifier and localize that prose.
+    ("X-From-Modular header", "X-From-Modular 请求头"),
+    ("X-If-Match-AccessTime header", "X-If-Match-AccessTime 请求头"),
+    ("X-If-Match-CreateTime header", "X-If-Match-CreateTime 请求头"),
+    ("X-If-Match-Expires header", "X-If-Match-Expires 请求头"),
+    ("X-If-Match-Tags header", "X-If-Match-Tags 请求头"),
+    (
+        "X-Inner-Properties-TimeStamp header",
+        "X-Inner-Properties-TimeStamp 请求头",
+    ),
+    (
+        "X-Inner-Properties-TimeStampNsec header",
+        "X-Inner-Properties-TimeStampNsec 请求头",
+    ),
+    ("X-Replicated-From header", "X-Replicated-From 请求头"),
+    ("x-content-sha256 header", "x-content-sha256 请求头"),
+    ("x-decoded-content-length header", "x-decoded-content-length 请求头"),
+    ("x-if-match-inode-id header", "x-if-match-inode-id 请求头"),
+    (
+        "x-lifecycle-directly-delete-versions header",
+        "x-lifecycle-directly-delete-versions 请求头",
+    ),
+    ("x-modify-timestamp header", "x-modify-timestamp 请求头"),
+    ("x-modify-timestamp-ns header", "x-modify-timestamp-ns 请求头"),
+    ("x-only-put-delete-marker header", "x-only-put-delete-marker 请求头"),
+    ("x-parent-inode-id header", "x-parent-inode-id 请求头"),
+    (
+        "A-Drive commands (high-level + utilities)",
+        "A-Drive 命令（高阶命令与工具）",
+    ),
+    ("ACL value", "ACL 值"),
+    (
+        "ACL value (private, public-read, public-read-write, authenticated-read)",
+        "ACL 值（private、public-read、public-read-write、authenticated-read）",
+    ),
+    ("ACL value (x-tos-acl)", "ACL 值（x-tos-acl）"),
+    ("API action", "API 操作"),
+    ("API group", "API 分组"),
+    (
+        "AZ redundancy (x-tos-az-redundancy). Allowed: single-az, multi-az",
+        "AZ 冗余（x-tos-az-redundancy）。可选值：single-az、multi-az",
+    ),
+    ("Abort a multipart upload", "中止分片上传"),
+    (
+        "Accelerator ID or name used in path parameters",
+        "路径参数中使用的 Accelerator ID 或名称",
+    ),
+    (
+        "Accelerator ID used by accelerator APIs",
+        "Accelerator API 使用的 Accelerator ID",
+    ),
+    (
+        "Agent-Native CLI for Volcengine storage services",
+        "面向 Agent 的火山引擎存储服务 CLI",
+    ),
+    ("Allow non-idempotent raw API execution", "允许执行非幂等的原始 API"),
+    ("Append data to a turbo object", "向 Turbo 对象追加数据"),
+    ("Append data to an appendable object", "向可追加对象追加数据"),
+    ("Append last time", "上次追加时间"),
+    ("Append offset", "追加偏移量"),
+    ("ArkClaw service Instance", "ArkClaw 服务 Instance"),
+    (
+        "Authentication mode for this invocation: aksk or unified. Precedence is --auth-mode <MODE>, profile auth_mode, TOS_AUTH_MODE, then aksk. Unified selects the same-name externally managed profile, ignores local AK/SK, and uses `ve login`.",
+        "本次调用的鉴权模式：aksk 或 unified。优先级为 --auth-mode <MODE>、profile auth_mode、TOS_AUTH_MODE，最后为 aksk。Unified 使用同名的外部托管 profile，忽略本地 AK/SK，并使用 `ve login`。",
+    ),
+    (
+        "Authentication mode for this invocation: aksk, oauth, or unified. Precedence is --auth-mode <MODE>, profile auth_mode, ADRIVE_AUTH_MODE, then aksk. Unified selects the same-name externally managed profile, ignores local AK/SK and OAuth credentials, and uses `ve login` / `ve logout`.",
+        "本次调用的鉴权模式：aksk、oauth 或 unified。优先级为 --auth-mode <MODE>、profile auth_mode、ADRIVE_AUTH_MODE，最后为 aksk。Unified 使用同名的外部托管 profile，忽略本地 AK/SK 和 OAuth 凭证，并使用 `ve login` / `ve logout`。",
+    ),
+    ("Availability zone", "可用区"),
+    (
+        "Bare AK/SK credential keys are written to the current command surface: `[active-profile.ve-tos]` for `ve-tos` and `[active-profile.tos]` for `tos`. Use an explicit `<profile>.access_key_id` or other two-segment credential key only when shared TOS credentials are intended. For `ve-tos`, an `endpoint` / `control_endpoint` / `account_id` / HTTP tuning key without an explicit binary qualifier is written to `[active-profile.ve-tos]` by default. For `tos`, `endpoint` and PSM keys are written to `[active-profile.tos]`; the `tos` entry rejects `control_endpoint` because only `ve-tos` has a control plane endpoint.",
+        "未限定层级的 AK/SK 凭证键会写入当前命令面：`ve-tos` 写入 `[active-profile.ve-tos]`，`tos` 写入 `[active-profile.tos]`。仅在需要共享 TOS 凭证时使用显式的 `<profile>.access_key_id` 或其他两段式凭证键。对于 `ve-tos`，没有显式二进制限定符的 `endpoint` / `control_endpoint` / `account_id` / HTTP 调优键默认写入 `[active-profile.ve-tos]`。对于 `tos`，`endpoint` 和 PSM 键写入 `[active-profile.tos]`；`tos` 入口拒绝 `control_endpoint`，因为只有 `ve-tos` 具有控制面 endpoint。",
+    ),
+    (
+        "Bare access_key_id / secret_access_key / security_token keys write to [active-profile.adrive] in credentials.toml. Unified ignores those local credentials, selects the same-name external profile, and uses `ve login`.",
+        "未限定层级的 access_key_id / secret_access_key / security_token 键会写入 credentials.toml 的 [active-profile.adrive]。Unified 忽略这些本地凭证，选择同名外部 profile，并使用 `ve login`。",
+    ),
+    ("Batch delete objects (DeleteMultiObjects)", "批量删除对象（DeleteMultiObjects）"),
+    ("Bind a bucket to an accelerator", "将 Bucket 绑定到 Accelerator"),
+    ("Bind accelerator to MRAP", "将 Accelerator 绑定到 MRAP"),
+    ("Bind accelerator to access point", "将 Accelerator 绑定到接入点"),
+    ("Body source (file path or inline data)", "正文来源（文件路径或内联数据）"),
+    (
+        "Bucket ACL (x-tos-acl). Allowed: private, public-read, public-read-write, authenticated-read, bucket-owner-read, bucket-owner-full-control",
+        "Bucket ACL（x-tos-acl）。可选值：private、public-read、public-read-write、authenticated-read、bucket-owner-read、bucket-owner-full-control",
+    ),
+    (
+        "Bucket default storage class [Review Fix #M5] Variant renamed to `Storageclass`; the legacy spelling `storgeclass` is kept as a clap alias to preserve backward compatibility for existing scripts and skill manifests",
+        "Bucket 默认存储类型",
+    ),
+    ("Bucket name (flag style)", "Bucket 名称（flag 形式）"),
+    ("Bucket name (used with --check permissions)", "Bucket 名称（与 --check permissions 配合使用）"),
+    (
+        "Bucket name path parameter for control-plane binding APIs",
+        "控制面绑定 API 的 Bucket 名称路径参数",
+    ),
+    (
+        "Bucket type header (x-tos-bucket-type; allowed: fns, hns)",
+        "Bucket 类型请求头（x-tos-bucket-type；可选值：fns、hns）",
+    ),
+    ("ByteCloud TOS PSM service name", "ByteCloud TOS PSM 服务名"),
+    (
+        "ByteCloud TOS commands (high-level + utilities)",
+        "ByteCloud TOS 命令（高阶命令与工具）",
+    ),
+    ("CRC64 checksum", "CRC64 校验和"),
+    ("CRR proxy (x-crr-proxy)", "CRR 代理（x-crr-proxy）"),
+    (
+        "CRR source bucket version status (x-crr-source-bucket-version-status)",
+        "CRR 源 Bucket 版本状态（x-crr-source-bucket-version-status）",
+    ),
+    (
+        "CRR source last modify time (x-crr-source-last-modify-time)",
+        "CRR 源最后修改时间（x-crr-source-last-modify-time）",
+    ),
+    (
+        "CRR source timestamp nsec (x-crr-source-timestamp-nsec)",
+        "CRR 源时间戳纳秒值（x-crr-source-timestamp-nsec）",
+    ),
+    (
+        "CRR source uploadId (x-crr-source-uploadId)",
+        "CRR 源 uploadId（x-crr-source-uploadId）",
+    ),
+    (
+        "CRR source versionId (x-crr-source-versionId)",
+        "CRR 源 versionId（x-crr-source-versionId）",
+    ),
+    (
+        "Canned ACL value (private, public-read, public-read-write, authenticated-read)",
+        "预定义 ACL 值（private、public-read、public-read-write、authenticated-read）",
+    ),
+    (
+        "Check a specific module: auth, config, registry, network, principles, mcp, completion",
+        "检查指定模块：auth、config、registry、network、principles、mcp、completion",
+    ),
+    (
+        "Check a specific module: auth, config, registry, permissions, region, network, version, mcp, principles, completion",
+        "检查指定模块：auth、config、registry、permissions、region、network、version、mcp、principles、completion",
+    ),
+    ("Close a turbo channel", "关闭 Turbo 通道"),
+    ("Common keys include:", "常用键包括："),
+    ("Complete a multipart upload", "完成分片上传"),
+    ("Complete all parts server-side", "在服务端完成所有分片"),
+    ("Completed parts JSON", "已完成分片的 JSON"),
+    ("Configuration (JSON or file://path)", "配置（JSON 或 file://path）"),
+    ("Configuration key to set.", "要设置的配置键。"),
+    (
+        "Configuration key, e.g. `region`, `endpoint`, `account_id`, or `staging.endpoint`",
+        "配置键，例如 `region`、`endpoint`、`account_id` 或 `staging.endpoint`",
+    ),
+    ("Configuration value", "配置值"),
+    (
+        "Confirm destructive Advanced operation before execution",
+        "执行前确认破坏性的 Advanced 操作",
+    ),
+    ("Confirm destructive abort before execution", "执行前确认破坏性的中止操作"),
+    ("Confirm destructive delete before execution", "执行前确认破坏性的删除操作"),
+    ("Content type", "内容类型"),
+    ("Content-MD5 for integrity check", "用于完整性校验的 Content-MD5"),
+    ("Content-MD5 header", "Content-MD5 请求头"),
+    (
+        "Content-MD5 header; auto-computed when omitted",
+        "Content-MD5 请求头；省略时自动计算",
+    ),
+    (
+        "Content-MD5 request header for JSON body",
+        "JSON 正文的 Content-MD5 请求头",
+    ),
+    ("Content-Type header", "Content-Type 请求头"),
+    ("Continuation token", "续传 token"),
+    ("Continuation token for listing tasks", "列出任务时使用的续传 token"),
+    ("Converged access point APIs", "融合接入点 API"),
+    ("Copy an object (server-side CopyObject)", "复制对象（服务端 CopyObject）"),
+    (
+        "Copy source (for example /src-bucket/src-key)",
+        "复制源（例如 /src-bucket/src-key）",
+    ),
+    (
+        "Copy source last modified (x-tos-copy-source-last-modified)",
+        "复制源最后修改时间（x-tos-copy-source-last-modified）",
+    ),
+    ("Create MRAP routes", "创建 MRAP 路由"),
+    ("Create URL cache purge/prefetch", "创建 URL 缓存清理/预取任务"),
+    ("Create a batch job", "创建批处理任务"),
+    ("Create a cross-account access point", "创建跨账号接入点"),
+    ("Create a dataset", "创建 Dataset"),
+    ("Create a dataset binding", "创建 Dataset 绑定"),
+    ("Create a document processing job", "创建文档处理任务"),
+    ("Create a file processing job", "创建文件处理任务"),
+    ("Create a hard link to an object", "创建对象硬链接"),
+    ("Create a media processing job", "创建媒体处理任务"),
+    ("Create a multipart upload", "创建分片上传"),
+    ("Create a prefetch job", "创建预取任务"),
+    ("Create a redundancy transition task", "创建冗余转换任务"),
+    ("Create a symbolic link", "创建符号链接"),
+    ("Create an MRAP", "创建 MRAP"),
+    ("Create an accelerator", "创建 Accelerator"),
+    ("Create an access point", "创建接入点"),
+    ("Create an async fetch task", "创建异步拉取任务"),
+    ("Create an audit configuration", "创建审计配置"),
+    ("Create an audit job", "创建审计任务"),
+    ("Create an evict job", "创建驱逐任务"),
+    ("Create an increment audit configuration", "创建增量审计配置"),
+    ("Create custom endpoint for CAP", "为 CAP 创建自定义 endpoint"),
+    ("Create custom endpoint token", "创建自定义 endpoint token"),
+    ("Create object set for CAP", "为 CAP 创建对象集"),
+    ("Custom domain name", "自定义域名"),
+    ("Custom domain name to remove", "要移除的自定义域名"),
+    ("Custom endpoint domain", "自定义 endpoint 域名"),
+    ("Custom metadata (key1=val1&key2=val2)", "自定义元数据（key1=val1&key2=val2）"),
+    ("Data ID (x-data-id)", "Data ID（x-data-id）"),
+    (
+        "Data processing job type (job_type query)",
+        "数据处理任务类型（job_type 查询参数）",
+    ),
+    ("Data to append (file path or inline)", "要追加的数据（文件路径或内联内容）"),
+    (
+        "Data-process template tag query parameter",
+        "数据处理模板的 tag 查询参数",
+    ),
+    ("Decoded content length", "解码后的内容长度"),
+    (
+        "Defaults to `$HOME/.tos/config.toml` when omitted. The parent directory is also used for the local encryption key that protects stored secrets.",
+        "省略时默认为 `$HOME/.tos/config.toml`。其父目录也用于存放保护已保存密钥的本地加密密钥。",
+    ),
+    (
+        "Defaults to `credentials.toml` beside the effective config file.",
+        "默认为有效配置文件旁的 `credentials.toml`。",
+    ),
+    ("Delete CDN notification configuration", "删除 CDN 通知配置"),
+    ("Delete CORS configuration", "删除 CORS 配置"),
+    ("Delete MRAP mirror configuration", "删除 MRAP 镜像配置"),
+    ("Delete MRAP policy", "删除 MRAP 策略"),
+    ("Delete QoS policy", "删除 QoS 策略"),
+    ("Delete URL cache", "删除 URL 缓存"),
+    ("Delete a batch job", "删除批处理任务"),
+    ("Delete a cross-account access point", "删除跨账号接入点"),
+    ("Delete a dataset", "删除 Dataset"),
+    ("Delete a dataset binding", "删除 Dataset 绑定"),
+    (
+        "Delete a file, folder, or recursively clear a space",
+        "删除文件、文件夹，或递归清空空间",
+    ),
+    ("Delete a lens configuration", "删除 Lens 配置"),
+    ("Delete a prefetch job", "删除预取任务"),
+    ("Delete a redundancy transition task", "删除冗余转换任务"),
+    ("Delete a resource tag", "删除资源 tag"),
+    ("Delete a single object", "删除单个对象"),
+    ("Delete a template", "删除模板"),
+    ("Delete a workflow", "删除工作流"),
+    ("Delete access point policy", "删除接入点策略"),
+    ("Delete an MRAP", "删除 MRAP"),
+    ("Delete an accelerator", "删除 Accelerator"),
+    ("Delete an access point", "删除接入点"),
+    ("Delete an evict job", "删除驱逐任务"),
+    ("Delete an image style", "删除图片样式"),
+    ("Delete an increment audit configuration", "删除增量审计配置"),
+    ("Delete an object set", "删除对象集"),
+    ("Delete bucket encryption configuration", "删除 Bucket 加密配置"),
+    ("Delete bucket policy", "删除 Bucket 策略"),
+    ("Delete bucket rename configuration", "删除 Bucket 重命名配置"),
+    ("Delete bucket tagging", "删除 Bucket tag"),
+    ("Delete custom domain binding", "删除自定义域名绑定"),
+    ("Delete custom endpoint for CAP", "删除 CAP 的自定义 endpoint"),
+    ("Delete event subscription", "删除事件订阅"),
+    ("Delete every object version and delete marker", "删除对象的所有版本和删除标记"),
+    ("Delete inventory configuration", "删除清单配置"),
+    ("Delete lifecycle rules", "删除生命周期规则"),
+    ("Delete max-age configuration", "删除 max-age 配置"),
+    ("Delete mirror back-to-source rules", "删除镜像回源规则"),
+    ("Delete object set lifecycle by tag", "按 tag 删除对象集生命周期"),
+    ("Delete object set lifecycle configuration", "删除对象集生命周期配置"),
+    ("Delete object set quota by tag", "按 tag 删除对象集配额"),
+    ("Delete object tagging", "删除对象 tag"),
+    ("Delete real-time log configuration", "删除实时日志配置"),
+    ("Delete replication configuration", "删除复制配置"),
+    ("Delete static website configuration", "删除静态网站配置"),
+    ("Destination (tos://dst-bucket/dst-key)", "目标（tos://dst-bucket/dst-key）"),
+    (
+        "Destination object path in the same bucket (tos://bucket/key)",
+        "同一 Bucket 内的目标对象路径（tos://bucket/key）",
+    ),
+    ("Destroy bucket permanently (?destroy)", "永久销毁 Bucket（?destroy）"),
+    ("Directory for trace diagnostics output", "trace 诊断输出目录"),
+    ("Disable colored output", "禁用彩色输出"),
+    ("Do not update timestamp (x-not-update-timestamp)", "不更新时间戳（x-not-update-timestamp）"),
+    ("Download a single object (GetObject)", "下载单个对象（GetObject）"),
+    ("ETag pattern hint", "ETag 模式提示"),
+    ("ETag pattern hint (x-etag-pattern)", "ETag 模式提示（x-etag-pattern）"),
+    ("Enable MCP server", "启用 MCP 服务"),
+    (
+        "Enable bucket object lock (x-tos-bucket-object-lock-enabled=true)",
+        "启用 Bucket 对象锁（x-tos-bucket-object-lock-enabled=true）",
+    ),
+    ("Encoding type", "编码类型"),
+    ("Examples:", "示例:"),
+    ("Expiration time (RFC3339 or Unix epoch)", "过期时间（RFC3339 或 Unix 时间戳）"),
+    ("Export skills to local directory", "将 Skill 导出到本地目录"),
+    (
+        "Extra query parameter, repeatable, in k=v form",
+        "额外查询参数，可重复指定，格式为 k=v",
+    ),
+    (
+        "Extra request header, repeatable, in k=v form",
+        "额外请求头，可重复指定，格式为 k=v",
+    ),
+    ("Fetch an external object synchronously", "同步拉取外部对象"),
+    ("Fetch from KV (fetch-from-kv)", "从 KV 拉取（fetch-from-kv）"),
+    ("File or data to write", "要写入的文件或数据"),
+    ("File to upload", "要上传的文件"),
+    ("File to upload (or - for stdin)", "要上传的文件（或使用 - 表示标准输入）"),
+    (
+        "Filter by bucket type (x-tos-bucket-type; allowed: fns, hns)",
+        "按 Bucket 类型过滤（x-tos-bucket-type；可选值：fns、hns）",
+    ),
+    ("Filter by project name", "按项目名称过滤"),
+    ("Fingerprint (x-finger-print)", "指纹（x-finger-print）"),
+    ("Forbid overwrite (x-forbid-overwrite)", "禁止覆盖（x-forbid-overwrite）"),
+    ("Forbid overwrite (x-tos-forbid-overwrite)", "禁止覆盖（x-tos-forbid-overwrite）"),
+    ("Forbid overwrite existing object", "禁止覆盖已有对象"),
+    ("Force delete bucket contents first (?force)", "先强制删除 Bucket 内容（?force）"),
+    ("Force deletion before execution", "执行前强制确认删除"),
+    ("From modular marker (X-From-Modular)", "modular 来源标记（X-From-Modular）"),
+    (
+        "Full CDN notification configuration JSON or file://path",
+        "完整的 CDN 通知配置 JSON 或 file://path",
+    ),
+    (
+        "Full intelligent tiering configuration JSON or file://path",
+        "完整的智能分层配置 JSON 或 file://path",
+    ),
+    (
+        "Full quota request body JSON or file://path",
+        "完整的配额请求正文 JSON 或 file://path",
+    ),
+    ("Full request body JSON or file://path", "完整的请求正文 JSON 或 file://path"),
+    (
+        "Full trash configuration JSON or file://path",
+        "完整的回收站配置 JSON 或 file://path",
+    ),
+    (
+        "Generate shell completion scripts and installation snippets for ve-adrive-cli / ve-adrive",
+        "为 ve-adrive-cli / ve-adrive 生成 shell 补全脚本和安装片段",
+    ),
+    ("Get CDN notification configuration", "获取 CDN 通知配置"),
+    ("Get CORS configuration", "获取 CORS 配置"),
+    ("Get HTTPS / TLS version configuration", "获取 HTTPS / TLS 版本配置"),
+    ("Get MRAP details", "获取 MRAP 详情"),
+    ("Get MRAP mirror configuration", "获取 MRAP 镜像配置"),
+    ("Get MRAP policy", "获取 MRAP 策略"),
+    ("Get MRAP routes", "获取 MRAP 路由"),
+    ("Get QoS policy", "获取 QoS 策略"),
+    ("Get WORM (object lock) configuration", "获取 WORM（对象锁）配置"),
+    ("Get a batch job", "获取批处理任务"),
+    ("Get a dataset binding", "获取 Dataset 绑定"),
+    ("Get a job", "获取任务"),
+    ("Get a lens configuration", "获取 Lens 配置"),
+    ("Get a prefetch job", "获取预取任务"),
+    ("Get a redundancy transition task", "获取冗余转换任务"),
+    ("Get a template", "获取模板"),
+    ("Get a workflow", "获取工作流"),
+    ("Get a workflow execution", "获取工作流执行记录"),
+    ("Get accelerator bandwidth", "获取 Accelerator 带宽"),
+    ("Get accelerator capacity", "获取 Accelerator 容量"),
+    ("Get accelerator details", "获取 Accelerator 详情"),
+    ("Get access monitor status", "获取访问监控状态"),
+    ("Get access point details", "获取接入点详情"),
+    ("Get access point policy", "获取接入点策略"),
+    ("Get an audit configuration", "获取审计配置"),
+    ("Get an evict job", "获取驱逐任务"),
+    ("Get an image style", "获取图片样式"),
+    ("Get an increment audit configuration", "获取增量审计配置"),
+    ("Get an object set", "获取对象集"),
+    ("Get async fetch task status", "获取异步拉取任务状态"),
+    ("Get blind watermark rule", "获取盲水印规则"),
+    ("Get bucket ACL", "获取 Bucket ACL"),
+    ("Get bucket encryption configuration", "获取 Bucket 加密配置"),
+    ("Get bucket logging configuration", "获取 Bucket 日志配置"),
+    ("Get bucket policy", "获取 Bucket 策略"),
+    ("Get bucket quota", "获取 Bucket 配额"),
+    ("Get bucket rename configuration", "获取 Bucket 重命名配置"),
+    ("Get bucket tagging", "获取 Bucket tag"),
+    ("Get cross-account access point details", "获取跨账号接入点详情"),
+    ("Get custom domain certificate token", "获取自定义域名证书 token"),
+    ("Get custom endpoint token", "获取自定义 endpoint token"),
+    ("Get dataset details", "获取 Dataset 详情"),
+    ("Get event notification configuration", "获取事件通知配置"),
+    ("Get event subscription", "获取事件订阅"),
+    ("Get global object set configuration", "获取全局对象集配置"),
+    ("Get image protect rule", "获取图片保护规则"),
+    ("Get image style separator", "获取图片样式分隔符"),
+    ("Get intelligent tiering configuration", "获取智能分层配置"),
+    ("Get inventory configuration", "获取清单配置"),
+    ("Get lifecycle rules", "获取生命周期规则"),
+    ("Get max-age configuration", "获取 max-age 配置"),
+    ("Get mirror back-to-source rules", "获取镜像回源规则"),
+    ("Get object ACL", "获取对象 ACL"),
+    ("Get object metadata (HeadObject)", "获取对象元数据（HeadObject）"),
+    ("Get object processing status", "获取对象处理状态"),
+    ("Get object retention policy", "获取对象保留策略"),
+    ("Get object set endpoint", "获取对象集 endpoint"),
+    ("Get object set lifecycle by tag", "按 tag 获取对象集生命周期"),
+    ("Get object set lifecycle configuration", "获取对象集生命周期配置"),
+    ("Get object set quota", "获取对象集配额"),
+    ("Get object set quota by tag", "按 tag 获取对象集配额"),
+    ("Get object set storage info", "获取对象集存储信息"),
+    ("Get object set tagging", "获取对象集 tag"),
+    ("Get object stat information", "获取对象 stat 信息"),
+    ("Get object tagging", "获取对象 tag"),
+    ("Get pay-by-traffic configuration", "获取按流量计费配置"),
+    ("Get payment (requester pays) configuration", "获取请求方付费配置"),
+    ("Get private M3U8 rule", "获取私有 M3U8 规则"),
+    ("Get real-time log configuration", "获取实时日志配置"),
+    (
+        "Get remaining time for a redundancy transition task",
+        "获取冗余转换任务的剩余时间",
+    ),
+    ("Get replication configuration", "获取复制配置"),
+    ("Get static website configuration", "获取静态网站配置"),
+    ("Get symlink target", "获取符号链接目标"),
+    ("Get transfer acceleration status", "获取传输加速状态"),
+    ("Get trash (recycle bin) configuration", "获取回收站配置"),
+    ("Get versioning status", "获取版本控制状态"),
+    ("Grant full control", "授予完全控制权限"),
+    ("Grant full control (x-tos-grant-full-control)", "授予完全控制权限（x-tos-grant-full-control）"),
+    ("Grant full control permission header", "授予完全控制权限的请求头"),
+    ("Grant read", "授予读取权限"),
+    ("Grant read (x-tos-grant-read)", "授予读取权限（x-tos-grant-read）"),
+    ("Grant read ACP", "授予读取 ACP 权限"),
+    ("Grant read ACP (x-tos-grant-read-acp)", "授予读取 ACP 权限（x-tos-grant-read-acp）"),
+    ("Grant read ACP permission", "授予读取 ACP 权限"),
+    ("Grant read ACP permission header", "授予读取 ACP 权限的请求头"),
+    ("Grant read permission", "授予读取权限"),
+    ("Grant read permission header", "授予读取权限的请求头"),
+    ("Grant read without list", "授予无列举能力的读取权限"),
+    (
+        "Grant read without list (x-tos-grant-read-non-list)",
+        "授予无列举能力的读取权限（x-tos-grant-read-non-list）",
+    ),
+    ("Grant read without list permission", "授予无列举能力的读取权限"),
+    (
+        "Grant read without list permission header",
+        "授予无列举能力的读取权限请求头",
+    ),
+    ("Grant write", "授予写入权限"),
+    ("Grant write (x-tos-grant-write)", "授予写入权限（x-tos-grant-write）"),
+    ("Grant write ACP", "授予写入 ACP 权限"),
+    ("Grant write ACP (x-tos-grant-write-acp)", "授予写入 ACP 权限（x-tos-grant-write-acp）"),
+    ("Grant write ACP permission", "授予写入 ACP 权限"),
+    ("Grant write ACP permission header", "授予写入 ACP 权限的请求头"),
+    ("Grant write permission", "授予写入权限"),
+    ("Grant write permission header", "授予写入权限的请求头"),
+    ("Guard object match condition", "对象匹配保护条件"),
+    ("If-Match", "If-Match 条件"),
+    ("If-Match (ETag condition)", "If-Match（ETag 条件）"),
+    ("If-Match condition", "If-Match 条件"),
+    ("If-Match header", "If-Match 请求头"),
+    ("If-Modified-Since header", "If-Modified-Since 请求头"),
+    ("If-None-Match", "If-None-Match 条件"),
+    ("If-None-Match (ETag condition)", "If-None-Match（ETag 条件）"),
+    ("If-None-Match condition", "If-None-Match 条件"),
+    ("If-None-Match header", "If-None-Match 请求头"),
+    ("If-Unmodified-Since (x-if-unmodified-since)", "If-Unmodified-Since（x-if-unmodified-since）"),
+    ("If-Unmodified-Since header", "If-Unmodified-Since 请求头"),
+    ("Image style name (styleName query)", "图片样式名称（styleName 查询参数）"),
+    (
+        "Initialize the selected profile. ve-tos writes Beijing network defaults; ByteTOS tos leaves region, endpoint, and PSM unset",
+        "初始化所选 profile。ve-tos 写入北京网络默认值；ByteTOS tos 不设置 region、endpoint 和 PSM",
+    ),
+    (
+        "Inspect API metadata; execution is unimplemented",
+        "查看 API 元数据；暂不支持执行",
+    ),
+    ("Install examples:", "安装示例:"),
+    ("Interactive initialization", "交互式初始化"),
+    (
+        "Internal metadata directive (x-internal-metadata-directive)",
+        "内部元数据指令（x-internal-metadata-directive）",
+    ),
+    ("Inventory configuration ID", "清单配置 ID"),
+    ("Job ID (jobID path/query)", "任务 ID（jobID 路径/查询参数）"),
+    ("Key marker", "Key 标记"),
+    (
+        "Keys to delete (JSON array or comma-separated keys)",
+        "要删除的 key（JSON 数组或逗号分隔的 key）",
+    ),
+    ("Language:", "语言:"),
+    ("Last-Modified header", "Last-Modified 请求头"),
+    (
+        "List ADrive skill metadata or export Markdown SKILL.md files for external Agents and adapters",
+        "列出 ADrive Skill 元数据，或为外部 Agent 和适配器导出 Markdown SKILL.md 文件",
+    ),
+    ("List MRAPs for an accelerator", "列出 Accelerator 的 MRAP"),
+    ("List accelerators", "列出 Accelerator"),
+    ("List accelerators for MRAP", "列出 MRAP 的 Accelerator"),
+    ("List accelerators for a bucket", "列出 Bucket 的 Accelerator"),
+    ("List accelerators for access point", "列出接入点的 Accelerator"),
+    ("List access points", "列出接入点"),
+    ("List all MRAPs", "列出所有 MRAP"),
+    ("List all built-in skills", "列出所有内置 Skill"),
+    ("List all image styles", "列出所有图片样式"),
+    ("List audit configurations", "列出审计配置"),
+    ("List availability zones", "列出可用区"),
+    ("List available skills", "列出可用 Skill"),
+    ("List batch jobs", "列出批处理任务"),
+    ("List bound access points", "列出已绑定的接入点"),
+    ("List bound buckets", "列出已绑定的 Bucket"),
+    ("List cross-account access points", "列出跨账号接入点"),
+    ("List custom domain bindings", "列出自定义域名绑定"),
+    ("List dataset bindings", "列出 Dataset 绑定"),
+    ("List dataset templates", "列出 Dataset 模板"),
+    ("List datasets", "列出 Dataset"),
+    ("List evict jobs", "列出驱逐任务"),
+    ("List image style brief infos", "列出图片样式摘要信息"),
+    ("List image style contents", "列出图片样式内容"),
+    ("List increment audit configurations", "列出增量审计配置"),
+    (
+        "List instances, spaces, or files by target depth",
+        "按目标层级列出实例、空间或文件",
+    ),
+    ("List inventory configurations", "列出清单配置"),
+    ("List jobs", "列出任务"),
+    ("List lens configurations", "列出 Lens 配置"),
+    ("List multipart uploads", "列出分片上传"),
+    ("List object sets", "列出对象集"),
+    ("List object versions", "列出对象版本"),
+    ("List prefetch jobs", "列出预取任务"),
+    ("List prefetch records", "列出预取记录"),
+    (
+        "List recursively with delimiter=\"\" where supported",
+        "在支持时使用 delimiter=\"\" 递归列出",
+    ),
+    ("List redundancy transition tasks", "列出冗余转换任务"),
+    ("List resource tags", "列出资源 tag"),
+    ("List turbo sessions", "列出 Turbo 会话"),
+    ("List uploaded parts", "列出已上传分片"),
+    ("List workflow executions", "列出工作流执行记录"),
+    ("MCP usage:", "MCP 用法:"),
+    ("MRAP alias", "MRAP 别名"),
+    ("Manage ADrive CLI configuration", "管理 ADrive CLI 配置"),
+    ("Marker for pagination", "分页标记"),
+    ("Maximum parts per response", "单次响应最大分片数"),
+    ("Maximum uploads per response", "单次响应最大上传数"),
+    ("Metadata (JSON or key1=val1&key2=val2)", "元数据（JSON 或 key1=val1&key2=val2）"),
+    ("Metadata directive", "元数据指令"),
+    (
+        "Modification time filter; bare durations such as 7d mean files modified within that window",
+        "修改时间过滤；7d 等不带前缀的时长表示在该时间窗口内修改的文件",
+    ),
+    (
+        "Modification time filter; bare durations such as 7d mean objects modified within that window",
+        "修改时间过滤；7d 等不带前缀的时长表示在该时间窗口内修改的对象",
+    ),
+    ("Modify an object in-place", "原地修改对象"),
+    (
+        "Move files or folders by same-space rename or copy plus source delete",
+        "通过同空间重命名，或复制后删除源文件/文件夹来移动",
+    ),
+    ("Multi-region access point APIs", "多地域接入点 API"),
+    (
+        "Net speed test marker header (X-Tos-Net-Speed-Test)",
+        "网络测速标记请求头（X-Tos-Net-Speed-Test）",
+    ),
+    ("Notes:", "备注:"),
+    (
+        "Number of largest/oldest file samples to keep in --verbose diagnostics; 0 disables samples",
+        "--verbose 诊断中保留的最大/最旧文件样本数；0 表示禁用样本",
+    ),
+    (
+        "Number of largest/oldest object samples to keep in --verbose diagnostics; 0 disables samples",
+        "--verbose 诊断中保留的最大/最旧对象样本数；0 表示禁用样本",
+    ),
+    ("OAuth Space owner collection to list", "要列出的 OAuth Space 所有者集合"),
+    ("Object key", "对象 key"),
+    ("Object key path parameter", "对象 key 路径参数"),
+    ("Object lock mode", "对象锁模式"),
+    ("Object lock mode (x-object-lock-mode)", "对象锁模式（x-object-lock-mode）"),
+    (
+        "Object lock retain until date (x-object-lock-retain-until-date)",
+        "对象锁保留截止日期（x-object-lock-retain-until-date）",
+    ),
+    ("Object lock retain-until date", "对象锁保留截止日期"),
+    (
+        "Object lock retain-until date (x-object-lock-retain-until-date)",
+        "对象锁保留截止日期（x-object-lock-retain-until-date）",
+    ),
+    (
+        "Object path (tos://bucket/key or --bucket + --key)",
+        "对象路径（tos://bucket/key 或 --bucket + --key）",
+    ),
+    ("Object set name encoded as query key", "编码为查询 key 的对象集名称"),
+    ("Object tagging (key1=value1&key2=value2)", "对象 tag（key1=value1&key2=value2）"),
+    ("Object tags (key1=value1&key2=value2)", "对象 tag（key1=value1&key2=value2）"),
+    (
+        "Object tags (x-tagging; key1=value1&key2=value2)",
+        "对象 tag（x-tagging；key1=value1&key2=value2）",
+    ),
+    (
+        "Object tags (x-tos-tagging; key1=value1&key2=value2)",
+        "对象 tag（x-tos-tagging；key1=value1&key2=value2）",
+    ),
+    ("Offset to write at", "写入偏移量"),
+    ("Open a turbo channel for an object", "为对象打开 Turbo 通道"),
+    ("Open mode query value (0=create open, 1=write open)", "打开模式查询值（0=创建打开，1=写入打开）"),
+    ("Optional Content-MD5 header", "可选的 Content-MD5 请求头"),
+    ("Optional skill name or domain filter", "可选的 Skill 名称或 domain 过滤器"),
+    ("Output file (or - for stdout)", "输出文件（或使用 - 表示标准输出）"),
+    (
+        "Output redacts secrets and annotates where each value comes from, for example `[default]`, `[default.ve-tos]`, env, cli, or derived from endpoint.",
+        "输出会脱敏密钥并标注每个值的来源，例如 `[default]`、`[default.ve-tos]`、env、cli 或从 endpoint 推导。",
+    ),
+    ("Override response Cache-Control", "覆盖响应 Cache-Control"),
+    ("Override response Content-Disposition", "覆盖响应 Content-Disposition"),
+    ("Override response Content-Type", "覆盖响应 Content-Type"),
+    ("Override response Expires", "覆盖响应 Expires"),
+    (
+        "Owner collection for a newly-created Space. OAuth user Space ownership defaults to the logged-in user_id; OAuth group Space ownership requires --owner-id",
+        "新建 Space 的所有者集合。OAuth 用户 Space 默认归当前登录 user_id 所有；OAuth 群组 Space 必须指定 --owner-id",
+    ),
+    (
+        "Owner identifier for a newly-created Space. OAuth user ownership defaults to the logged-in user_id; OAuth group ownership requires --owner-id",
+        "新建 Space 的所有者标识。OAuth 用户所有权默认使用当前登录 user_id；OAuth 群组所有权必须指定 --owner-id",
+    ),
+    ("Pagination marker returned by a previous listing", "上一次列举返回的分页标记"),
+    ("Part body source", "分片正文来源"),
+    ("Part number", "分片编号"),
+    ("Part number marker", "分片编号标记"),
+    ("Path to the config TOML file", "配置 TOML 文件路径"),
+    ("Path to the config TOML file.", "配置 TOML 文件路径。"),
+    ("Path to the encrypted credentials TOML file", "加密凭证 TOML 文件路径"),
+    ("Path to the encrypted credentials TOML file.", "加密凭证 TOML 文件路径。"),
+    (
+        "Persistent custom response headers (x-persistent-headers)",
+        "持久化自定义响应头（x-persistent-headers）",
+    ),
+    ("Persistent headers list", "持久化请求头列表"),
+    ("Persistent headers list (x-persistent-headers)", "持久化请求头列表（x-persistent-headers）"),
+    ("Platform-as-a-service Instance", "平台即服务 Instance"),
+    ("Port for SSE transport", "SSE 传输端口"),
+    ("Prefix filter", "前缀过滤器"),
+    (
+        "Prevent overwrite if object exists (if-none-match: *)",
+        "对象存在时禁止覆盖（if-none-match: *）",
+    ),
+    ("Print help (see a summary with '-h')", "显示帮助（使用 '-h' 查看摘要）"),
+    ("Print help (see more with '--help')", "显示帮助（使用 '--help' 查看详情）"),
+    (
+        "Print this message or the help of the given subcommand(s)",
+        "显示此消息或指定子命令的帮助",
+    ),
+    ("Print version", "显示版本"),
+    (
+        "Probe the configured ADrive endpoint with a real HTTPS request and record latency. Off by default to keep `ve-adrive-cli doctor` fully offline-safe",
+        "使用真实 HTTPS 请求探测已配置的 ADrive endpoint 并记录延迟。默认关闭，以确保 `ve-adrive-cli doctor` 可安全地完全离线运行",
+    ),
+    ("Profile name to initialize (defaults to `default`)", "要初始化的 profile 名称（默认为 `default`）"),
+    ("Profile name to initialize (defaults to `default`).", "要初始化的 profile 名称（默认为 `default`）。"),
+    ("Project name header (x-tos-project-name)", "项目名称请求头（x-tos-project-name）"),
+    ("Query a dataset", "查询 Dataset"),
+    ("Range header (bytes=start-end)", "Range 请求头（bytes=start-end）"),
+    ("Raw request contract (inline JSON or file://path)", "原始请求契约（内联 JSON 或 file://path）"),
+    ("Read specific part number of multipart upload", "读取分片上传的指定分片编号"),
+    ("Recursive delete flag (queryRecursive)", "递归删除参数（queryRecursive）"),
+    ("Recursive mkdir (x-recursive-mkdir)", "递归创建目录（x-recursive-mkdir）"),
+    ("Redundancy transition task ID", "冗余转换任务 ID"),
+    ("Region query parameter", "Region 查询参数"),
+    ("Rename an object", "重命名对象"),
+    ("Replicated-from (x-replicated-from)", "复制来源（x-replicated-from）"),
+    ("Request body (JSON or file://path)", "请求正文（JSON 或 file://path）"),
+    (
+        "Reserved for future raw API execution; currently unimplemented",
+        "预留用于未来执行原始 API；当前暂不支持",
+    ),
+    ("Resource ID", "资源 ID"),
+    ("Resource TRN path parameter", "资源 TRN 路径参数"),
+    (
+        "Resource identifier (bucket name, access point name, etc.)",
+        "资源标识（Bucket 名称、接入点名称等）",
+    ),
+    ("Restore an archived object", "恢复归档对象"),
+    ("Retain until date (RFC3339)", "保留截止日期（RFC3339）"),
+    ("Retention mode (COMPLIANCE)", "保留模式（COMPLIANCE）"),
+    (
+        "SSE is same-host only. After binding, it prints a fresh Bearer token once to stderr. Every HTTP request must send it in the Authorization header. The Host header must be exact loopback plus the configured port. Native clients may omit the Origin header; when present, the Origin header must be the matching HTTP loopback origin and port.",
+        "SSE 仅限同一主机。绑定后会向 stderr 一次性输出新的 Bearer token。每个 HTTP 请求都必须在 Authorization 请求头中发送该 token。Host 请求头必须精确匹配回环地址和已配置端口。原生客户端可以省略 Origin 请求头；如果提供，Origin 必须匹配 HTTP 回环来源和端口。",
+    ),
+    ("Seal an appendable object (make it immutable)", "封存可追加对象（使其不可变）"),
+    ("Select columns for table/csv output (comma-separated)", "选择 table/csv 输出列（逗号分隔）"),
+    (
+        "Server-side encryption algorithm (x-server-side-encryption)",
+        "服务端加密算法（x-server-side-encryption）",
+    ),
+    (
+        "Service tier for a newly-created Instance. Defaults to arkclaw for AK/SK and paas for OAuth",
+        "新建 Instance 的服务层级。AK/SK 默认使用 arkclaw，OAuth 默认使用 paas",
+    ),
+    ("Set CDN notification configuration", "设置 CDN 通知配置"),
+    ("Set CORS configuration", "设置 CORS 配置"),
+    ("Set HTTPS / TLS version configuration", "设置 HTTPS / TLS 版本配置"),
+    ("Set MRAP mirror configuration", "设置 MRAP 镜像配置"),
+    ("Set MRAP policy", "设置 MRAP 策略"),
+    ("Set QoS policy", "设置 QoS 策略"),
+    ("Set WORM (object lock) configuration", "设置 WORM（对象锁）配置"),
+    ("Set a configuration value", "设置配置值"),
+    ("Set a lens configuration", "设置 Lens 配置"),
+    ("Set a resource tag", "设置资源 tag"),
+    ("Set a template", "设置模板"),
+    ("Set a workflow", "设置工作流"),
+    ("Set access monitor status", "设置访问监控状态"),
+    ("Set access point policy", "设置接入点策略"),
+    ("Set an image style", "设置图片样式"),
+    ("Set an object set", "设置对象集"),
+    ("Set batch job priority", "设置批处理任务优先级"),
+    ("Set batch job status", "设置批处理任务状态"),
+    ("Set blind watermark rule", "设置盲水印规则"),
+    ("Set bucket ACL", "设置 Bucket ACL"),
+    ("Set bucket encryption configuration", "设置 Bucket 加密配置"),
+    ("Set bucket logging configuration", "设置 Bucket 日志配置"),
+    ("Set bucket policy", "设置 Bucket 策略"),
+    ("Set bucket quota", "设置 Bucket 配额"),
+    ("Set bucket rename configuration", "设置 Bucket 重命名配置"),
+    ("Set bucket tagging", "设置 Bucket tag"),
+    ("Set custom domain binding", "设置自定义域名绑定"),
+    ("Set custom domain certificate token", "设置自定义域名证书 token"),
+    ("Set default storage class for the bucket", "设置 Bucket 的默认存储类型"),
+    ("Set event notification configuration", "设置事件通知配置"),
+    ("Set event subscription", "设置事件订阅"),
+    ("Set global object set configuration", "设置全局对象集配置"),
+    ("Set image protect rule", "设置图片保护规则"),
+    ("Set image style separator", "设置图片样式分隔符"),
+    ("Set intelligent tiering configuration", "设置智能分层配置"),
+    ("Set inventory configuration", "设置清单配置"),
+    ("Set lifecycle rules", "设置生命周期规则"),
+    ("Set max-age configuration", "设置 max-age 配置"),
+    ("Set mirror back-to-source rules", "设置镜像回源规则"),
+    ("Set object ACL", "设置对象 ACL"),
+    ("Set object expiration time", "设置对象过期时间"),
+    ("Set object metadata", "设置对象元数据"),
+    ("Set object retention policy", "设置对象保留策略"),
+    ("Set object set lifecycle by tag", "按 tag 设置对象集生命周期"),
+    ("Set object set lifecycle configuration", "设置对象集生命周期配置"),
+    ("Set object set quota", "设置对象集配额"),
+    ("Set object set quota by tag", "按 tag 设置对象集配额"),
+    ("Set object set tagging", "设置对象集 tag"),
+    ("Set object tagging", "设置对象 tag"),
+    ("Set object time attributes", "设置对象时间属性"),
+    ("Set pay-by-traffic configuration", "设置按流量计费配置"),
+    ("Set payment (requester pays) configuration", "设置请求方付费配置"),
+    ("Set private M3U8 rule", "设置私有 M3U8 规则"),
+    ("Set real-time log configuration", "设置实时日志配置"),
+    ("Set replication configuration", "设置复制配置"),
+    ("Set static website configuration", "设置静态网站配置"),
+    ("Set transfer acceleration status", "设置传输加速状态"),
+    ("Set trash (recycle bin) configuration", "设置回收站配置"),
+    ("Set versioning status (Enabled/Suspended)", "设置版本控制状态（Enabled/Suspended）"),
+    ("Shell name (bash, zsh, fish, powershell)", "Shell 名称（bash、zsh、fish、powershell）"),
+    ("Shell type", "Shell 类型"),
+    ("Show API description", "查看 API 说明"),
+    ("Show current configuration (redacted)", "查看当前配置（已脱敏）"),
+    ("Show file or folder metadata", "查看文件或文件夹元数据"),
+    ("Skip trash flag (querySkipTrash)", "跳过回收站参数（querySkipTrash）"),
+    ("Software-as-a-service Instance", "软件即服务 Instance"),
+    ("Source (tos://src-bucket/src-key)", "源（tos://src-bucket/src-key）"),
+    ("Source URL to fetch from", "要拉取的源 URL"),
+    ("Source byte range", "源字节范围"),
+    ("Source modified-since condition", "源 modified-since 条件"),
+    ("Source object key to link to", "要链接到的源对象 key"),
+    ("Source object path (tos://bucket/key)", "源对象路径（tos://bucket/key）"),
+    ("Source part number", "源分片编号"),
+    ("Source unmodified-since condition", "源 unmodified-since 条件"),
+    ("Space owned by a group", "由群组拥有的 Space"),
+    ("Space owned by a user", "由用户拥有的 Space"),
+    ("Specific rule ID", "指定规则 ID"),
+    (
+        "Start registry-backed MCP server over stdio or local HTTP/SSE",
+        "通过 stdio 或本地 HTTP/SSE 启动由 registry 支持的 MCP 服务",
+    ),
+    ("Storage class", "存储类型"),
+    (
+        "Storage class for ve-tos stdin uploads. ByteTOS tos put does not support creation-time override. Allowed: STANDARD, IA, ARCHIVE_FR, INTELLIGENT_TIERING, COLD_ARCHIVE, ARCHIVE, DEEP_COLD_ARCHIVE",
+        "ve-tos 标准输入上传使用的存储类型。ByteTOS tos put 不支持创建时覆盖。可选值：STANDARD、IA、ARCHIVE_FR、INTELLIGENT_TIERING、COLD_ARCHIVE、ARCHIVE、DEEP_COLD_ARCHIVE",
+    ),
+    (
+        "Storage class for ve-tos uploads and TOS-to-TOS copies. ByteTOS tos uploads do not support creation-time override. Allowed: STANDARD, IA, ARCHIVE_FR, INTELLIGENT_TIERING, COLD_ARCHIVE, ARCHIVE, DEEP_COLD_ARCHIVE",
+        "ve-tos 上传和 TOS 到 TOS 复制使用的存储类型。ByteTOS tos 上传不支持创建时覆盖。可选值：STANDARD、IA、ARCHIVE_FR、INTELLIGENT_TIERING、COLD_ARCHIVE、ARCHIVE、DEEP_COLD_ARCHIVE",
+    ),
+    (
+        "Storage class for ve-tos uploads; ByteTOS tos object upload does not support creation-time override",
+        "ve-tos 上传使用的存储类型；ByteTOS tos object upload 不支持创建时覆盖",
+    ),
+    ("Supported KEY values:", "支持的 KEY 值:"),
+    ("Symlink key", "符号链接 key"),
+    (
+        "TOS Object Storage commands (high-level + low-level + utilities)",
+        "TOS 对象存储命令（高阶、低阶与工具命令）",
+    ),
+    (
+        "Tag keys query parameter (comma-separated or JSON array)",
+        "tag key 查询参数（逗号分隔或 JSON 数组）",
+    ),
+    ("Tagging (x-tagging; key1=value1&key2=value2)", "Tag（x-tagging；key1=value1&key2=value2）"),
+    ("Tagging directive", "Tag 指令"),
+    ("Tags (JSON or key1=val1&key2=val2)", "Tag（JSON 或 key1=val1&key2=val2）"),
+    ("Target bucket (if different)", "目标 Bucket（如果不同）"),
+    ("Target object key", "目标对象 key"),
+    ("Task ID", "任务 ID"),
+    (
+        "The command creates both the shared section `[profile]` and the active binary section (`[profile.ve-tos]` or `[profile.tos]`). Only ve-tos writes network defaults.",
+        "该命令会同时创建共享 section `[profile]` 和当前二进制 section（`[profile.ve-tos]` 或 `[profile.tos]`）。只有 ve-tos 会写入网络默认值。",
+    ),
+    (
+        "This command creates the shared and active binary sections. ve-tos writes the cn-beijing production endpoint pair; ByteTOS tos leaves region, endpoint, and PSM unset.",
+        "该命令会创建共享 section 和当前二进制 section。ve-tos 写入 cn-beijing 生产 endpoint 对；ByteTOS tos 不设置 region、endpoint 和 PSM。",
+    ),
+    ("Three path forms are supported:", "支持三种路径形式："),
+    (
+        "Timeout (milliseconds) for the live network probe. Only used when --live-network is set",
+        "实时网络探测超时（毫秒）。仅在设置 --live-network 时使用",
+    ),
+    ("Timestamp (RFC3339 or Unix epoch)", "时间戳（RFC3339 或 Unix 时间戳）"),
+    (
+        "Tip: use the dedicated tos-cli, ve-tos-cli, and ve-adrive-cli binaries for direct invocation.",
+        "提示：直接调用时请使用专用的 tos-cli、ve-tos-cli 和 ve-adrive-cli 二进制。",
+    ),
+    (
+        "Tool names come from skills, e.g. `tos_ls` for `tos ls` and `tos_cp` for `tos cp`.",
+        "工具名称来自 Skill，例如 `tos ls` 对应 `tos_ls`，`tos cp` 对应 `tos_cp`。",
+    ),
+    (
+        "Tool names come from skills, e.g. `ve_adrive_ls` for `ve-adrive ls` and `ve_adrive_cp` for `ve-adrive cp`.",
+        "工具名称来自 Skill，例如 `ve-adrive ls` 对应 `ve_adrive_ls`，`ve-adrive cp` 对应 `ve_adrive_cp`。",
+    ),
+    (
+        "Tool names come from skills, e.g. `ve_tos_ls` for `ve-tos ls` and `ve_tos_bucket_create` for `ve-tos bucket create`.",
+        "工具名称来自 Skill，例如 `ve-tos ls` 对应 `ve_tos_ls`，`ve-tos bucket create` 对应 `ve_tos_bucket_create`。",
+    ),
+    ("Trace ID (X-Tracer-Traceid)", "链路追踪 ID（X-Tracer-Traceid）"),
+    ("Trace redaction level (strict / relaxed / off)", "Trace 脱敏级别（strict / relaxed / off）"),
+    ("Traffic limit", "流量限制"),
+    ("Traffic limit (x-traffic-limit)", "流量限制（x-traffic-limit）"),
+    ("Traffic limit in bps", "流量限制（bps）"),
+    ("Traffic limit in bps (x-traffic-limit)", "流量限制（bps，x-traffic-limit）"),
+    ("Transport: stdio or sse", "传输方式：stdio 或 sse"),
+    ("Turbo token", "Turbo 令牌"),
+    ("Unbind a bucket from an accelerator", "解除 Bucket 与 Accelerator 的绑定"),
+    ("Unbind accelerator from MRAP", "解除 Accelerator 与 MRAP 的绑定"),
+    ("Unbind accelerator from access point", "解除 Accelerator 与接入点的绑定"),
+    ("Unique tag (x-unique-tag)", "唯一 tag（x-unique-tag）"),
+    ("Unmodified-since condition", "unmodified-since 条件"),
+    ("Update a dataset", "更新 Dataset"),
+    ("Upload ID", "上传 ID"),
+    ("Upload ID marker", "上传 ID 标记"),
+    ("Upload a part", "上传分片"),
+    ("Upload a part by copy", "通过复制上传分片"),
+    ("Upload a single object (PutObject, <=5GB)", "上传单个对象（PutObject，<=5GB）"),
+    ("Upload object via form (PostObject)", "通过表单上传对象（PostObject）"),
+    ("Usage:", "用法:"),
+    (
+        "Use surface defaults: tos lists with delimiter=\"/\"; ve-tos uses HNS hierarchical and FNS flat",
+        "使用命令面默认值：tos 以 delimiter=\"/\" 列举；ve-tos 对 HNS 使用层级列举，对 FNS 使用扁平列举",
+    ),
+    (
+        "Value to write into the configuration file. Credential fields are encrypted at rest and automatically redacted by `show`.",
+        "要写入配置文件的值。凭证字段会静态加密，并在 `show` 中自动脱敏。",
+    ),
+    (
+        "View: groups (default — group summary with command counts), text (one-line summaries), compact (capability rows without parameters), full (capability rows + parameters + command tree)",
+        "视图：groups（默认，包含命令数的分组摘要）、text（单行摘要）、compact（不含参数的能力行）、full（能力行、参数与命令树）",
+    ),
+    (
+        "Volcengine Storage Unified CLI — agent-native command-line interface for storage tools.",
+        "火山引擎存储统一 CLI——面向 Agent 的存储工具命令行界面。",
+    ),
+    (
+        "[G6] Probe the configured TOS endpoint with a real HTTPS request and record latency. Off by default to keep `ve-tos doctor` fully offline-safe",
+        "[G6] 使用真实 HTTPS 请求探测已配置的 TOS endpoint 并记录延迟。默认关闭，以确保 `ve-tos doctor` 可安全地完全离线运行",
+    ),
+    (
+        "[G6] Timeout (milliseconds) for the live network probe. Only used when --live-network is set",
+        "[G6] 实时网络探测超时（毫秒）。仅在设置 --live-network 时使用",
+    ),
+    (
+        "[G9] Markdown — emit Envelope as a human-readable Markdown report so Agents (and humans) can paste CLI responses directly into chat / docs",
+        "[G9] Markdown——将 Envelope 输出为人类可读的 Markdown 报告，便于 Agent 和用户将 CLI 响应直接粘贴到聊天或文档中",
+    ),
+    (
+        "`tools/call` plans by default; pass argument `execute: true` to run the underlying CLI command.",
+        "`tools/call` 默认只生成计划；传入参数 `execute: true` 才会运行底层 CLI 命令。",
+    ),
+    // [Review Fix #1] The grouped ADrive renderer uses registry prose rather
+    // than the AuthCommand summary, so it needs its own exact translation.
+    (
+        "Inspect authentication status or manage OAuth. Unified uses the same-name external profile, ignores local AK/SK and OAuth credentials, and delegates login/logout to `ve login` / `ve logout`",
+        "查看鉴权状态或管理 OAuth。Unified 使用同名外部 profile，忽略本地 AK/SK 和 OAuth 凭证，并将登录/登出交由 `ve login` / `ve logout`",
+    ),
+    (
+        "Authentication mode for this invocation: aksk, oauth, or unified",
+        "本次调用的鉴权模式：aksk、oauth 或 unified",
+    ),
+    (
+        "Authentication mode for this invocation: aksk or unified",
+        "本次调用的鉴权模式：aksk 或 unified",
+    ),
+    (
+        "Precedence is --auth-mode <MODE>, profile auth_mode, ADRIVE_AUTH_MODE, then aksk.",
+        "优先级为 --auth-mode <MODE>、profile auth_mode、ADRIVE_AUTH_MODE，最后为 aksk。",
+    ),
+    (
+        "Precedence is --auth-mode <MODE>, profile auth_mode, TOS_AUTH_MODE, then aksk.",
+        "优先级为 --auth-mode <MODE>、profile auth_mode、TOS_AUTH_MODE，最后为 aksk。",
+    ),
+    (
+        "Unified selects the same-name externally managed profile, ignores local AK/SK and OAuth credentials, and uses `ve login` / `ve logout`.",
+        "Unified 使用同名的外部托管 profile，忽略本地 AK/SK 和 OAuth 凭证，并使用 `ve login` / `ve logout`。",
+    ),
+    (
+        "Unified selects the same-name externally managed profile, ignores local AK/SK, and uses `ve login`.",
+        "Unified 使用同名的外部托管 profile，忽略本地 AK/SK，并使用 `ve login`。",
+    ),
+    (
+        "Inspect the selected ADrive authentication strategy. Select aksk, oauth, or unified with --auth-mode <MODE> or ADRIVE_AUTH_MODE. Unified uses the same-name externally managed profile and never reads local AK/SK or OAuth credentials.",
+        "查看选定的 ADrive 鉴权策略。通过 --auth-mode <MODE> 或 ADRIVE_AUTH_MODE 选择 aksk、oauth 或 unified。Unified 使用同名的外部托管 profile，且不会读取本地 AK/SK 或 OAuth 凭证。",
+    ),
+    ("Inspect or manage ADrive authentication", "查看或管理 ADrive 鉴权"),
+    (
+        "Show the effective mode and credential availability without exposing secrets",
+        "显示生效的鉴权模式和凭证可用性，不暴露敏感信息",
+    ),
+    ("Start OAuth Device Authorization login", "启动 OAuth 设备授权登录"),
+    (
+        "Clear the current profile's locally persisted OAuth state; --dry-run only previews it",
+        "清除当前 profile 本地保存的 OAuth 状态；--dry-run 仅预览",
+    ),
+    (
+        "Sign IDS requests with the existing access-key/secret-key mechanism",
+        "使用现有 AK/SK 机制为 IDS 请求签名",
+    ),
+    (
+        "Sign requests with access-key and secret-key credentials",
+        "使用 AK/SK 凭证为请求签名",
+    ),
+    (
+        "Use OAuth credentials and Bearer-authenticated Resource requests",
+        "使用 OAuth 凭证，以 Bearer Token 鉴权访问资源接口",
+    ),
+    (
+        "Use credentials managed by the unified authentication integration",
+        "使用统一登录集成管理的凭证",
+    ),
+    (
+        "ADrive Instance ID to authorize. Overrides profile default_instance and ADRIVE_DEFAULT_INSTANCE; required if neither fallback is configured",
+        "要授权的 ADrive Instance ID。覆盖 profile default_instance 和 ADRIVE_DEFAULT_INSTANCE；两者均未配置时必填",
+    ),
+    (
+        "OAuth Authorization Server base URL. Required unless configured in the selected profile or ADRIVE_AUTH_ENDPOINT",
+        "OAuth 授权服务器基础 URL。除非已在所选 profile 或 ADRIVE_AUTH_ENDPOINT 中配置，否则必填",
+    ),
+    (
+        "Human-readable device name shown during authorization",
+        "授权期间显示的人类可读设备名称",
+    ),
+    (
+        "Unified login and logout are owned by the external framework; use `ve login` or `ve logout`.",
+        "Unified 登录和登出由外部框架管理；请使用 `ve login` 或 `ve logout`。",
+    ),
     ("ByteCloud TOS PSM service name.", "PSM 服务名。"),
     (
         "CLI flag only. Supported by the `tos` command surface. When omitted, `--idc`, `--cluster`, and `--addr-family` do not enable PSM mode by themselves.",
@@ -827,7 +1992,6 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Object prefix", "对象前缀"),
     ("Delimiter", "分隔符"),
     ("Maximum keys per response", "单次响应最大 key 数"),
-    ("Continuation token", "Continuation token"),
     (
         "View: groups (default — group summary with command counts), text (one-line summaries: `<command>\\t<description>`), compact (capability rows without parameters), full (capability rows + parameters + command tree). `tree` is accepted as a legacy alias for `compact`",
         "视图：groups（默认，按分组汇总命令数量）、text（单行摘要：`<command>\\t<description>`）、compact（不含参数的能力行）、full（能力行 + 参数 + 命令树）。`tree` 作为兼容别名等同于 `compact`",
@@ -851,7 +2015,7 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
         "Target path (adrive://instance/space/folder/file or adrive://instance/space/folder/)",
         "目标路径（adrive://instance/space/folder/file 或 adrive://instance/space/folder/）",
     ),
-    ("Bucket URI (tos://bucket)", "Bucket URI（tos://bucket）"),
+    ("Bucket URI (tos://bucket)", "存储桶 URI（tos://bucket）"),
     (
         "Folder path (tos://bucket/folder/)",
         "文件夹路径（tos://bucket/folder/）",
@@ -1322,6 +2486,428 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("恢复归档对象s", "恢复归档对象"),
 ];
 
+#[cfg(test)]
+mod chinese_help_catalog_tests {
+    use super::*;
+    use clap::{Command, CommandFactory};
+    use std::collections::BTreeMap;
+
+    fn exact_help_translation_zh(source: &str) -> Option<&'static str> {
+        HELP_TRANSLATIONS_ZH.iter().find_map(|(english, chinese)| {
+            (*english == source.trim() && english != chinese).then_some(*chinese)
+        })
+    }
+
+    fn is_machine_config_line(source: &str) -> bool {
+        const CONFIG_IDENTIFIERS: &[&str] = &[
+            "- access_key_id",
+            "- account_id",
+            "- connecttimeout",
+            "- endpoint",
+            "- max_retry_count",
+            "- maxconnections",
+            "- region",
+            "- requesttimeout",
+            "- secret_access_key",
+            "access_key_id / secret_access_key / security_token",
+            "account_id / default_instance / default_space",
+            "auth_mode (aksk, oauth, or unified) / region / endpoint / auth_endpoint",
+            "checkpoint_dir / batch_report_dir / batch_report_format / progress_enabled",
+            "max_retry_count / requesttimeout / connecttimeout / maxconnections",
+        ];
+        CONFIG_IDENTIFIERS.contains(&source)
+    }
+
+    fn is_machine_uri_line(source: &str) -> bool {
+        // [Review Fix #5] Exclude only standalone URI tokens; a URI-led line
+        // with surrounding prose must still pass through the exact catalog.
+        let has_uri_prefix = ["tos://", "adrive://", "http://", "https://"]
+            .iter()
+            .any(|prefix| source.starts_with(prefix));
+        has_uri_prefix && source.split_whitespace().count() == 1
+    }
+
+    fn shell_words(source: &str) -> Option<Vec<String>> {
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut quote = None;
+        let mut is_escaped = false;
+        for character in source.chars() {
+            if is_escaped {
+                word.push(character);
+                is_escaped = false;
+            } else if character == '\\' && quote != Some('\'') {
+                is_escaped = true;
+            } else if let Some(delimiter) = quote {
+                if character == delimiter {
+                    quote = None;
+                } else {
+                    word.push(character);
+                }
+            } else if matches!(character, '\'' | '"') {
+                quote = Some(character);
+            } else if character.is_whitespace() {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            } else {
+                word.push(character);
+            }
+        }
+        if is_escaped || quote.is_some() {
+            return None;
+        }
+        if !word.is_empty() {
+            words.push(word);
+        }
+        Some(words)
+    }
+
+    fn unified_cli_args(words: &[String]) -> Option<Vec<String>> {
+        let (surface, rest) = match words.first()?.as_str() {
+            "ve-storage-uni-cli" => return Some(words.to_vec()),
+            "tos-cli" => ("tos", &words[1..]),
+            "ve-tos-cli" => ("ve-tos", &words[1..]),
+            "ve-adrive-cli" => ("ve-adrive", &words[1..]),
+            "tos" => ("tos", &words[1..]),
+            _ => return None,
+        };
+        let mut args = vec!["ve-storage-uni-cli".to_string(), surface.to_string()];
+        args.extend_from_slice(rest);
+        Some(args)
+    }
+
+    const MACHINE_INVOCATION_TEMPLATES: &[&str] = &[
+        "ve-storage-uni-cli tos <command>",
+        "ve-storage-uni-cli ve-tos <command>",
+        "ve-storage-uni-cli ve-adrive <command>",
+    ];
+    const EXTERNAL_MACHINE_COMMANDS: &[&str] = &["ve login"];
+
+    // [Review Fix #12] Only exact shell expressions belong here: pipelines,
+    // redirections, and standalone shell utilities cannot be parsed by Clap.
+    const SHELL_ONLY_MACHINE_LINES: &[&str] = &[
+        "echo 'fpath=(~/.zfunc $fpath); autoload -Uz compinit && compinit' >> ~/.zshrc",
+        "echo 'source ~/.tos-completion.bash' >> ~/.bashrc",
+        "echo 'source ~/.ve-adrive-completion.bash' >> ~/.bashrc",
+        "echo 'source ~/.ve-tos-completion.bash' >> ~/.bashrc",
+        "mkdir -p ~/.config/fish/completions && tos-cli completion fish --output json | jq -r '.data.script' > ~/.config/fish/completions/tos.fish",
+        "mkdir -p ~/.config/fish/completions && ve-adrive-cli completion fish --output json | jq -r '.data.script' > ~/.config/fish/completions/ve-adrive.fish",
+        "mkdir -p ~/.config/fish/completions && ve-tos-cli completion fish --output json | jq -r '.data.script' > ~/.config/fish/completions/ve-tos.fish",
+        "mkdir -p ~/.zfunc",
+        "tos-cli completion bash --output json | jq -r '.data.script' > ~/.tos-completion.bash",
+        "tos-cli completion powershell --output json | jq -r '.data.script' >> $PROFILE",
+        "tos-cli completion zsh --output json | jq -r '.data.script' > ~/.zfunc/_tos",
+        "ve-adrive-cli cat adrive://inst/space/src.txt | gzip | ve-adrive-cli put adrive://inst/space/src.txt.gz",
+        "ve-adrive-cli completion bash --output json | jq -r '.data.script' > ~/.ve-adrive-completion.bash",
+        "ve-adrive-cli completion powershell --output json | jq -r '.data.script' >> $PROFILE",
+        "ve-adrive-cli completion zsh --output json | jq -r '.data.script' > ~/.zfunc/_ve-adrive",
+        "ve-tos-cli cat tos://src/file.txt | gzip | ve-tos-cli put tos://dst/file.txt.gz",
+        "ve-tos-cli completion bash --output json | jq -r '.data.script' > ~/.ve-tos-completion.bash",
+        "ve-tos-cli completion powershell --output json | jq -r '.data.script' >> $PROFILE",
+        "ve-tos-cli completion zsh --output json | jq -r '.data.script' > ~/.zfunc/_ve-tos",
+    ];
+
+    fn is_complete_cli_command(source: &str) -> bool {
+        let Some(words) = shell_words(source) else {
+            return false;
+        };
+        let Some(args) = unified_cli_args(&words) else {
+            return false;
+        };
+        // [Review Fix #11] Clap reports valid help/version invocations through
+        // display errors, so accept those two terminal outcomes as complete syntax.
+        match Cli::try_parse_from(args) {
+            Ok(_) => true,
+            Err(error) => matches!(
+                error.kind(),
+                ClapErrorKind::DisplayHelp | ClapErrorKind::DisplayVersion
+            ),
+        }
+    }
+
+    fn is_machine_command_line(line: &str) -> bool {
+        let source = line.trim();
+        MACHINE_INVOCATION_TEMPLATES.contains(&source)
+            || EXTERNAL_MACHINE_COMMANDS.contains(&source)
+            || SHELL_ONLY_MACHINE_LINES.contains(&source)
+            || is_complete_cli_command(source)
+    }
+
+    fn is_machine_help_line(line: &str) -> bool {
+        let source = line.trim();
+        source.is_empty()
+            || is_machine_command_line(source)
+            || is_machine_uri_line(source)
+            || is_machine_config_line(source)
+    }
+
+    fn aligned_command_description(source: &str) -> Option<&str> {
+        let (command, description) = source.split_once("  ")?;
+        let description = description.trim();
+        (is_machine_command_line(command) && !description.is_empty()).then_some(description)
+    }
+
+    fn human_help_source(line: &str) -> Option<&str> {
+        let source = line.trim();
+        // [Review Fix #7] A shell command is machine syntax, but text after
+        // the conventional ` # ` delimiter is human-facing documentation.
+        if let Some((command, comment)) = source.split_once(" # ") {
+            if is_machine_help_line(command) {
+                return Some(comment.trim());
+            }
+        }
+        // [Review Fix #9] Only the invocation portion of an aligned command
+        // example is machine syntax; its trailing description is prose.
+        if let Some(description) = aligned_command_description(source) {
+            return Some(description);
+        }
+        (!is_machine_help_line(source)).then_some(source)
+    }
+
+    fn audit_help_source(path: &str, source: &str, failures: &mut BTreeMap<String, String>) {
+        for line in source.lines() {
+            // [Review Fix #8] Never bypass a complete line merely because it
+            // already contains CJK; mixed Chinese/English prose is still a gap.
+            let Some(line) = human_help_source(line) else {
+                continue;
+            };
+            let Some(expected) = exact_help_translation_zh(line) else {
+                let rendered = localize_clap_help_zh(line);
+                failures.entry(line.to_string()).or_insert_with(|| {
+                    format!(
+                        "missing Chinese help translation: command={path}, source={line:?}, rendered={rendered:?}"
+                    )
+                });
+                continue;
+            };
+            let rendered = localize_clap_help_zh(line);
+            if rendered != expected {
+                failures
+                    .entry(format!("partial:{line}"))
+                    .or_insert_with(|| format!(
+                        "partial Chinese help translation: command={path}, source={line:?}, expected={expected:?}, rendered={rendered:?}"
+                    ));
+            }
+        }
+    }
+
+    fn audit_arg_help(
+        command_path: &str,
+        arg: &clap::Arg,
+        failures: &mut BTreeMap<String, String>,
+    ) {
+        let path = format!("{command_path} --{}", arg.get_id());
+        for source in [arg.get_help(), arg.get_long_help()].into_iter().flatten() {
+            audit_help_source(&path, &source.to_string(), failures);
+        }
+        let Some(possible_values) = arg.get_value_parser().possible_values() else {
+            return;
+        };
+        for value in possible_values {
+            if let Some(help) = value.get_help() {
+                let value_path = format!("{path}={}", value.get_name());
+                audit_help_source(&value_path, &help.to_string(), failures);
+            }
+        }
+    }
+
+    fn audit_command_help(command: &Command, path: &str, failures: &mut BTreeMap<String, String>) {
+        for source in [
+            command.get_about(),
+            command.get_long_about(),
+            command.get_before_help(),
+            command.get_before_long_help(),
+            command.get_after_help(),
+            command.get_after_long_help(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            audit_help_source(path, &source.to_string(), failures);
+        }
+        for arg in command.get_arguments() {
+            audit_arg_help(path, arg, failures);
+        }
+        for child in command.get_subcommands() {
+            let child_path = format!("{path} {}", child.get_name());
+            audit_command_help(child, &child_path, failures);
+        }
+    }
+
+    fn audit_registry_help(failures: &mut BTreeMap<String, String>) {
+        for entry in ve_tos_cli::registry::command_groups() {
+            let path = format!("ve-tos registry {}", entry.name);
+            audit_help_source(&path, entry.description, failures);
+        }
+        for row in tos_cli::registry::capabilities() {
+            let path = format!("tos registry {}", row.command);
+            audit_help_source(&path, row.description, failures);
+        }
+        for row in ve_adrive_cli::registry::capabilities() {
+            let path = format!("ve-adrive registry {}", row.command);
+            audit_help_source(&path, row.description, failures);
+        }
+    }
+
+    #[test]
+    fn chinese_help_audit_rejects_mixed_cjk_and_english_prose() {
+        let mut failures = BTreeMap::new();
+        let source = "已有中文 untranslated human prose";
+        audit_help_source("mixed-language fixture", source, &mut failures);
+        let report = failures.values().cloned().collect::<Vec<_>>().join("\n");
+        assert_eq!(failures.len(), 1, "{report}");
+        assert!(
+            report.contains("command=mixed-language fixture"),
+            "{report}"
+        );
+        assert!(report.contains(&format!("source={source:?}")), "{report}");
+    }
+
+    #[test]
+    fn chinese_help_audit_extracts_aligned_command_descriptions() {
+        let mut failures = BTreeMap::new();
+        let description = "untranslated aligned description";
+        let source = format!("ve-storage-uni-cli tos <command>          {description}");
+        audit_help_source("aligned-description fixture", &source, &mut failures);
+        let report = failures.values().cloned().collect::<Vec<_>>().join("\n");
+        assert_eq!(failures.len(), 1, "{report}");
+        assert!(
+            report.contains("command=aligned-description fixture"),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("source={description:?}")),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn chinese_help_audit_rejects_unknown_cli_prefix_suffixes() {
+        let sources = [
+            "ve-storage-uni-cli tos ls — untranslated prose",
+            "ve-tos-cli ls: untranslated prose",
+            "tos-cli ls\tuntranslated prose",
+            "ve-adrive-cli ls untranslated prose",
+        ];
+        let mut failures = BTreeMap::new();
+        for source in sources {
+            audit_help_source("unknown CLI suffix fixture", source, &mut failures);
+        }
+        let report = failures.values().cloned().collect::<Vec<_>>().join("\n");
+        assert_eq!(failures.len(), sources.len(), "{report}");
+        for source in sources {
+            assert!(report.contains(&format!("source={source:?}")), "{report}");
+        }
+    }
+
+    #[test]
+    fn chinese_help_audit_excludes_complete_machine_commands() {
+        let mut failures = BTreeMap::new();
+        for source in [
+            "ve-storage-uni-cli tos ls tos://bucket/prefix/",
+            "ve-tos-cli bucket list",
+            "tos-cli completion bash --output json",
+            "ve-adrive-cli ls adrive://inst/space/docs/",
+            "ve-adrive-cli ls --help",
+        ] {
+            audit_help_source("machine command fixture", source, &mut failures);
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn shell_only_machine_exemptions_have_explicit_shell_syntax() {
+        for source in SHELL_ONLY_MACHINE_LINES {
+            let has_shell_operator = [" | ", " > ", " >> ", " && "]
+                .iter()
+                .any(|operator| source.contains(operator));
+            let is_shell_utility = source.starts_with("echo ") || source.starts_with("mkdir ");
+            assert!(
+                has_shell_operator || is_shell_utility,
+                "shell-only exemption lacks explicit shell syntax: {source:?}"
+            );
+            assert!(
+                !is_complete_cli_command(source),
+                "valid CLI commands must not use the shell-only exemption: {source:?}"
+            );
+        }
+        assert_eq!(EXTERNAL_MACHINE_COMMANDS, ["ve login"]);
+        assert!(
+            MACHINE_INVOCATION_TEMPLATES
+                .iter()
+                .all(|source| source.ends_with(" <command>")),
+            "invocation templates must retain their explicit placeholder"
+        );
+    }
+
+    #[test]
+    fn corrected_low_level_examples_are_valid_machine_commands() {
+        let mut root = Cli::command();
+        let ve_tos = root.find_subcommand_mut("ve-tos").expect("ve-tos command");
+        for (command, expected, rejected) in [
+            (
+                "multipart",
+                "ve-tos-cli multipart complete --bucket mybucket --key bigfile.bin --upload-id xxx --parts '[{\"PartNumber\":1,\"ETag\":\"etag\"}]' --complete-all",
+                "--upload-id xxx --complete-all",
+            ),
+            (
+                "replication",
+                "ve-tos-cli replication delete --bucket mybucket --force",
+                "--rule-id rule-1",
+            ),
+        ] {
+            let help = ve_tos
+                .find_subcommand_mut(command)
+                .expect("low-level command")
+                .render_long_help()
+                .to_string();
+            assert!(help.contains(expected), "expected={expected:?}: {help}");
+            assert!(!help.contains(rejected), "rejected={rejected:?}: {help}");
+            assert!(is_complete_cli_command(expected), "invalid example: {expected}");
+        }
+    }
+
+    #[test]
+    fn chinese_root_long_help_localizes_aligned_descriptions() {
+        let mut command = Cli::command();
+        let english = command.render_long_help().to_string();
+        let chinese = localize_clap_help_zh(&english);
+        for expected in [
+            "ve-storage-uni-cli tos <command>          ByteCloud TOS 对象存储",
+            "ve-storage-uni-cli ve-tos <command>       TOS 对象存储",
+            "ve-storage-uni-cli ve-adrive <command>    A-Drive 文件存储",
+        ] {
+            assert!(
+                chinese.contains(expected),
+                "expected={expected:?}: {chinese}"
+            );
+        }
+        for source in [
+            "ByteCloud TOS Object Storage",
+            "TOS Object Storage",
+            "A-Drive\n",
+        ] {
+            assert!(!chinese.contains(source), "source={source:?}: {chinese}");
+        }
+    }
+
+    #[test]
+    fn chinese_help_catalog_covers_complete_command_tree() {
+        let mut command = Cli::command();
+        command.build();
+        let mut failures = BTreeMap::new();
+        audit_command_help(&command, "ve-storage-uni-cli", &mut failures);
+        audit_registry_help(&mut failures);
+        let report = failures.values().cloned().collect::<Vec<_>>().join("\n");
+        assert!(
+            failures.is_empty(),
+            "Chinese help catalog audit failed:\n{}",
+            report
+        );
+    }
+}
+
 fn args_without_help_language(effective_args: &[String]) -> Vec<String> {
     let mut sanitized = Vec::with_capacity(effective_args.len());
     let mut index = 0;
@@ -1339,6 +2925,30 @@ fn args_without_help_language(effective_args: &[String]) -> Vec<String> {
         index += 1;
     }
     sanitized
+}
+
+fn describe_language_for_canonical_dispatch(effective_args: &[String]) -> Option<HelpLanguage> {
+    if !has_flag(effective_args, "--describe") {
+        return None;
+    }
+    let language = requested_help_language(effective_args)?;
+    let sanitized_args = args_without_help_language(effective_args);
+    let parsed = Cli::try_parse_from(&sanitized_args).ok()?;
+    let needs_canonical_dispatch = match parsed.tool {
+        ToolCommand::TosCli {
+            command: tos_cli::TosCliCommand::Api(_),
+        }
+        | ToolCommand::ADrive {
+            command: ve_adrive_cli::ADriveCommand::Api(_),
+            ..
+        } => true,
+        ToolCommand::Tos { command, .. } => {
+            matches!(command, Some(ve_tos_cli::TosCommand::Api(_)))
+                || is_tos_group_describe_command(&ve_tos_cli::command_path(&command))
+        }
+        _ => false,
+    };
+    needs_canonical_dispatch.then_some(language)
 }
 
 fn print_chinese_help(effective_args: &[String]) {
@@ -1428,7 +3038,7 @@ fn recovered_any_command_path(effective_args: &[String]) -> String {
 
 fn unified_grouped_help_zh() -> String {
     let mut output = String::new();
-    let _ = writeln!(output, "Volcengine Storage Unified CLI - Agent-Native\n");
+    let _ = writeln!(output, "火山引擎存储统一 CLI - 面向 Agent\n");
     let _ = writeln!(output, "用法:");
     let _ = writeln!(output, "  ve-storage-uni-cli tos <命令> [选项]");
     let _ = writeln!(output, "  ve-storage-uni-cli ve-tos <命令> [选项]");
@@ -1454,7 +3064,7 @@ fn unified_grouped_help_zh() -> String {
 fn tos_grouped_help_zh() -> String {
     let prefix = std::env::var(TOS_EXAMPLE_PREFIX_ENV).unwrap_or_else(|_| "ve-tos-cli".to_string());
     let mut output = String::new();
-    let _ = writeln!(output, "TOS Object Storage CLI - Agent-Native\n");
+    let _ = writeln!(output, "TOS 对象存储 CLI - 面向 Agent\n");
     append_tos_usage_zh(&mut output, &prefix);
     for (title, category) in [
         ("高阶命令", "high_level"),
@@ -1467,6 +3077,7 @@ fn tos_grouped_help_zh() -> String {
     }
     append_tos_target_syntax_zh(&mut output);
     append_root_common_options_zh(&mut output);
+    append_tos_unified_auth_zh(&mut output, &prefix);
     append_help_language_section_zh(&mut output);
     append_tos_examples_zh(&mut output, &prefix);
     translate_help_phrases_zh(&output)
@@ -1476,7 +3087,7 @@ fn byted_tos_grouped_help_zh() -> String {
     let prefix =
         std::env::var(BYTED_TOS_EXAMPLE_PREFIX_ENV).unwrap_or_else(|_| "tos-cli".to_string());
     let mut output = String::new();
-    let _ = writeln!(output, "TOS CLI - Agent-Native\n");
+    let _ = writeln!(output, "TOS CLI - 面向 Agent\n");
     let _ = writeln!(output, "用法:\n  {prefix} <命令> [选项]\n");
     append_byted_capability_group_zh(&mut output, "高阶命令", "high_level");
     append_byted_capability_group_zh(&mut output, "能力 / 工具", "utilities");
@@ -1492,12 +3103,13 @@ fn adrive_grouped_help_zh() -> String {
     let prefix =
         std::env::var(ADRIVE_EXAMPLE_PREFIX_ENV).unwrap_or_else(|_| "ve-adrive-cli".to_string());
     let mut output = String::new();
-    let _ = writeln!(output, "ADrive CLI - Agent-Native\n");
+    let _ = writeln!(output, "ADrive CLI - 面向 Agent\n");
     let _ = writeln!(output, "用法:\n  {prefix} <命令> [选项]\n");
     append_adrive_capability_group_zh(&mut output, "高阶命令", "high_level");
     append_adrive_capability_group_zh(&mut output, "能力 / 工具", "utilities");
     append_adrive_target_syntax_zh(&mut output);
     append_root_common_options_zh(&mut output);
+    append_adrive_unified_auth_zh(&mut output, &prefix);
     append_help_language_section_zh(&mut output);
     append_adrive_examples_zh(&mut output, &prefix);
     translate_help_phrases_zh(&output)
@@ -1620,6 +3232,36 @@ fn append_root_common_options_zh(output: &mut String) {
     let _ = writeln!(output, "      --describe              输出结构化命令描述");
     let _ = writeln!(output, "  -h, --help                  显示帮助");
     let _ = writeln!(output, "  -V, --version               显示版本\n");
+}
+
+fn append_tos_unified_auth_zh(output: &mut String, prefix: &str) {
+    let _ = writeln!(output, "统一登录鉴权:");
+    let _ = writeln!(output, "  --auth-mode <MODE>          aksk 或 unified");
+    let _ = writeln!(output, "  环境变量: TOS_AUTH_MODE");
+    let _ = writeln!(
+        output,
+        "  {prefix} --profile default --auth-mode unified ls"
+    );
+    let _ = writeln!(output, "  {prefix} config set auth_mode unified");
+    let _ = writeln!(output, "  使用同名外部 profile；登录由 `ve login` 管理\n");
+}
+
+fn append_adrive_unified_auth_zh(output: &mut String, prefix: &str) {
+    let _ = writeln!(output, "统一登录鉴权:");
+    let _ = writeln!(
+        output,
+        "  --auth-mode <MODE>          aksk、oauth 或 unified"
+    );
+    let _ = writeln!(output, "  环境变量: ADRIVE_AUTH_MODE");
+    let _ = writeln!(
+        output,
+        "  {prefix} --profile default --auth-mode unified ls"
+    );
+    let _ = writeln!(output, "  {prefix} config set auth_mode unified");
+    let _ = writeln!(
+        output,
+        "  使用同名外部 profile；登录/登出由 `ve login` / `ve logout` 管理\n"
+    );
 }
 
 fn append_help_language_section_zh(output: &mut String) {
@@ -1822,13 +3464,28 @@ async fn run_with_args(args: Vec<String>, invocation_surface: InvocationSurface)
         return;
     }
 
+    // [Review Fix #GlobalZh2] Canonical Describe handlers must own the payload;
+    // the root consumes only the language selector instead of replacing their
+    // result with a shorter recovery document.
+    let documentation_language = describe_language_for_canonical_dispatch(&effective_args);
+    let parser_args = documentation_language
+        .map(|_| args_without_help_language(&effective_args))
+        .unwrap_or_else(|| effective_args.clone());
     // [Review Fix #19] Use try_parse_from so `tos` parse failures can be rendered as failed Envelope.
-    let cli = match Cli::try_parse_from(&effective_args) {
-        Ok(cli) => {
+    let cli = match Cli::try_parse_from(&parser_args) {
+        Ok(mut cli) => {
+            cli.global.documentation_language =
+                documentation_language.map(|language| match language {
+                    HelpLanguage::En => "en".to_string(),
+                    HelpLanguage::Zh => "zh".to_string(),
+                });
             // [Review Fix #1] Preserve parameter-independent trailing `--describe`
             // only when clap parsed the command but did not attach the flag to
             // global args; richer handler-level describe output keeps precedence.
-            if has_flag(&effective_args, "--describe") && !cli.global.describe {
+            if documentation_language.is_none()
+                && has_flag(&effective_args, "--describe")
+                && !cli.global.describe
+            {
                 if maybe_emit_byted_tos_describe_recovery(&effective_args) {
                     return;
                 }
@@ -1841,15 +3498,17 @@ async fn run_with_args(args: Vec<String>, invocation_surface: InvocationSurface)
             }
             cli
         }
-        Err(err) => handle_parse_error(&effective_args, err),
+        Err(err) => handle_parse_error(&parser_args, err),
     };
 
     match cli.tool {
         ToolCommand::TosCli { command } => {
             handle_byted_tos(cli.global, command).await;
         }
-        ToolCommand::Tos { command } => {
-            handle_tos(cli.global, command).await;
+        ToolCommand::Tos { auth, command } => {
+            let mut global = cli.global;
+            global.ve_tos_auth_mode = auth.auth_mode.map(|mode| mode.as_str().to_string());
+            handle_tos(global, command).await;
         }
         ToolCommand::ADrive { auth, command } => {
             handle_adrive(cli.global, auth, command).await;
@@ -2098,7 +3757,7 @@ fn maybe_emit_byted_tos_describe_recovery(effective_args: &[String]) -> bool {
     let _config_guard = EnvGuard::set(TOS_CONFIG_BINARY_ENV, "tos");
     let global = recovered_global_args(effective_args);
     let command = recovered_command_path(effective_args, "byted-tos");
-    let data = if command == "tos" {
+    let mut data = if command == "tos" {
         serde_json::json!({
             "tool": "tos",
             "version": env!("CARGO_PKG_VERSION"),
@@ -2127,6 +3786,11 @@ fn maybe_emit_byted_tos_describe_recovery(effective_args: &[String]) -> bool {
     } else {
         return false;
     };
+    if requested_help_language(effective_args) == Some(HelpLanguage::Zh) {
+        // [Review Fix #TosZh1] Route every recovered TOS Describe document
+        // through the owner exact catalog while preserving machine fields.
+        tos_cli::handler::meta::localize_tos_documentation_zh(&mut data);
+    }
     let envelope = tos_core::agent::envelope::Envelope::success(command, data);
     let _ = ve_tos_cli::handler::common::output_result(&global, &envelope);
     true
@@ -2140,10 +3804,13 @@ fn maybe_emit_tos_describe_recovery(effective_args: &[String]) -> bool {
     let _config_guard = EnvGuard::set(TOS_CONFIG_BINARY_ENV, "ve-tos");
     let global = recovered_global_args(effective_args);
     let command = recovered_command_path(effective_args, "ve-tos");
-    if is_tos_group_describe_command(&command) {
+    // [Review Fix #VeTosZh3] Root Describe must stay in the recovery path so
+    // the documentation language is consumed and localized; non-root groups
+    // retain their existing Clap-owned behavior.
+    if command != "ve-tos" && is_tos_group_describe_command(&command) {
         return false;
     }
-    let data = if command == "ve-tos" {
+    let mut data = if command == "ve-tos" {
         ve_tos_cli::registry::describe_tos_group()
     } else if let Some(desc) = ve_tos_cli::registry::describe_command_metadata(&command) {
         serde_json::to_value(desc).unwrap_or_else(|_| serde_json::json!({}))
@@ -2165,6 +3832,9 @@ fn maybe_emit_tos_describe_recovery(effective_args: &[String]) -> bool {
     } else {
         return false;
     };
+    if requested_help_language(effective_args) == Some(HelpLanguage::Zh) {
+        ve_tos_cli::handler::meta::localize_ve_tos_auth_documentation_zh(&mut data);
+    }
     let envelope = tos_core::agent::envelope::Envelope::success(command, data);
     let _ = ve_tos_cli::handler::common::output_result(&global, &envelope);
     true
@@ -2250,6 +3920,9 @@ fn maybe_emit_adrive_describe_recovery(effective_args: &[String]) -> bool {
         return false;
     };
     ve_adrive_cli::handler::common::publicize_adrive_output_value(&mut data);
+    if requested_help_language(effective_args) == Some(HelpLanguage::Zh) {
+        ve_adrive_cli::handler::meta::localize_adrive_auth_documentation_zh(&mut data);
+    }
     let envelope = tos_core::agent::envelope::Envelope::success(
         ve_adrive_cli::handler::common::public_adrive_command_path(&command),
         data,
@@ -2538,6 +4211,10 @@ async fn handle_byted_tos(global: GlobalArgs, command: tos_cli::TosCliCommand) {
         Err(err) => {
             let exit_code = err.exit_code();
             let semantics = err.agent_semantics();
+            let request_id = tos_core::agent::request_id::select_error_request_id(
+                &global.request_trace.snapshot(),
+                semantics.request_id.as_deref(),
+            );
             let error_detail = ErrorDetail {
                 status_code: semantics.status_code,
                 code: semantics.code.clone(),
@@ -2561,7 +4238,7 @@ async fn handle_byted_tos(global: GlobalArgs, command: tos_cli::TosCliCommand) {
                 docs_url: None,
             };
             let mut envelope = Envelope::<()>::failed(command_path, error_detail);
-            if let Some(request_id) = semantics.request_id {
+            if let Some(request_id) = request_id {
                 envelope = envelope.with_request_id(request_id);
             }
             eprintln!(
@@ -2736,6 +4413,14 @@ fn suggest_byted_tos_fix(
 ) -> Option<String> {
     use tos_core::agent::error::CliError;
     match err {
+        // [Review Fix #29] `tos config init` intentionally leaves network
+        // fields unset, so endpoint/region errors need field-specific fixes.
+        CliError::ConfigMissing(message) if message.contains("endpoint") => {
+            Some("tos config set endpoint <endpoint>".to_string())
+        }
+        CliError::ConfigMissing(message) if message.contains("region") => {
+            Some("tos config set region <region>".to_string())
+        }
         CliError::ConfigMissing(_) => Some("tos config init".to_string()),
         CliError::AuthFailed(_) => Some("tos config init (reconfigure credentials)".to_string()),
         CliError::ValidationError(_) => {
@@ -2756,6 +4441,11 @@ async fn handle_tos(global: GlobalArgs, command: Option<ve_tos_cli::TosCommand>)
         Err(err) => {
             let exit_code = err.exit_code();
             let semantics = err.agent_semantics();
+            let request_id = tos_core::agent::request_id::select_error_request_id(
+                &global.request_trace.snapshot(),
+                semantics.request_id.as_deref(),
+            );
+            let guidance = suggest_fix(&global, &err);
             let error_detail = ErrorDetail {
                 status_code: semantics.status_code,
                 code: semantics.code.clone(),
@@ -2774,13 +4464,13 @@ async fn handle_tos(global: GlobalArgs, command: Option<ve_tos_cli::TosCommand>)
                 },
                 category: semantics.category,
                 suggested_action: Some(semantics.suggested_action.clone()),
-                fix_command: suggest_fix(&err),
-                doctor_hint: Some("ve-tos capabilities --view groups".to_string()),
+                fix_command: guidance.fix_command,
+                doctor_hint: guidance.doctor_hint,
                 docs_url: Some("https://www.volcengine.com/docs/6349".to_string()),
             };
             let mut envelope =
                 Envelope::<()>::failed(ve_tos_cli::command_path(&command), error_detail);
-            if let Some(request_id) = semantics.request_id {
+            if let Some(request_id) = request_id {
                 envelope = envelope.with_request_id(request_id);
             }
             eprintln!(
@@ -3003,15 +4693,115 @@ async fn handle_tos_inner(
     }
 }
 
-fn suggest_fix(err: &tos_core::agent::error::CliError) -> Option<String> {
+struct VeTosRepairGuidance {
+    fix_command: Option<String>,
+    doctor_hint: Option<String>,
+}
+
+fn suggest_fix(global: &GlobalArgs, err: &tos_core::agent::error::CliError) -> VeTosRepairGuidance {
     use tos_core::agent::error::CliError;
-    match err {
+    let is_unified = resolve_ve_tos_repair_auth_mode(global)
+        .is_ok_and(|mode| mode == ve_tos_cli::domain::auth::AuthMode::Unified);
+    let is_unified_credential_error = err.to_string().contains("unified login credential");
+    if is_unified && is_unified_credential_error {
+        return VeTosRepairGuidance {
+            fix_command: Some("ve login".to_string()),
+            doctor_hint: Some("ve-tos doctor --check auth".to_string()),
+        };
+    }
+    let fix_command = match err {
+        // [Review Fix #29] Existing profiles may intentionally keep a custom
+        // region or endpoint, so repair the missing field instead of replacing
+        // it indirectly through initialization defaults.
+        CliError::ConfigMissing(message) if message.contains("control_endpoint") => {
+            Some("ve-tos config set control_endpoint <endpoint>".to_string())
+        }
+        CliError::ConfigMissing(message) if message.contains("endpoint") => {
+            Some("ve-tos config set endpoint <endpoint>".to_string())
+        }
+        CliError::ConfigMissing(message) if message.contains("region") => {
+            Some("ve-tos config set region <region>".to_string())
+        }
         CliError::ConfigMissing(_) => Some("ve-tos config init".to_string()),
         CliError::AuthFailed(_) => Some("ve-tos config init (reconfigure credentials)".to_string()),
         CliError::ResourceNotFound(msg) if msg.contains("NoSuchBucket") => {
             Some("ve-tos bucket create --bucket <name> --region <region>".to_string())
         }
         _ => None,
+    };
+    VeTosRepairGuidance {
+        fix_command,
+        doctor_hint: Some("ve-tos capabilities --view groups".to_string()),
+    }
+}
+
+fn resolve_ve_tos_repair_auth_mode(
+    global: &GlobalArgs,
+) -> Result<ve_tos_cli::domain::auth::AuthMode, tos_core::agent::error::CliError> {
+    use ve_tos_cli::domain::auth::AuthMode;
+    if let Some(value) = global.ve_tos_auth_mode.as_deref() {
+        return AuthMode::parse(value, "command line");
+    }
+    let config_path = global.existing_runtime_config_path()?;
+    let config = tos_core::infra::config::ConfigFile::load_from(&config_path)?;
+    if let Some(value) = config
+        .profiles
+        .get(&global.profile)
+        .and_then(|profile| profile.ve_tos.as_ref())
+        .and_then(|settings| settings.auth_mode.as_deref())
+    {
+        return AuthMode::parse(value, "profile config");
+    }
+    if let Ok(value) = std::env::var("TOS_AUTH_MODE") {
+        return AuthMode::parse(&value, "TOS_AUTH_MODE");
+    }
+    Ok(AuthMode::Aksk)
+}
+
+#[cfg(test)]
+mod ve_tos_unified_guidance_tests {
+    use super::*;
+
+    #[test]
+    fn suggest_fix_unified_sdk_error_recommends_external_login_and_auth_doctor() {
+        let global = GlobalArgs {
+            ve_tos_auth_mode: Some("unified".to_string()),
+            ..GlobalArgs::default()
+        };
+        let error = tos_core::agent::error::CliError::ConfigMissing(
+            "[CliConfigLoginSessionMissing] unified login credentials are unavailable".to_string(),
+        );
+
+        let guidance = suggest_fix(&global, &error);
+
+        assert_eq!(guidance.fix_command.as_deref(), Some("ve login"));
+        assert_eq!(
+            guidance.doctor_hint.as_deref(),
+            Some("ve-tos doctor --check auth")
+        );
+    }
+
+    #[test]
+    fn suggest_fix_aksk_repair_guidance_keeps_existing_commands() {
+        let global = GlobalArgs {
+            ve_tos_auth_mode: Some("aksk".to_string()),
+            ..GlobalArgs::default()
+        };
+        let guidance = suggest_fix(
+            &global,
+            &tos_core::agent::error::CliError::ConfigMissing(
+                "TOS endpoint is required".to_string(),
+            ),
+        );
+
+        assert_eq!(
+            guidance.fix_command.as_deref(),
+            Some("ve-tos config set endpoint <endpoint>")
+        );
+        assert_eq!(
+            guidance.doctor_hint.as_deref(),
+            Some("ve-tos capabilities --view groups")
+        );
     }
 }
 
@@ -3034,6 +4824,25 @@ async fn handle_adrive(
         Err(err) => {
             let exit_code = err.exit_code();
             let semantics = err.agent_semantics();
+            let request_id = tos_core::agent::request_id::select_error_request_id(
+                &global.request_trace.snapshot(),
+                semantics.request_id.as_deref(),
+            );
+            let command_path = ve_adrive_cli::handler::common::public_adrive_command_path(
+                &ve_adrive_cli::command_path(&command),
+            );
+            let guidance = ve_adrive_cli::handler::common::adrive_error_guidance(
+                &global,
+                auth.auth_mode,
+                &err,
+                &command_path,
+            );
+            let category = ve_adrive_cli::handler::common::adrive_error_category(
+                &global,
+                auth.auth_mode,
+                &err,
+            )
+            .unwrap_or(semantics.category);
             let error_detail = ErrorDetail {
                 status_code: semantics.status_code,
                 code: semantics.code.clone(),
@@ -3050,17 +4859,16 @@ async fn handle_adrive(
                     ExitCode::Conflict => ErrorKind::Conflict,
                     _ => ErrorKind::Unknown,
                 },
-                category: semantics.category,
-                suggested_action: Some(semantics.suggested_action.clone()),
-                fix_command: suggest_adrive_fix(&err, &command),
-                doctor_hint: Some("ve-adrive doctor".to_string()),
+                category,
+                suggested_action: Some(guidance.suggested_action),
+                fix_command: guidance.fix_command,
+                doctor_hint: guidance.doctor_hint,
                 docs_url: None,
             };
-            let command_path = ve_adrive_cli::handler::common::public_adrive_command_path(
-                &ve_adrive_cli::command_path(&command),
-            );
             let mut envelope = Envelope::<()>::failed(command_path, error_detail);
-            if let Some(request_id) = semantics.request_id {
+            // [Review Fix #12] Error request IDs come only from the terminal
+            // traced response; a terminal no-response failure keeps the ULID.
+            if let Some(request_id) = request_id {
                 envelope = envelope.with_request_id(request_id);
             }
             // [Review Fix #5] Runtime errors are emitted from the unified
@@ -3078,30 +4886,6 @@ async fn handle_adrive(
 
     if exit_code != 0 {
         std::process::exit(exit_code);
-    }
-}
-
-fn suggest_adrive_fix(
-    err: &tos_core::agent::error::CliError,
-    command: &ve_adrive_cli::ADriveCommand,
-) -> Option<String> {
-    use tos_core::agent::error::CliError;
-    match err {
-        CliError::ConfigMissing(_) => Some("ve-adrive config init".to_string()),
-        CliError::AuthFailed(_) => {
-            Some("ve-adrive config init (reconfigure IDS credentials)".to_string())
-        }
-        CliError::ValidationError(message) if message.contains("raw API execution") => {
-            Some("ve-adrive api <group> <action> --dry-run".to_string())
-        }
-        CliError::ValidationError(_) => {
-            let command_path = ve_adrive_cli::command_path(command);
-            let public_command = command_path
-                .strip_prefix("ve-adrive ")
-                .unwrap_or(&command_path);
-            Some(format!("ve-adrive {public_command} --help"))
-        }
-        _ => None,
     }
 }
 

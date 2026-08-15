@@ -29,7 +29,7 @@ use tos_core::agent::envelope::{Envelope, PaginationInfo};
 use tos_core::agent::error::CliError;
 use tos_core::infra::client::TosClient;
 
-use crate::domain::core::extract_request_id;
+use crate::domain::core;
 use crate::domain::object::{CommonPrefix, ObjectOwner};
 
 // ===== ListMultipartUploads =====
@@ -129,9 +129,6 @@ pub async fn list_multipart_uploads(
     encoding_type: Option<&str>,
     fetch_from_kv: bool,
 ) -> Result<Envelope<ListMultipartUploadsResponse>, CliError> {
-    let url = client.bucket_endpoint(bucket)?;
-    let path = client.bucket_request_path(bucket)?;
-
     let mut query: BTreeMap<String, String> = BTreeMap::new();
     query.insert("uploads".to_string(), String::new());
     if let Some(p) = prefix {
@@ -166,15 +163,19 @@ pub async fn list_multipart_uploads(
         query.insert("fetch-from-kv".to_string(), "true".to_string());
     }
 
-    let resp = client
-        .send_request(Method::GET, &url, &path, query, BTreeMap::new(), None)
-        .await?;
-
-    let request_id = extract_request_id(&resp);
-    let resp = client.check_response(resp).await?;
-    let body = resp.text().await.map_err(CliError::Http)?;
-
-    let data: ListMultipartUploadsResponse = parse_list_response(&body, "ListMultipartUploads")?;
+    let response = core::send_bucket_request_parsed(
+        client,
+        core::ReplayableBucketBytesRequest {
+            method: Method::GET,
+            bucket,
+            query,
+            headers: BTreeMap::new(),
+            body: None,
+        },
+        |body| parse_list_response::<ListMultipartUploadsResponse>(body, "ListMultipartUploads"),
+    )
+    .await?;
+    let data = response.value;
 
     let next_token = if data.is_truncated {
         data.next_key_marker.clone()
@@ -184,7 +185,7 @@ pub async fn list_multipart_uploads(
     let total = data.uploads.len() as u64;
 
     Ok(Envelope::success("ve-tos multipart list", data)
-        .with_request_id(request_id)
+        .with_request_id(response.request_id)
         .with_pagination(PaginationInfo {
             next_token,
             next_marker: None,
@@ -202,9 +203,6 @@ pub async fn list_parts(
     max_parts: Option<u32>,
     fetch_from_kv: bool,
 ) -> Result<Envelope<ListPartsResponse>, CliError> {
-    let url = client.object_endpoint(bucket, key)?;
-    let path = client.object_request_path(bucket, key)?;
-
     let mut query: BTreeMap<String, String> = BTreeMap::new();
     query.insert("uploadId".to_string(), upload_id.to_string());
     if let Some(m) = part_number_marker {
@@ -217,15 +215,20 @@ pub async fn list_parts(
         query.insert("fetch-from-kv".to_string(), "true".to_string());
     }
 
-    let resp = client
-        .send_request(Method::GET, &url, &path, query, BTreeMap::new(), None)
-        .await?;
-
-    let request_id = extract_request_id(&resp);
-    let resp = client.check_response(resp).await?;
-    let body = resp.text().await.map_err(CliError::Http)?;
-
-    let data: ListPartsResponse = parse_list_response(&body, "ListParts")?;
+    let response = core::send_object_request_parsed(
+        client,
+        core::ReplayableObjectBytesRequest {
+            method: Method::GET,
+            bucket,
+            key,
+            query,
+            headers: BTreeMap::new(),
+            body: None,
+        },
+        |body| parse_list_response::<ListPartsResponse>(body, "ListParts"),
+    )
+    .await?;
+    let data = response.value;
 
     let next_token = if data.is_truncated {
         data.next_part_number_marker.map(|n| n.to_string())
@@ -235,7 +238,7 @@ pub async fn list_parts(
     let total = data.parts.len() as u64;
 
     Ok(Envelope::success("ve-tos multipart list-parts", data)
-        .with_request_id(request_id)
+        .with_request_id(response.request_id)
         .with_pagination(PaginationInfo {
             next_token,
             next_marker: None,
@@ -253,7 +256,9 @@ fn parse_list_response<T: for<'de> Deserialize<'de>>(body: &str, api: &str) -> R
         serde_json::from_str::<T>(body).map_err(|e| format!("json: {}", e))
     };
     result.map_err(|e| {
-        let preview = &body[..200.min(body.len())];
+        // [Review Fix #8] Build a Unicode-safe preview for malformed typed
+        // responses that have exhausted their decode retries.
+        let preview = body.chars().take(200).collect::<String>();
         CliError::Unknown(format!(
             "Failed to parse {} response: {} -- body: {}",
             api, e, preview

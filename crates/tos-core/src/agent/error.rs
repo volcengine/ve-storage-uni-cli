@@ -17,6 +17,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::agent::request_id::sanitize_request_id;
+
 /// Agent-facing error category for programmatic recovery decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentErrorCategory {
@@ -138,7 +140,18 @@ impl CliError {
         let request_id = service
             .as_ref()
             .and_then(|fields| fields.request_id.clone())
-            .or_else(last_request_id);
+            // [Review Fix #13] The process-wide compatibility mirror is only
+            // eligible for a parsed HTTP service error, never for local or
+            // transport-only failures, and it must pass the shared sanitizer.
+            .or_else(|| {
+                if raw_message.contains("(RequestId:") {
+                    return None;
+                }
+                service
+                    .as_ref()
+                    .and_then(|fields| fields.status_code)
+                    .and_then(|_| last_request_id())
+            });
         let category = classify_agent_error(exit_code, &code);
         AgentErrorSemantics {
             status_code,
@@ -209,7 +222,7 @@ fn extract_request_id(message: &str) -> Option<String> {
     let start = message.find(marker)? + marker.len();
     let end = message[start..].find(')')? + start;
     let request_id = message[start..end].trim();
-    (!request_id.is_empty()).then(|| request_id.to_string())
+    sanitize_request_id(request_id)
 }
 
 fn extract_service_message(message: &str) -> Option<String> {
@@ -226,7 +239,7 @@ fn extract_service_message(message: &str) -> Option<String> {
 fn last_request_id() -> Option<String> {
     std::env::var("TOS_LAST_REQUEST_ID")
         .ok()
-        .filter(|request_id| !request_id.is_empty())
+        .and_then(|request_id| sanitize_request_id(&request_id))
 }
 
 fn default_error_code(exit_code: ExitCode) -> &'static str {
@@ -402,6 +415,9 @@ fn io_error_exit_code(err: &std::io::Error) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_exit_codes() {
@@ -464,5 +480,27 @@ mod tests {
             .unwrap_err()
             .into();
         assert_eq!(err.exit_code(), ExitCode::ValidationError);
+    }
+
+    #[test]
+    fn unsafe_embedded_request_id_is_rejected() {
+        let error = CliError::Unknown(format!(
+            "HTTP 500 [InternalError] failed (RequestId: {})",
+            "x".repeat(257)
+        ));
+
+        assert_eq!(error.agent_semantics().request_id, None);
+    }
+
+    #[test]
+    fn local_error_does_not_use_process_request_id_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        std::env::set_var("TOS_LAST_REQUEST_ID", "stale-request-id");
+
+        let semantics =
+            CliError::ValidationError("invalid local input".to_string()).agent_semantics();
+
+        std::env::remove_var("TOS_LAST_REQUEST_ID");
+        assert_eq!(semantics.request_id, None);
     }
 }

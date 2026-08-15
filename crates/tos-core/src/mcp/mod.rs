@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+mod http_security;
 pub mod server;
 pub mod tools;
 

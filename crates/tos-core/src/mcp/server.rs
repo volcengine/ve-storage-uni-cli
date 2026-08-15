@@ -47,10 +47,12 @@
 
 use std::borrow::Cow;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use axum::Router;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParam, CallToolResult, Content, Implementation, InitializeResult,
@@ -58,9 +60,12 @@ use rmcp::model::{
     ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
-use rmcp::transport::{io::stdio, SseServer};
+use rmcp::transport::{io::stdio, sse_server::SseServerConfig, SseServer};
 use rmcp::{ErrorData as McpError, ServiceExt};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
+
+use super::http_security::{generate_bearer_token, protect_router, McpHttpSecurity};
 
 /// Boxed future returned by [`ToolDispatcher::dispatch`].
 pub type DispatchFuture<'a> =
@@ -126,6 +131,53 @@ pub struct TosMcpServer {
     dispatcher: Arc<dyn ToolDispatcher>,
 }
 
+struct SseRuntime {
+    server: SseServer,
+    router: Router,
+    token: String,
+}
+
+fn build_sse_runtime(bind: SocketAddr) -> SseRuntime {
+    let token = generate_bearer_token();
+    let config = SseServerConfig {
+        bind,
+        sse_path: "/sse".to_string(),
+        post_path: "/message".to_string(),
+        ct: CancellationToken::new(),
+        sse_keep_alive: None,
+    };
+    let (server, router) = SseServer::new(config);
+    let router = protect_router(router, McpHttpSecurity::new(&token, bind.port()));
+    SseRuntime {
+        server,
+        router,
+        token,
+    }
+}
+
+fn sse_startup_message(bind: SocketAddr, token: &str) -> String {
+    format!("MCP SSE listening on http://{bind}/sse\nAuthorization: Bearer {token}\n")
+}
+
+fn write_sse_startup(
+    writer: &mut impl Write,
+    bind: SocketAddr,
+    token: &str,
+) -> std::io::Result<()> {
+    writer.write_all(sse_startup_message(bind, token).as_bytes())?;
+    writer.flush()
+}
+
+fn validate_sse_bind(bind: SocketAddr) -> std::io::Result<()> {
+    if bind.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "MCP SSE only supports 127.0.0.1",
+        ));
+    }
+    Ok(())
+}
+
 impl TosMcpServer {
     /// Create a new server with a static set of tools.
     ///
@@ -178,19 +230,48 @@ impl TosMcpServer {
         Ok(())
     }
 
-    /// Run the server through rmcp's HTTP/SSE transport.
+    /// Run an authenticated rmcp HTTP/SSE server on exact IPv4 loopback.
     ///
-    /// The server listens on `bind` and exposes the default rmcp endpoints:
-    /// `/sse` for the event stream and `/message` for client requests.
+    /// After the listener binds, a fresh Bearer credential is written once to
+    /// stderr. Every `/sse` and `/message` request must carry that credential
+    /// in `Authorization`; the credential is never accepted in the URL.
     pub async fn run_sse(self, bind: SocketAddr) -> std::io::Result<()> {
+        validate_sse_bind(bind)?;
+        let listener = tokio::net::TcpListener::bind(bind).await?;
+        let local_bind = listener.local_addr()?;
+        let SseRuntime {
+            server,
+            router,
+            token,
+        } = build_sse_runtime(local_bind);
+
         // [Review Fix #20] SSE and stdio must share the same rmcp service; only the transport differs.
         let service = self;
-        let ct = SseServer::serve(bind)
-            .await?
-            .with_service(move || service.clone());
-        tokio::signal::ctrl_c().await?;
-        ct.cancel();
-        Ok(())
+        let http_shutdown = server.config.ct.child_token();
+        let cancellation = server.with_service(move || service.clone());
+        let http_server = axum::serve(listener, router).with_graceful_shutdown(async move {
+            http_shutdown.cancelled().await;
+        });
+        let http_future = async move { http_server.await };
+        tokio::pin!(http_future);
+
+        // [Review Fix #3] Fail closed if the caller cannot receive the only plaintext credential.
+        let output_result = write_sse_startup(&mut std::io::stderr().lock(), local_bind, &token);
+        if let Err(error) = output_result {
+            cancellation.cancel();
+            return Err(error);
+        }
+        drop(token);
+        let result = tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                cancellation.cancel();
+                signal?;
+                http_future.await
+            }
+            result = &mut http_future => result,
+        };
+        cancellation.cancel();
+        result
     }
 }
 
@@ -271,6 +352,133 @@ impl ServerHandler for TosMcpServer {
                     Ok(CallToolResult::error(content))
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use axum::{
+        body::{to_bytes, Body},
+        http::{
+            header::{AUTHORIZATION, CONTENT_TYPE, HOST},
+            Request, StatusCode,
+        },
+    };
+    use tower::ServiceExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn prepared_rmcp_router_rejects_anonymous_sse_before_session_creation() {
+        let runtime = build_sse_runtime(([127, 0, 0, 1], 19090).into());
+        let token = runtime.token.clone();
+        let response = runtime
+            .router
+            .oneshot(
+                Request::builder()
+                    .uri("/sse")
+                    .header(HOST, "127.0.0.1:19090")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains(&token));
+    }
+
+    #[tokio::test]
+    async fn prepared_rmcp_router_accepts_authenticated_sse_and_authenticates_messages_first() {
+        // [Review Fix #9] Exercise the protected real rmcp routes, not only a dummy router.
+        let runtime = build_sse_runtime(([127, 0, 0, 1], 19090).into());
+        let authorization = format!("Bearer {}", runtime.token);
+        let sse_response = runtime
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sse")
+                    .header(HOST, "127.0.0.1:19090")
+                    .header(AUTHORIZATION, &authorization)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sse_response.status(), StatusCode::OK);
+        drop(sse_response);
+
+        let message = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"security-test","version":"1"}}}"#;
+        let message_response = runtime
+            .router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/message?sessionId=unknown-session")
+                    .header(HOST, "127.0.0.1:19090")
+                    .header(AUTHORIZATION, authorization)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(message))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(message_response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn startup_message_prints_header_credential_once_without_url_credential() {
+        let token = "test-only-token";
+        let message = sse_startup_message(([127, 0, 0, 1], 19090).into(), token);
+
+        assert!(message.contains("http://127.0.0.1:19090/sse"));
+        assert!(message.contains("Authorization: Bearer test-only-token"));
+        assert_eq!(message.matches(token).count(), 1);
+        assert!(!message.contains("?token="));
+        assert!(!message.contains("access_token="));
+    }
+
+    #[test]
+    fn startup_writer_propagates_output_failure() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "test output failure",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = write_sse_startup(
+            &mut FailingWriter,
+            ([127, 0, 0, 1], 19090).into(),
+            "test-only-token",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn sse_bind_accepts_only_exact_ipv4_loopback() {
+        assert!(validate_sse_bind(([127, 0, 0, 1], 19090).into()).is_ok());
+        for bind in [
+            ([0, 0, 0, 0], 19090).into(),
+            ([127, 0, 0, 2], 19090).into(),
+            "[::1]:19090".parse().unwrap(),
+        ] {
+            let error = validate_sse_bind(bind).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         }
     }
 }

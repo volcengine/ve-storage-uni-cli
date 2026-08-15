@@ -42,11 +42,14 @@ use crate::cli::meta::{
     DocumentationLanguage, ServeArgs, SkillAction, SkillCommand,
 };
 use crate::cli::ADriveAuthArgs;
-use crate::domain::auth::AuthMode;
+use crate::domain::auth::{
+    oauth_client_id_diagnostics, AuthMode, OAuthClientIdDiagnostics, ResolvedAuthMode,
+};
 use crate::domain::client::resolve_endpoint_and_region;
 use crate::handler::common::{
-    build_profile, inspect_selected_credentials, output_envelope, output_result,
-    output_result_with_columns, public_adrive_command_path,
+    build_runtime_profile, inspect_selected_credentials, inspect_unified_credentials_for_profile,
+    output_envelope, output_result, output_result_with_columns, public_adrive_command_path,
+    UnifiedCredentialInspection,
 };
 use crate::registry::{
     business_domain, business_domains, capabilities, command_domains, find_capability,
@@ -97,6 +100,207 @@ const ADRIVE_EXAMPLE_PREFIX_ENV: &str = "VE_STORAGE_UNI_ADRIVE_EXAMPLE_PREFIX";
 const ADRIVE_DEFAULT_CHECKPOINT_DIR: &str = "~/.tos/checkpoints/ve-adrive";
 const ADRIVE_DEFAULT_BATCH_REPORT_DIR: &str = "~/.tos/reports/ve-adrive";
 
+// Exact owner catalog: identifiers inside each full phrase remain unchanged.
+const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    // Capability descriptions.
+    ("Copy local files, ADrive files, or folders", "复制本地文件、ADrive 文件或文件夹"),
+    ("Move files or folders by same-space rename or copy plus source delete", "通过同空间重命名，或复制后删除源文件/文件夹来移动"),
+    ("Move files or folders by copy plus source delete", "通过复制后删除源文件/文件夹来移动"),
+    ("Synchronize source and destination incrementally", "增量同步源与目标"),
+    ("Create an instance or space", "创建 Instance 或 Space"),
+    ("Delete an instance or space", "删除 Instance 或 Space"),
+    ("Delete a file, folder, or recursively clear a space", "删除文件、文件夹，或递归清空空间"),
+    ("List instances, spaces, or files by target depth", "按目标层级列出 Instance、Space 或文件"),
+    ("Show file or folder metadata", "查看文件或文件夹元数据"),
+    ("Show instance, space, file, or folder metadata", "查看 Instance、Space、文件或文件夹元数据"),
+    ("Calculate file size statistics for a folder", "统计文件夹的文件大小"),
+    ("Find files by name, size, or mtime", "按名称、大小或 mtime 查找文件"),
+    ("Stream file content", "流式输出文件内容"),
+    ("Upload stdin to a file", "将 stdin 上传为文件"),
+    ("Create a folder", "创建文件夹"),
+    ("Discover CLI capabilities", "发现 CLI 能力"),
+    ("Inspect API metadata; execution is unimplemented", "查看 API 元数据；暂不支持执行"),
+    ("Manage ADrive CLI configuration", "管理 ADrive CLI 配置"),
+    ("Generate shell completion scripts and installation snippets for ve-adrive-cli / ve-adrive", "为 ve-adrive-cli / ve-adrive 生成 shell 补全脚本和安装片段"),
+    ("Start registry-backed MCP server over stdio or local HTTP/SSE", "通过 stdio 或本地 HTTP/SSE 启动由 registry 支持的 MCP 服务"),
+    ("List ADrive skill metadata or export Markdown SKILL.md files for external Agents and adapters", "列出 ADrive Skill 元数据，或为外部 Agent 和适配器导出 Markdown SKILL.md 文件"),
+    ("Environment diagnostics", "环境诊断"),
+    // Shared target and transfer parameters.
+    ("Treat ADrive instance/space target segments as names and resolve them to IDs", "将 ADrive instance/space 目标段视为名称并解析为 ID"),
+    ("ADrive instance identifier", "ADrive Instance 标识符"),
+    ("ADrive space identifier", "ADrive Space 标识符"),
+    ("Folder path inside the space", "Space 内的文件夹路径"),
+    ("File name inside the folder", "文件夹内的文件名"),
+    ("Local path or adrive://instance/space/path source", "本地路径或 adrive://instance/space/path 源路径"),
+    ("Local path or adrive://instance/space/path destination", "本地路径或 adrive://instance/space/path 目标路径"),
+    ("Traverse folders recursively", "递归遍历文件夹"),
+    ("Include the source directory or prefix name under the destination path", "在目标路径下包含源目录或前缀名称"),
+    ("Include only paths matching this pattern during recursive transfers", "递归传输时仅包含匹配此模式的路径"),
+    ("Exclude paths matching this pattern during recursive transfers", "递归传输时排除匹配此模式的路径"),
+    ("Include only paths matching this pattern during recursive moves", "递归移动时仅包含匹配此模式的路径"),
+    ("Exclude paths matching this pattern during recursive moves", "递归移动时排除匹配此模式的路径"),
+    ("Include only paths matching this pattern", "仅包含匹配此模式的路径"),
+    ("Exclude paths matching this pattern", "排除匹配此模式的路径"),
+    ("Allow overwrite/delete operations without interactive confirmation", "允许覆盖/删除操作，无需交互确认"),
+    ("Fail when the destination already exists", "目标已存在时失败"),
+    ("Fail when the destination file already exists", "目标文件已存在时失败"),
+    ("Destination overwrite strategy", "目标覆盖策略"),
+    ("Enable resumable upload/download or recursive item checkpointing", "启用可恢复上传/下载或递归项目 checkpoint"),
+    ("Directory for transfer checkpoint state", "传输 checkpoint 状态目录"),
+    ("Directory reserved for transfer checkpoint state", "为传输 checkpoint 状态预留的目录"),
+    ("File size threshold for checkpoint multipart/range transfer", "checkpoint 分片/范围传输的文件大小阈值"),
+    ("Throttle upload/download bandwidth, e.g. 100MB", "限制上传/下载带宽，例如 100MB"),
+    ("Maximum files/items running concurrently in batch execution", "批量执行时并发运行的最大文件/项目数"),
+    ("Maximum folder prefixes listed concurrently in recursive batch commands", "递归批量命令中并发列出的最大文件夹前缀数"),
+    ("Maximum parts/ranges running concurrently for one large file", "单个大文件并发运行的最大分片/范围数"),
+    ("Progress granularity: part or byte", "进度粒度：part 或 byte"),
+    ("Enable execution progress output on stderr", "在 stderr 启用执行进度输出"),
+    ("Disable execution progress output on stderr", "在 stderr 禁用执行进度输出"),
+    ("Enable listing-phase echo output on stderr", "在 stderr 启用列举阶段回显"),
+    ("Disable listing-phase echo output on stderr", "在 stderr 禁用列举阶段回显"),
+    ("Write planned transfer manifest CSV base path", "写入计划传输 manifest CSV 基础路径"),
+    ("Disable planned manifest output", "禁用计划 manifest 输出"),
+    ("Write success/failure report CSV base path", "写入成功/失败报告 CSV 基础路径"),
+    ("Write only failed items to the batch report", "批量报告中仅写入失败项目"),
+    // Create/delete parameters.
+    ("adrive://instance-name or adrive://instance-id/space-name target", "adrive://instance-name 或 adrive://instance-id/space-name 目标"),
+    ("Instance name to create, or existing instance ID when --space is set", "要创建的 Instance 名称；设置 --space 时为现有 Instance ID"),
+    ("Space name to create under --instance", "在 --instance 下创建的 Space 名称"),
+    ("Instance service type: saas, paas, or arkclaw; default is arkclaw for AK/SK and paas for OAuth", "Instance 服务类型：saas、paas 或 arkclaw；AK/SK 默认 arkclaw，OAuth 默认 paas"),
+    ("Display name for the created instance or space", "所创建 Instance 或 Space 的显示名称"),
+    ("Description for the created instance or space", "所创建 Instance 或 Space 的描述"),
+    ("Enable search indexing for a newly-created space", "为新创建的 Space 启用搜索索引"),
+    ("Space owner type: user or group; OAuth defaults to user and group requires --owner-id", "Space 所有者类型：user 或 group；OAuth 默认为 user，group 需要 --owner-id"),
+    ("Space owner identifier; OAuth user ownership defaults to the logged-in user_id, while OAuth group ownership requires this option", "Space 所有者标识符；OAuth user 所有权默认为已登录 user_id，OAuth group 所有权需要此选项"),
+    ("adrive://instance-id or adrive://instance-id/space-id target", "adrive://instance-id 或 adrive://instance-id/space-id 目标"),
+    ("Instance ID to delete, or containing instance ID when --space is set", "要删除的 Instance ID；设置 --space 时为其所属 Instance ID"),
+    ("Space ID to delete under --instance", "在 --instance 下删除的 Space ID"),
+    ("Required safety gate for destructive deletion; non-interactive critical execution also requires global --confirm <target>", "破坏性删除的必需安全门；非交互 critical 执行还需要全局 --confirm <target>"),
+    ("adrive://instance/space/folder[/file] target", "adrive://instance/space/folder[/file] 目标"),
+    ("Delete folders recursively when supported", "在支持时递归删除文件夹"),
+    ("Recursive folder delete strategy: bottom-up or direct", "递归文件夹删除策略：bottom-up 或 direct"),
+    ("Include only paths matching this pattern during bottom-up recursive deletes", "自底向上递归删除时仅包含匹配此模式的路径"),
+    ("Exclude paths matching this pattern during bottom-up recursive deletes", "自底向上递归删除时排除匹配此模式的路径"),
+    ("Also abort incomplete multipart uploads recorded in ADrive checkpoints matching the target", "同时中止 ADrive checkpoint 中与目标匹配的未完成分片上传"),
+    ("Checkpoint directory to scan when include-uploads is enabled", "启用 include-uploads 时扫描的 checkpoint 目录"),
+    ("Maximum files/items running concurrently in this batch delete", "本次批量删除中并发运行的最大文件/项目数"),
+    ("Maximum folder prefixes listed concurrently in recursive batch deletes", "递归批量删除中并发列出的最大文件夹前缀数"),
+    ("Write planned delete manifest CSV base path", "写入计划删除 manifest CSV 基础路径"),
+    // Listing, statistics, and stdin parameters.
+    ("Optional adrive://instance[/space[/folder]] target", "可选的 adrive://instance[/space[/folder]] 目标"),
+    ("List spaces under this instance when space is omitted", "省略 space 时列出此 Instance 下的 Space"),
+    ("List files under this space when provided", "提供时列出此 Space 下的文件"),
+    ("Folder prefix for file listing", "文件列举的文件夹前缀"),
+    ("Maximum entries to return from the current directory level", "当前目录层级返回的最大条目数"),
+    ("Pagination marker returned by a previous listing", "上一次列举返回的分页 marker"),
+    ("OAuth Space collection: user (default) or group", "OAuth Space 集合：user（默认）或 group"),
+    ("Comma-separated table/csv columns", "逗号分隔的 table/csv 列"),
+    ("Sort field", "排序字段"),
+    ("Render human-readable sizes", "以人类可读格式显示大小"),
+    ("Optionally write listing manifest CSV base path", "可选写入列举 manifest CSV 基础路径"),
+    ("Optional adrive://instance/space/folder target", "可选的 adrive://instance/space/folder 目标"),
+    ("Maximum directory aggregation depth", "最大目录聚合深度"),
+    ("Render human-readable total size", "以人类可读格式显示总大小"),
+    ("Include estimated monthly storage cost by storage class", "包含按存储类型估算的每月存储成本"),
+    ("Override storage price as CLASS=PRICE in CNY/GB/month", "以 CLASS=PRICE 覆盖存储价格，单位 CNY/GB/月"),
+    ("Enable traversal echo output", "启用遍历回显输出"),
+    ("Disable traversal echo output", "禁用遍历回显输出"),
+    ("Legacy alias to enable traversal echo when list echo flags are absent", "未提供 list echo flags 时启用遍历回显的旧版别名"),
+    ("Legacy alias to disable traversal echo when list echo flags are absent", "未提供 list echo flags 时禁用遍历回显的旧版别名"),
+    ("Maximum folder prefixes listed concurrently while measuring recursively", "递归统计时并发列出的最大文件夹前缀数"),
+    ("Number of largest and oldest file samples to keep in verbose diagnostics; 0 disables samples", "verbose 诊断中保留的最大和最旧文件样本数；0 禁用样本"),
+    ("Optionally write traversed-file manifest CSV base path", "可选写入已遍历文件 manifest CSV 基础路径"),
+    ("Name glob or substring", "名称 glob 或子字符串"),
+    ("Size predicate such as +100MB or -1GB", "大小条件，例如 +100MB 或 -1GB"),
+    ("Relative modified time predicate such as -7d", "相对修改时间条件，例如 -7d"),
+    ("Optionally write matched-file manifest CSV base path", "可选写入匹配文件 manifest CSV 基础路径"),
+    ("ADrive destination URI: adrive://instance/space/path", "ADrive 目标 URI：adrive://instance/space/path"),
+    ("Content-Type for uploaded stdin", "上传 stdin 的 Content-Type"),
+    ("Stdin size threshold for multipart upload; defaults to shared checkpoint_threshold", "stdin 分片上传的大小阈值；默认为共享 checkpoint_threshold"),
+    ("Create parent folders as needed", "按需创建父文件夹"),
+    // Sync, API, MCP, authentication, and common schema parameters.
+    ("Delete extraneous destination files/folders", "删除目标中多余的文件/文件夹"),
+    ("Required safety gate when --delete is enabled", "启用 --delete 时的必需安全门"),
+    ("Compare by size only", "仅按大小比较"),
+    ("Use exact timestamps for comparison", "使用精确时间戳比较"),
+    ("IDS API group", "IDS API 分组"),
+    ("IDS API action", "IDS API 操作"),
+    ("JSON request body or file:// path", "JSON 请求体或 file:// 路径"),
+    ("Reserved for future ADrive raw API execution; currently unimplemented", "为未来 ADrive 原始 API 执行保留；当前尚未实现"),
+    ("Shell name: bash, zsh, fish, or powershell", "Shell 名称：bash、zsh、fish 或 powershell"),
+    ("Enable the long-running MCP runtime", "启用长时间运行的 MCP runtime"),
+    ("MCP transport: stdio or sse", "MCP 传输方式：stdio 或 sse"),
+    ("SSE port; runtime binds 127.0.0.1:<port>", "SSE 端口；runtime 绑定 127.0.0.1:<port>"),
+    ("Inspect authentication status or manage OAuth. Unified uses the same-name external profile, ignores local AK/SK and OAuth credentials, and delegates login/logout to `ve login` / `ve logout`", "查看鉴权状态或管理 OAuth。Unified 使用同名外部 profile，忽略本地 AK/SK 和 OAuth 凭证，并将登录/登出交由 `ve login` / `ve logout`"),
+    ("Per-invocation override: --auth-mode <MODE>; supported values are aksk, oauth, or unified. ADRIVE_AUTH_MODE supplies the environment value", "单次调用覆盖：--auth-mode <MODE>；支持值为 aksk、oauth 或 unified。环境变量由 ADRIVE_AUTH_MODE 提供"),
+    ("Authentication action: status (default), login, or logout", "鉴权操作：status（默认）、login 或 logout"),
+    ("OAuth login Instance; required unless the selected profile or ADRIVE_DEFAULT_INSTANCE supplies it", "OAuth 登录 Instance；除非所选 profile 或 ADRIVE_DEFAULT_INSTANCE 已提供，否则必填"),
+    ("OAuth Authorization Server for login; required unless the selected profile or ADRIVE_AUTH_ENDPOINT supplies it", "OAuth 登录授权服务器；除非所选 profile 或 ADRIVE_AUTH_ENDPOINT 已提供，否则必填"),
+    ("Human-readable device name shown during OAuth authorization", "OAuth 授权期间显示的人类可读设备名称"),
+    ("Unified uses the same-name external profile, ignores local AK/SK and OAuth credentials, and delegates login/logout to `ve login` / `ve logout`", "Unified 使用同名外部 profile，忽略本地 AK/SK 和 OAuth 凭证，并将登录/登出交由 `ve login` / `ve logout`"),
+    ("Execute the CLI command; false returns a plan only", "执行 CLI 命令；false 时仅返回计划"),
+    ("Pass global --dry-run to the CLI command", "向 CLI 命令传递全局 --dry-run"),
+    ("Pass global --describe to the CLI command", "向 CLI 命令传递全局 --describe"),
+    ("Configuration profile name", "配置 profile 名称"),
+    ("Output format, defaults to json", "输出格式，默认为 json"),
+    ("Optional global region override", "可选的全局 region 覆盖"),
+    ("Optional global endpoint override", "可选的全局 endpoint 覆盖"),
+    ("Include extra diagnostic output where supported", "在支持时包含额外诊断输出"),
+    ("Disable prompts and progress output", "禁用提示和进度输出"),
+    // Describe-only metadata phrases.
+    ("Quote paths and JSON/JMESPath expressions that contain shell metacharacters.", "包含 shell 元字符的路径和 JSON/JMESPath 表达式需要加引号。"),
+    ("The command returns an Envelope; extract payload fields from data.*.", "命令返回 Envelope；请从 data.* 提取负载字段。"),
+    ("Generate shell completion scripts and installation snippets for ADrive CLI names.", "为 ADrive CLI 名称生成 shell 补全脚本和安装片段。"),
+    ("Start the registry-backed ADrive MCP server.", "启动由 registry 支持的 ADrive MCP 服务。"),
+    ("List ADrive skill metadata from the live registry.", "列出 live registry 中的 ADrive Skill 元数据。"),
+    ("Export ADrive Markdown SKILL.md files for external consumers.", "为外部使用者导出 ADrive Markdown SKILL.md 文件。"),
+    ("Documentation language for generated skill metadata: en (default) or zh", "生成 Skill 元数据的文档语言：en（默认）或 zh"),
+    ("Optional skill name, command path, or business domain filter", "可选的 Skill 名称、命令路径或业务域过滤器"),
+    ("Output directory for exported Markdown skill files", "导出 Markdown Skill 文件的输出目录"),
+    ("Documentation language for generated SKILL.md files: en (default) or zh", "生成 SKILL.md 文件的文档语言：en（默认）或 zh"),
+    // High-level and utility Describe routing prose; examples stay untouched.
+    ("accept adrive://instance/space/path URI or --instance/--space/--folder/--file flags; --by-name resolves instance/space names to IDs before execution", "接受 adrive://instance/space/path URI 或 --instance/--space/--folder/--file flags；--by-name 在执行前将 instance/space 名称解析为 ID"),
+    ("returns a deterministic plan without mutating local files or ADrive resources", "返回确定性计划，不修改本地文件或 ADrive 资源"),
+    ("success and failure paths use Envelope plus --query and multi-format rendering", "成功和失败路径使用 Envelope，并支持 --query 与多格式渲染"),
+    ("execution stderr; auto-enabled on TTY, disabled by --no-progress or --quiet, forced by --progress", "执行进度输出到 stderr；TTY 上自动启用，--no-progress 或 --quiet 禁用，--progress 强制启用"),
+    ("listing stderr; auto-enabled on TTY, disabled by --no-list-echo or --quiet, forced by --list-echo", "列举回显输出到 stderr；TTY 上自动启用，--no-list-echo 或 --quiet 禁用，--list-echo 强制启用"),
+    ("stable task fingerprint plus atomic lock when the command supports checkpoint state", "命令支持 checkpoint 状态时使用稳定任务指纹和原子锁"),
+    ("ADrive Low-Level CLI is not implemented; High-Level commands wrap IDS API actions directly", "ADrive Low-Level CLI 尚未实现；High-Level 命令直接封装 IDS API 操作"),
+    ("Quote ADrive paths that contain spaces or shell metacharacters: ve-adrive cp 'adrive://inst/space/path with space.txt' ./out.txt", "包含空格或 shell 元字符的 ADrive 路径需要加引号：ve-adrive cp 'adrive://inst/space/path with space.txt' ./out.txt"),
+    ("JMESPath literals inside --query use backticks; keep the expression inside single quotes in POSIX shells.", "--query 内的 JMESPath 字面量使用反引号；在 POSIX shell 中请将表达式放在单引号内。"),
+    ("Use --output json when piping ADrive output into jq or another parser.", "将 ADrive 输出通过管道传给 jq 或其他解析器时，请使用 --output json。"),
+    ("the command returns an Envelope; install by extracting data.script, then source bash output, add ~/.zfunc to zsh fpath and run compinit, write fish output under ~/.config/fish/completions, or append PowerShell output to $PROFILE", "命令返回 Envelope；安装时提取 data.script，然后 source bash 输出、将 ~/.zfunc 加入 zsh fpath 并运行 compinit、把 fish 输出写入 ~/.config/fish/completions，或把 PowerShell 输出追加到 $PROFILE"),
+    ("generated scripts register ve-adrive-cli and ve-adrive", "生成的脚本会注册 ve-adrive-cli 和 ve-adrive"),
+    ("Instance: AK/SK defaults --service-type to arkclaw and OAuth defaults it to paas. Space: OAuth user Space ownership defaults to the logged-in user_id; --owner-type group requires --owner-id.", "Instance：AK/SK 的 --service-type 默认为 arkclaw，OAuth 默认为 paas。Space：OAuth user Space 所有权默认为已登录 user_id；--owner-type group 需要 --owner-id。"),
+    ("critical delete paths require --force and, in non-interactive shells, exact --confirm <deleted-source-or-target>", "critical 删除路径需要 --force；在非交互 shell 中还需要精确的 --confirm <deleted-source-or-target>"),
+    ("AK/SK no target -> list_instances collection; OAuth no target -> the credentials-bound single Instance, missing binding -> oauth_instance_required, and OAuth root rejects --marker; AK/SK instance target -> list_spaces; OAuth instance target -> list_my_spaces and --owner-type group -> list_my_group_spaces; instance/space[/folder] target -> list_files", "AK/SK 无目标 -> list_instances 集合；OAuth 无目标 -> 凭证绑定的单个 Instance，缺少绑定 -> oauth_instance_required，且 OAuth 根路径拒绝 --marker；AK/SK instance 目标 -> list_spaces；OAuth instance 目标 -> list_my_spaces，--owner-type group -> list_my_group_spaces；instance/space[/folder] 目标 -> list_files"),
+    ("instance listing returns data.instances; space listing returns data.spaces; JSON file listing returns raw data.files/data.folders; table/csv render a synthesized typed row view", "Instance 列举返回 data.instances；Space 列举返回 data.spaces；JSON 文件列举返回原始 data.files/data.folders；table/csv 渲染合成的类型化行视图"),
+    ("reads stdin and writes it to exactly one ADrive file target; pipe-friendly for cat | gzip | put", "读取 stdin 并写入恰好一个 ADrive 文件目标；适用于 cat | gzip | put 管道"),
+    ("stdin input at or above --multipart-threshold uses initiate_multipart_upload + upload_part + complete_multipart_upload; failures abort_multipart_upload", "达到或超过 --multipart-threshold 的 stdin 输入使用 initiate_multipart_upload + upload_part + complete_multipart_upload；失败时执行 abort_multipart_upload"),
+    ("rm accepts file/folder targets only; use ve-adrive del for instance or space deletion", "rm 仅接受文件/文件夹目标；删除 Instance 或 Space 请使用 ve-adrive del"),
+    ("bottom-up mode lists children then deletes files before folders; direct mode asks the service to delete the folder target", "bottom-up 模式先列出子项，再先删文件后删文件夹；direct 模式请求服务删除文件夹目标"),
+    ("sync --delete is critical: interactive shells may confirm or use --force; non-interactive shells require --force plus exact --confirm <destination>", "sync --delete 属于 critical：交互 shell 可确认或使用 --force；非交互 shell 需要 --force 和精确的 --confirm <destination>"),
+    ("stdio uses stdin/stdout and opens no TCP listener; sse starts a local rmcp HTTP/SSE listener on 127.0.0.1:<port>", "stdio 使用 stdin/stdout 且不打开 TCP listener；sse 在 127.0.0.1:<port> 启动本地 rmcp HTTP/SSE listener"),
+    ("MCP tools are rebuilt from the in-process skill registry; exported Markdown skill files are not read by serve", "MCP 工具由进程内 Skill registry 重建；serve 不读取导出的 Markdown Skill 文件"),
+    ("tools/call plans by default; include execute=true to run the underlying CLI command", "tools/call 默认生成计划；包含 execute=true 才运行底层 CLI 命令"),
+    ("Markdown SKILL.md pack with root index plus per-domain command skills", "包含根索引和按域命令 Skill 的 Markdown SKILL.md 包"),
+    ("external Agent catalogs, prompt context, documentation generators, adapters, and MCP tool advertisement", "外部 Agent 目录、prompt 上下文、文档生成器、适配器和 MCP 工具声明"),
+    ("serve uses the same live registry data but does not read the exported Markdown skill directory", "serve 使用相同的 live registry 数据，但不读取导出的 Markdown Skill 目录"),
+    // [Review Fix #ADriveZh5] Root/config/raw Describe and Skill usage prose
+    // lives outside capability rows but must share the exact owner catalog.
+    ("ADrive CLI high-level file operations and agent utilities", "ADrive CLI 高层文件操作与 Agent 工具"),
+    ("File management operations with adrive:// URI and flag targets", "使用 adrive:// URI 和 flags 目标的文件管理操作"),
+    ("Discovery, configuration, diagnostics, completion, skill, API passthrough, and MCP utilities", "发现、配置、诊断、补全、Skill、API passthrough 和 MCP 工具"),
+    ("Guarded ADrive utility API planning; direct raw execution is not implemented yet", "受保护的 ADrive 工具 API 规划；暂不支持直接执行原始 API"),
+    ("Configuration management", "配置管理"),
+    ("Initialize configuration", "初始化配置"),
+    ("Show effective configuration", "显示生效配置"),
+    ("Set configuration value", "设置配置值"),
+    ("Derived from the live ADrive CLI capability registry.", "源自 live ADrive CLI capability registry。"),
+    ("Portable Markdown skill pack for external agents, documentation generators, prompts, or adapters. The built-in MCP server rebuilds tools from the in-process registry instead of reading exported files.", "供外部 Agent、文档生成器、prompt 或适配器使用的 portable Markdown Skill 包。内置 MCP 服务从进程内 registry 重建工具，不读取导出文件。"),
+    ("tools/call returns a plan by default; include argument execute=true to run the underlying CLI command.", "tools/call 默认返回计划；包含参数 execute=true 才运行底层 CLI 命令。"),
+];
+
 const ADRIVE_HIGH_LEVEL_SEMANTICS: &[(&str, &[&str])] = &[
     (
         "cp",
@@ -126,8 +330,8 @@ const ADRIVE_HIGH_LEVEL_SEMANTICS: &[(&str, &[&str])] = &[
     (
         "crt",
         &[
-            "adrive://instance -> create_instance",
-            "adrive://instance/space -> create_space",
+            "adrive://instance -> create_instance; --service-type accepts saas, paas, or arkclaw, defaulting to arkclaw for AK/SK and paas for OAuth",
+            "adrive://instance/space -> create_space; OAuth defaults to user ownership with the logged-in user_id, while --owner-type group requires --owner-id",
         ],
     ),
     (
@@ -146,11 +350,15 @@ const ADRIVE_HIGH_LEVEL_SEMANTICS: &[(&str, &[&str])] = &[
             "critical deletes require --force plus exact --confirm <target> in non-interactive shells",
         ],
     ),
+    // [Review Fix #1] Root and Instance listing routes depend on the selected
+    // authentication mode and must remain explicit for capability consumers.
     (
         "ls",
         &[
-            "no target -> list_instances",
-            "--instance or adrive://instance -> list_spaces",
+            "AK/SK no target -> list_instances collection",
+            "OAuth no target -> the credentials-bound single Instance; missing binding -> oauth_instance_required; OAuth root rejects --marker",
+            "AK/SK instance target -> list_spaces",
+            "OAuth instance target -> list_my_spaces; --owner-type group -> list_my_group_spaces",
             "--instance + --space or adrive://instance/space[/folder] -> list_files",
         ],
     ),
@@ -470,6 +678,8 @@ fn compact_capability(row: &CapabilityRow) -> Value {
         "risk_level": row.risk_level,
         "destructive": row.destructive,
         "supports_force": row.supports_force,
+        // [Review Fix #3] Registry metadata is authoritative; the previous
+        // hand-written allowlist incorrectly reported auth describe as false.
         "supports_dry_run": row.supports_dry_run,
         "api_actions": row.api_actions,
     })
@@ -504,12 +714,22 @@ pub async fn handle_api_command(global: &GlobalArgs, args: &ApiArgs) -> Result<i
             .unwrap_or_else(
                 || json!({"command": "ve-adrive api", "mode": "guarded_utility_passthrough"}),
             );
-        let desc = json!({
-            "command": command,
-            "description": format!(
+        let description = if global.uses_chinese_documentation() {
+            // [Review Fix #GlobalZh5] Preserve the dynamic API identifiers and
+            // localize only the fixed prose surrounding them.
+            format!(
+                "受保护的 ADrive 工具 API 规划：{}.{}；暂不支持直接执行原始 API",
+                args.group, args.action
+            )
+        } else {
+            format!(
                 "Guarded ADrive utility API planning for {}.{}; direct raw execution is not implemented yet",
                 args.group, args.action
-            ),
+            )
+        };
+        let mut desc = json!({
+            "command": command,
+            "description": description,
             "service": "ids",
             "capability": capability,
             "mode": "guarded_utility_passthrough",
@@ -518,6 +738,9 @@ pub async fn handle_api_command(global: &GlobalArgs, args: &ApiArgs) -> Result<i
             "supports_dry_run": true,
             "supports_force": false,
         });
+        if global.uses_chinese_documentation() {
+            localize_adrive_auth_documentation_zh(&mut desc);
+        }
         output_result(global, &Envelope::success(command, desc))?;
         return Ok(0);
     }
@@ -650,17 +873,33 @@ fn skill_definitions_for_language(language: DocumentationLanguage) -> Vec<SkillD
         for definition in &mut definitions {
             definition.description = localized_skill_description_zh(definition);
             definition.input_schema = localized_input_schema(&definition.input_schema, language);
+            // [Review Fix #ADriveZh6] Skill usage is human-facing metadata too;
+            // localizing only descriptions and schemas leaves Chinese output mixed.
+            definition.usage = localized_skill_usage_zh(&definition.usage);
         }
     }
     definitions
 }
 
+fn localized_skill_usage_zh(usage: &SkillUsage) -> SkillUsage {
+    SkillUsage {
+        format: usage.format,
+        source: adrive_metadata_translation_zh(usage.source)
+            .expect("owner audit guarantees Skill usage source"),
+        mcp_tool_name: usage.mcp_tool_name.clone(),
+        mcp_server: usage.mcp_server.clone(),
+        serve_reads_exported_files: usage.serve_reads_exported_files,
+        exported_file_use: adrive_metadata_translation_zh(usage.exported_file_use)
+            .expect("owner audit guarantees exported-file usage"),
+        default_mcp_call: adrive_metadata_translation_zh(usage.default_mcp_call)
+            .expect("owner audit guarantees MCP call usage"),
+    }
+}
+
 fn localized_skill_description_zh(skill: &SkillDefinition) -> String {
-    format!(
-        "用于调用 `{}`。原始英文说明：{}",
-        public_adrive_command(&skill.command),
-        skill.description
-    )
+    adrive_metadata_translation_zh(&skill.description)
+        .expect("owner audit guarantees every ADrive skill description")
+        .to_string()
 }
 
 fn localized_input_schema(schema: &Value, language: DocumentationLanguage) -> Value {
@@ -677,11 +916,13 @@ fn localize_schema_descriptions_zh(value: &Value) -> Value {
             for (key, child) in map {
                 if key == "description" {
                     if let Some(description) = child.as_str() {
-                        // [Review Fix #ZhDocs1] 中文 skill 文档不能只翻译章节标题；
-                        // schema 参数说明也包装成中文，保留原文避免误译命令契约。
                         localized.insert(
                             key.clone(),
-                            Value::String(format!("参数说明：{description}")),
+                            Value::String(
+                                adrive_metadata_translation_zh(description)
+                                    .expect("owner audit guarantees every schema description")
+                                    .to_string(),
+                            ),
                         );
                         continue;
                     }
@@ -698,6 +939,151 @@ fn localize_schema_descriptions_zh(value: &Value) -> Value {
         ),
         _ => value.clone(),
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ADriveMetadataContext {
+    Structured,
+    HumanText,
+    HumanContainer,
+    ScenarioRouting,
+    Usage,
+    Machine,
+}
+
+/// Localize frozen ADrive human prose inside describe metadata.
+///
+/// Machine-readable keys, identifiers, enum literals, examples, commands,
+/// and error codes are preserved even when their value matches prose in the
+/// owner catalog.
+pub fn localize_adrive_auth_documentation_zh(value: &mut Value) {
+    localize_adrive_metadata_value_zh(value, ADriveMetadataContext::Structured);
+}
+
+fn localize_adrive_metadata_value_zh(value: &mut Value, context: ADriveMetadataContext) {
+    match value {
+        Value::String(text) if context == ADriveMetadataContext::HumanText => {
+            if let Some(chinese) = adrive_metadata_translation_zh(text) {
+                *text = chinese.to_string();
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                let item_context = adrive_array_item_context(context, item);
+                localize_adrive_metadata_value_zh(item, item_context);
+            }
+        }
+        Value::Object(map) => {
+            for (key, child) in map {
+                let child_context = adrive_child_metadata_context(context, key, child);
+                localize_adrive_metadata_value_zh(child, child_context);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn adrive_array_item_context(parent: ADriveMetadataContext, item: &Value) -> ADriveMetadataContext {
+    match (parent, item) {
+        (ADriveMetadataContext::Machine, _) => ADriveMetadataContext::Machine,
+        (ADriveMetadataContext::HumanContainer, Value::String(_))
+        | (ADriveMetadataContext::ScenarioRouting, Value::String(_)) => {
+            ADriveMetadataContext::HumanText
+        }
+        (ADriveMetadataContext::HumanContainer, _) => ADriveMetadataContext::HumanContainer,
+        (ADriveMetadataContext::ScenarioRouting, _) => ADriveMetadataContext::ScenarioRouting,
+        _ => ADriveMetadataContext::Structured,
+    }
+}
+
+fn adrive_child_metadata_context(
+    parent: ADriveMetadataContext,
+    key: &str,
+    value: &Value,
+) -> ADriveMetadataContext {
+    // [Review Fix #ADriveZh8] Production and owner audits share this key-aware
+    // policy so catalog collisions can never rewrite machine metadata.
+    if parent == ADriveMetadataContext::Machine {
+        return ADriveMetadataContext::Machine;
+    }
+    if key == "description" && value.is_string() {
+        return ADriveMetadataContext::HumanText;
+    }
+    if is_adrive_machine_metadata_key(key) {
+        return ADriveMetadataContext::Machine;
+    }
+    match parent {
+        ADriveMetadataContext::ScenarioRouting => scenario_routing_context(key, value),
+        ADriveMetadataContext::HumanContainer => human_container_context(key, value),
+        ADriveMetadataContext::Usage => usage_metadata_context(key, value),
+        _ => structured_metadata_context(key, value),
+    }
+}
+
+fn scenario_routing_context(key: &str, value: &Value) -> ADriveMetadataContext {
+    if key == "mode_resolution" {
+        ADriveMetadataContext::Machine
+    } else if value.is_string() {
+        ADriveMetadataContext::HumanText
+    } else {
+        ADriveMetadataContext::ScenarioRouting
+    }
+}
+
+fn human_container_context(key: &str, value: &Value) -> ADriveMetadataContext {
+    if is_adrive_machine_metadata_key(key) {
+        ADriveMetadataContext::Machine
+    } else if value.is_string() {
+        ADriveMetadataContext::HumanText
+    } else {
+        ADriveMetadataContext::HumanContainer
+    }
+}
+
+fn usage_metadata_context(key: &str, value: &Value) -> ADriveMetadataContext {
+    if matches!(key, "source" | "exported_file_use" | "default_mcp_call") && value.is_string() {
+        ADriveMetadataContext::HumanText
+    } else {
+        ADriveMetadataContext::Machine
+    }
+}
+
+fn structured_metadata_context(key: &str, value: &Value) -> ADriveMetadataContext {
+    match key {
+        "scenario_routing" => ADriveMetadataContext::ScenarioRouting,
+        "shell_quoting_tips" | "notes" | "guidance" | "recovery" => {
+            if value.is_string() {
+                ADriveMetadataContext::HumanText
+            } else {
+                ADriveMetadataContext::HumanContainer
+            }
+        }
+        "usage" => ADriveMetadataContext::Usage,
+        _ => ADriveMetadataContext::Structured,
+    }
+}
+
+fn is_adrive_machine_metadata_key(key: &str) -> bool {
+    matches!(
+        key,
+        "api"
+            | "code"
+            | "command"
+            | "enum"
+            | "examples"
+            | "id"
+            | "method"
+            | "name"
+            | "path"
+            | "type"
+            | "uri"
+    )
+}
+
+fn adrive_metadata_translation_zh(text: &str) -> Option<&'static str> {
+    ADRIVE_METADATA_TRANSLATIONS_ZH
+        .iter()
+        .find_map(|(english, chinese)| (*english == text).then_some(*chinese))
 }
 
 fn public_capability_row(row: &CapabilityRow) -> Value {
@@ -1268,6 +1654,9 @@ pub async fn handle_config_command(
                         if let Some(ref f) = eff.auth_mode {
                             push_traced_row(&mut rows, eff, "auth_mode", f);
                         }
+                        if let Some(ref f) = eff.auth_endpoint {
+                            push_traced_row(&mut rows, eff, "auth_endpoint", f);
+                        }
                         push_traced_row(&mut rows, eff, "region", &eff.region);
                         push_traced_row(&mut rows, eff, "endpoint", &eff.endpoint);
                         push_traced_row(&mut rows, eff, "checkpoint_dir", &eff.checkpoint_dir);
@@ -1694,6 +2083,11 @@ fn describe_config_group() -> Value {
 /// Returns `None` when `command_path` is not an ADrive meta command handled by
 /// this module.
 pub fn describe_adrive_command_metadata(command_path: &str) -> Option<Value> {
+    // [Review Fix #ADriveZh7] Config actions bypass capability rows, so expose
+    // their owned descriptions through the same Describe localization path.
+    if let Some(description) = describe_config_action(command_path) {
+        return Some(description);
+    }
     let registry_command = match command_path {
         "ve-adrive skill list" | "ve-adrive skill export" => "ve-adrive skill",
         other => other,
@@ -1705,7 +2099,7 @@ pub fn describe_adrive_command_metadata(command_path: &str) -> Option<Value> {
         "layer": "meta",
         "description": describe_meta_command_description(command_path, row.description),
         "risk_level": row.risk_level,
-        "supports_dry_run": matches!(command_path, "ve-adrive serve" | "ve-adrive skill export"),
+        "supports_dry_run": row.supports_dry_run,
         "supports_pipe": false,
         "parameters": parameters,
         "scenario_routing": describe_meta_scenario_routing(command_path),
@@ -1723,6 +2117,23 @@ pub fn describe_adrive_command_metadata(command_path: &str) -> Option<Value> {
             "Quote paths and JSON/JMESPath expressions that contain shell metacharacters.",
             "The command returns an Envelope; extract payload fields from data.*."
         ],
+    }))
+}
+
+fn describe_config_action(command_path: &str) -> Option<Value> {
+    let description = match command_path {
+        "ve-adrive config init" => "Initialize configuration",
+        "ve-adrive config show" => "Show effective configuration",
+        "ve-adrive config set" => "Set configuration value",
+        _ => return None,
+    };
+    Some(json!({
+        "command": command_path,
+        "description": description,
+        "kind": "command",
+        "layer": "meta",
+        "supports_describe": true,
+        "supports_help": true,
     }))
 }
 
@@ -1799,12 +2210,34 @@ fn describe_meta_parameter(name: &str, required: bool, description: &str, locati
 fn describe_meta_scenario_routing(command_path: &str) -> Value {
     let mut routing = base_meta_scenario_routing();
     match command_path {
+        "ve-adrive crt" => insert_create_routing(&mut routing),
+        "ve-adrive auth" => insert_auth_routing(&mut routing),
         "ve-adrive completion" => insert_completion_routing(&mut routing),
         "ve-adrive serve" => insert_serve_routing(&mut routing),
         "ve-adrive skill list" | "ve-adrive skill export" => insert_skill_routing(&mut routing),
         _ => {}
     }
     Value::Object(routing)
+}
+
+fn insert_auth_routing(routing: &mut serde_json::Map<String, Value>) {
+    routing.insert(
+        "mode_resolution".to_string(),
+        json!("--auth-mode <MODE> > profile auth_mode > ADRIVE_AUTH_MODE > aksk"),
+    );
+    routing.insert(
+        "unified_identity".to_string(),
+        json!("Unified uses the same-name external profile, ignores local AK/SK and OAuth credentials, and delegates login/logout to `ve login` / `ve logout`"),
+    );
+}
+
+fn insert_create_routing(routing: &mut serde_json::Map<String, Value>) {
+    routing.insert(
+        "create_defaults".to_string(),
+        json!(
+            "Instance: AK/SK defaults --service-type to arkclaw and OAuth defaults it to paas. Space: OAuth user Space ownership defaults to the logged-in user_id; --owner-type group requires --owner-id."
+        ),
+    );
 }
 
 fn base_meta_scenario_routing() -> serde_json::Map<String, Value> {
@@ -1867,6 +2300,13 @@ fn insert_skill_routing(routing: &mut serde_json::Map<String, Value>) {
 
 fn describe_meta_examples(command_path: &str) -> Vec<String> {
     match command_path {
+        "ve-adrive auth" => vec![
+            public_adrive_command("ve-adrive auth status"),
+            public_adrive_command("ve-adrive --profile default --auth-mode unified auth status"),
+            public_adrive_command("ve-adrive config set auth_mode unified"),
+            "ve login".to_string(),
+            "ve logout".to_string(),
+        ],
         "ve-adrive completion" => vec![
             public_adrive_command("ve-adrive completion bash --output json"),
             format!(
@@ -2061,6 +2501,18 @@ fn serve_plan(args: &ServeArgs) -> Result<Value, CliError> {
         "tcp_listener": is_sse,
         "bind": is_sse.then(|| format!("127.0.0.1:{}", args.port)),
         "endpoints": if is_sse { vec!["/sse", "/message"] } else { Vec::new() },
+        "authentication": if is_sse { "ephemeral_bearer" } else { "process_stdio" },
+        "token_output": is_sse.then_some("stderr_once_after_bind"),
+        "authorization_header_required": is_sse,
+        "allowed_hosts": if is_sse {
+            vec![
+                format!("127.0.0.1:{}", args.port),
+                format!("localhost:{}", args.port),
+            ]
+        } else {
+            Vec::new()
+        },
+        "origin_policy": is_sse.then_some("missing_or_exact_http_loopback_origin_same_port"),
         "tool_source": "In-process ADrive skill registry; exported Markdown skill files are not read by serve.",
         "call_semantics": "tools/call plans by default; include execute=true to run the underlying CLI command.",
         "capabilities": capabilities().len(),
@@ -2392,6 +2844,8 @@ struct DoctorCheck {
     name: &'static str,
     status: &'static str,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fix_command: Option<String>,
     details: Value,
 }
 
@@ -2496,22 +2950,18 @@ async fn build_doctor_checks(
     args: &DoctorArgs,
 ) -> Result<Vec<DoctorCheck>, CliError> {
     let selected = args.check.as_deref();
+    let auth_context = doctor_auth_context(global, auth, selected);
     let mut checks = Vec::new();
-    maybe_push_check_result(&mut checks, selected, "config", || config_check(global));
-    maybe_push_check_result(&mut checks, selected, "auth", || auth_check(global, auth));
+    if doctor_check_selected(selected, "config") {
+        checks.push(config_doctor_check(global, &auth_context));
+    }
+    if doctor_check_selected(selected, "auth") {
+        checks.push(auth_doctor_check(global, &auth_context).await);
+    }
     maybe_push_check(&mut checks, selected, "registry", registry_check);
     // network_check is async because --live-network performs a real HTTPS probe.
-    let is_network_selected = selected.map(|name| name == "network").unwrap_or(true);
-    if is_network_selected {
-        match network_check(global, args).await {
-            Ok(check) => checks.push(check),
-            Err(err) => checks.push(DoctorCheck {
-                name: "network",
-                status: "failed",
-                message: err.to_string(),
-                details: json!({ "recoverable": true }),
-            }),
-        }
+    if doctor_check_selected(selected, "network") {
+        checks.push(network_doctor_check(global, args, &auth_context).await);
     }
     maybe_push_check(&mut checks, selected, "mcp", mcp_check);
     maybe_push_check(&mut checks, selected, "completion", completion_check);
@@ -2527,6 +2977,82 @@ async fn build_doctor_checks(
         )));
     }
     Ok(checks)
+}
+
+enum DoctorAuthContext {
+    Ready(ResolvedAuthMode),
+    Failed(String),
+    NotNeeded,
+}
+
+impl DoctorAuthContext {
+    fn resolved(&self) -> Result<ResolvedAuthMode, &str> {
+        match self {
+            Self::Ready(resolved) => Ok(*resolved),
+            Self::Failed(message) => Err(message),
+            Self::NotNeeded => Err("doctor auth mode unavailable"),
+        }
+    }
+}
+
+fn doctor_auth_context(
+    global: &GlobalArgs,
+    auth: &ADriveAuthArgs,
+    selected: Option<&str>,
+) -> DoctorAuthContext {
+    // [Review Fix #5] Independent diagnostics do not parse authentication
+    // configuration; dependent checks retain resolution failures as rows.
+    if selected.is_some() && !matches!(selected, Some("auth" | "config" | "network")) {
+        return DoctorAuthContext::NotNeeded;
+    }
+    match crate::handler::common::resolve_auth_mode(global, auth.auth_mode) {
+        Ok(resolved) => DoctorAuthContext::Ready(resolved),
+        Err(error) => DoctorAuthContext::Failed(error.to_string()),
+    }
+}
+
+fn config_doctor_check(global: &GlobalArgs, context: &DoctorAuthContext) -> DoctorCheck {
+    match context.resolved() {
+        Ok(resolved) => config_check(global, resolved.mode)
+            .unwrap_or_else(|error| failed_doctor_check("config", error)),
+        Err(error) => failed_doctor_check("config", error),
+    }
+}
+
+async fn auth_doctor_check(global: &GlobalArgs, context: &DoctorAuthContext) -> DoctorCheck {
+    match context.resolved() {
+        Ok(resolved) => auth_check(global, resolved)
+            .await
+            .unwrap_or_else(|error| failed_doctor_check("auth", error)),
+        Err(error) => failed_doctor_check("auth", error),
+    }
+}
+
+async fn network_doctor_check(
+    global: &GlobalArgs,
+    args: &DoctorArgs,
+    context: &DoctorAuthContext,
+) -> DoctorCheck {
+    match context.resolved() {
+        Ok(resolved) => network_check(global, args, resolved.mode)
+            .await
+            .unwrap_or_else(|error| failed_doctor_check("network", error)),
+        Err(error) => failed_doctor_check("network", error),
+    }
+}
+
+fn failed_doctor_check(name: &'static str, error: impl std::fmt::Display) -> DoctorCheck {
+    DoctorCheck {
+        name,
+        status: "failed",
+        message: error.to_string(),
+        fix_command: None,
+        details: json!({ "recoverable": true }),
+    }
+}
+
+fn doctor_check_selected(selected: Option<&str>, name: &str) -> bool {
+    selected.map(|value| value == name).unwrap_or(true)
 }
 
 fn maybe_push_check<F>(
@@ -2545,40 +3071,32 @@ fn maybe_push_check<F>(
     }
 }
 
-fn maybe_push_check_result<F>(
-    checks: &mut Vec<DoctorCheck>,
-    selected: Option<&str>,
-    name: &'static str,
-    build: F,
-) where
-    F: FnOnce() -> Result<DoctorCheck, CliError>,
-{
-    let is_selected = selected.map(|n| n == name).unwrap_or(true);
-    if !is_selected {
-        return;
-    }
-    match build() {
-        Ok(check) => checks.push(check),
-        Err(err) => checks.push(DoctorCheck {
-            name,
-            status: "failed",
-            message: err.to_string(),
-            details: json!({ "recoverable": true }),
-        }),
-    }
-}
-
-fn config_check(global: &GlobalArgs) -> Result<DoctorCheck, CliError> {
+fn config_check(global: &GlobalArgs, mode: AuthMode) -> Result<DoctorCheck, CliError> {
     let path = global.config_path();
-    let profile = build_profile(global)?;
+    // [Review Fix #2] Once Doctor selects Unified, its non-auth checks must not
+    // reload or decrypt unselected local AK/SK credentials.
+    let profile = build_runtime_profile(global, mode)?;
+    let resolved = resolve_endpoint_and_region(profile.endpoint.clone(), profile.region.clone());
+    let is_resource_configured = resolved.is_ok();
+    let has_explicit_endpoint = profile
+        .endpoint
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let fix_command = (!is_resource_configured)
+        .then(|| resource_config_fix_command(has_explicit_endpoint).to_string());
     Ok(DoctorCheck {
         name: "config",
-        status: if profile.endpoint.is_some() || profile.region.is_some() {
+        status: if is_resource_configured {
             "passed"
         } else {
             "warning"
         },
-        message: "effective ADrive profile loaded".to_string(),
+        message: resolved
+            .as_ref()
+            .map(|_| "effective ADrive resource configuration loaded".to_string())
+            .unwrap_or_else(|error| error.to_string()),
+        fix_command,
         details: json!({
             "config_exists": path.exists(),
             "config_path": path.display().to_string(),
@@ -2588,46 +3106,276 @@ fn config_check(global: &GlobalArgs) -> Result<DoctorCheck, CliError> {
     })
 }
 
-fn auth_check(global: &GlobalArgs, auth: &ADriveAuthArgs) -> Result<DoctorCheck, CliError> {
-    let resolved = crate::handler::common::resolve_auth_mode(global, auth.auth_mode)?;
+async fn auth_check(
+    global: &GlobalArgs,
+    resolved: ResolvedAuthMode,
+) -> Result<DoctorCheck, CliError> {
+    if resolved.mode == AuthMode::Unified {
+        let inspection = inspect_unified_credentials_for_profile(&global.profile).await;
+        return Ok(unified_auth_doctor_check(
+            &global.profile,
+            resolved,
+            &inspection,
+        ));
+    }
     let credentials = inspect_selected_credentials(global, resolved.mode)?;
-    let status = if resolved.mode == AuthMode::Aksk && credentials.has_complete_aksk() {
+    let is_ready = credentials.is_ready();
+    let has_login_auth_endpoint = resolved.mode != AuthMode::Oauth
+        || crate::handler::auth::has_configured_login_auth_endpoint(global)?;
+    let client_id = (resolved.mode == AuthMode::Oauth).then(oauth_client_id_diagnostics);
+    let uses_process_access_token =
+        credentials.credential_source == "environment" && credentials.is_ready();
+    let has_client_id_warning =
+        client_id.is_some_and(|value| value.is_placeholder && !uses_process_access_token);
+    let status = if is_ready && !has_client_id_warning {
         "passed"
     } else {
         "warning"
     };
-    let message = if resolved.mode == AuthMode::Aksk && credentials.has_complete_aksk() {
-        "ADrive credentials are configured".to_string()
-    } else if resolved.mode == AuthMode::Oauth && credentials.has_oauth_token() {
-        "ADrive OAuth credentials are available; service integration is pending".to_string()
-    } else if resolved.mode == AuthMode::Oauth {
-        "ADrive OAuth credentials are not configured".to_string()
+    let credential_state = credential_state(resolved.mode, &credentials);
+    let fix_command = if resolved.mode == AuthMode::Oauth && !is_ready && !has_login_auth_endpoint {
+        Some("ve-adrive config set auth_endpoint <url>".to_string())
     } else {
-        "ADrive credentials are incomplete (check ADRIVE_ACCESS_KEY / ADRIVE_SECRET_KEY or config file)"
-            .to_string()
+        auth_fix_command(resolved.mode, &credentials, is_ready, has_client_id_warning)
     };
+    let message = if resolved.mode == AuthMode::Oauth && !is_ready && !has_login_auth_endpoint {
+        "ADrive OAuth Authorization Server is not configured".to_string()
+    } else {
+        auth_check_message(resolved.mode, &credentials, is_ready, has_client_id_warning)
+    };
+    let mut details = auth_check_details(resolved, &credentials, credential_state);
+    if let Some(details) = details.as_object_mut() {
+        details.insert(
+            "has_login_auth_endpoint".to_string(),
+            Value::Bool(has_login_auth_endpoint),
+        );
+    }
+    add_oauth_client_id_details(&mut details, client_id);
     Ok(DoctorCheck {
         name: "auth",
         status,
         message,
-        details: json!({
-            "mode": resolved.mode.as_str(),
-            "source": resolved.source.as_str(),
-            "has_access_key": credentials.has_access_key,
-            "has_secret_key": credentials.has_secret_key,
-            "has_security_token": credentials.has_security_token,
-            "has_access_token": credentials.has_access_token,
-            "has_refresh_token": credentials.has_refresh_token,
-            // [Review Fix #3] OAuth cannot be reported healthy before its
-            // resource-request integration is actually available.
-            "oauth_service_integration": credentials.oauth_service_integration,
-            "credential_source": credentials.credential_source,
-        }),
+        fix_command,
+        details,
     })
 }
 
-async fn network_check(global: &GlobalArgs, args: &DoctorArgs) -> Result<DoctorCheck, CliError> {
-    let profile = build_profile(global)?;
+fn unified_auth_doctor_check(
+    profile_name: &str,
+    resolved: crate::domain::auth::ResolvedAuthMode,
+    inspection: &UnifiedCredentialInspection,
+) -> DoctorCheck {
+    let mut details = json!({
+        "mode": resolved.mode.as_str(),
+        "source": resolved.source.as_str(),
+        "profile": profile_name,
+        "provider_name": inspection.provider_name,
+        "has_session_token": inspection.has_session_token,
+        "ready": inspection.ready,
+    });
+    if let (Some(details), Some(sdk_code)) = (details.as_object_mut(), inspection.sdk_code.as_ref())
+    {
+        details.insert("sdk_code".to_string(), json!(sdk_code));
+    }
+    DoctorCheck {
+        name: "auth",
+        status: if inspection.ready {
+            "passed"
+        } else {
+            "warning"
+        },
+        message: if inspection.ready {
+            "ADrive Unified credentials are ready".to_string()
+        } else {
+            "ADrive Unified credentials are unavailable; login is managed externally".to_string()
+        },
+        fix_command: (!inspection.ready).then(|| "ve login".to_string()),
+        details,
+    }
+}
+
+fn auth_fix_command(
+    mode: AuthMode,
+    credentials: &crate::domain::auth::CredentialAvailability,
+    is_ready: bool,
+    has_client_id_warning: bool,
+) -> Option<String> {
+    if is_ready || has_client_id_warning {
+        return None;
+    }
+    match mode {
+        AuthMode::Oauth => Some("ve-adrive auth login".to_string()),
+        AuthMode::Unified => Some("ve login".to_string()),
+        AuthMode::Aksk => match (credentials.has_access_key, credentials.has_secret_key) {
+            (Some(false), Some(true)) => {
+                Some("ve-adrive config set access_key_id <access_key_id>".to_string())
+            }
+            (Some(true), Some(false)) => {
+                Some("ve-adrive config set secret_access_key <secret_access_key>".to_string())
+            }
+            _ => Some("ve-adrive config init".to_string()),
+        },
+    }
+}
+
+fn auth_check_message(
+    mode: AuthMode,
+    credentials: &crate::domain::auth::CredentialAvailability,
+    is_ready: bool,
+    has_client_id_warning: bool,
+) -> String {
+    if has_client_id_warning {
+        return "ADrive OAuth Client ID is still a placeholder; use a registered test override or a production build"
+            .to_string();
+    }
+    if mode == AuthMode::Aksk && credentials.has_complete_aksk() {
+        return "ADrive credentials are configured".to_string();
+    }
+    match (mode, is_ready, credentials.has_oauth_token()) {
+        (AuthMode::Oauth, true, _) => "ADrive OAuth credentials are available".to_string(),
+        (AuthMode::Oauth, false, true) => {
+            "ADrive OAuth credentials are present but cannot authenticate; run auth login"
+                .to_string()
+        }
+        (AuthMode::Oauth, false, false) => {
+            "ADrive OAuth credentials are not configured".to_string()
+        }
+        (AuthMode::Unified, _, _) => {
+            "ADrive unified credentials are managed externally".to_string()
+        }
+        (AuthMode::Aksk, false, _) => aksk_missing_credential_message(credentials),
+        (AuthMode::Aksk, true, _) => "ADrive credentials are configured".to_string(),
+    }
+}
+
+fn aksk_missing_credential_message(
+    credentials: &crate::domain::auth::CredentialAvailability,
+) -> String {
+    match (credentials.has_access_key, credentials.has_secret_key) {
+        (Some(false), Some(true)) => "ADrive Access Key is not configured".to_string(),
+        (Some(true), Some(false)) => "ADrive Secret Key is not configured".to_string(),
+        _ => "ADrive Access Key and Secret Key are not configured".to_string(),
+    }
+}
+
+fn auth_check_details(
+    resolved: crate::domain::auth::ResolvedAuthMode,
+    credentials: &crate::domain::auth::CredentialAvailability,
+    credential_state: &str,
+) -> Value {
+    let mut details = json!({
+        "mode": resolved.mode.as_str(),
+        "source": resolved.source.as_str(),
+        "credential_state": credential_state,
+        "has_access_key": credentials.has_access_key,
+        "has_secret_key": credentials.has_secret_key,
+        "has_security_token": credentials.has_security_token,
+        "has_access_token": credentials.has_access_token,
+        "has_refresh_token": credentials.has_refresh_token,
+        "access_token_expiry": credentials.access_token_expiry,
+        "expires_at": credentials.expires_at,
+        "scope": credentials.scope,
+        "instance_id": credentials.instance_id,
+        "ready": credentials.is_ready(),
+        "oauth_service_integration": credentials.oauth_service_integration,
+        "credential_source": credentials.credential_source,
+    });
+    if resolved.mode == AuthMode::Aksk {
+        add_aksk_source_details(&mut details, credentials);
+    }
+    details
+}
+
+fn add_aksk_source_details(
+    details: &mut Value,
+    credentials: &crate::domain::auth::CredentialAvailability,
+) {
+    let Some(details) = details.as_object_mut() else {
+        return;
+    };
+    details.insert(
+        "access_key_source".to_string(),
+        Value::String(credentials.access_key_source.unwrap_or("none").to_string()),
+    );
+    details.insert(
+        "secret_key_source".to_string(),
+        Value::String(credentials.secret_key_source.unwrap_or("none").to_string()),
+    );
+    details.insert(
+        "security_token_source".to_string(),
+        Value::String(
+            credentials
+                .security_token_source
+                .unwrap_or("none")
+                .to_string(),
+        ),
+    );
+}
+
+fn add_oauth_client_id_details(details: &mut Value, client_id: Option<OAuthClientIdDiagnostics>) {
+    let (Some(details), Some(client_id)) = (details.as_object_mut(), client_id) else {
+        return;
+    };
+    details.insert(
+        "oauth_client_id_source".to_string(),
+        Value::String(client_id.source.to_string()),
+    );
+    details.insert(
+        "oauth_client_id_placeholder".to_string(),
+        Value::Bool(client_id.is_placeholder),
+    );
+}
+
+fn credential_state(
+    mode: AuthMode,
+    credentials: &crate::domain::auth::CredentialAvailability,
+) -> &'static str {
+    if mode == AuthMode::Aksk {
+        return if credentials.is_ready() {
+            "configured"
+        } else {
+            "incomplete"
+        };
+    }
+    if credentials.is_ready() {
+        // [Review Fix #2] A malformed expiry is usable only when the stored
+        // credential group can refresh it, so report that state explicitly.
+        return if matches!(
+            credentials.access_token_expiry.as_deref(),
+            Some("expired" | "invalid")
+        ) || credentials.has_access_token == Some(false)
+        {
+            "refreshable"
+        } else {
+            "access_available"
+        };
+    }
+    if credentials.credential_source == "environment"
+        && credentials.has_access_token == Some(false)
+        && credentials.has_refresh_token == Some(true)
+    {
+        return "unsupported_refresh_source";
+    }
+    if credentials.has_oauth_token() {
+        "login_required"
+    } else {
+        "logged_out"
+    }
+}
+
+async fn network_check(
+    global: &GlobalArgs,
+    args: &DoctorArgs,
+    mode: AuthMode,
+) -> Result<DoctorCheck, CliError> {
+    // [Review Fix #2] Network diagnostics share the already-selected mode and
+    // therefore cannot switch to credential-bearing AK/SK profile loading.
+    let profile = build_runtime_profile(global, mode)?;
+    let has_explicit_endpoint = profile
+        .endpoint
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
     let resolved = resolve_endpoint_and_region(profile.endpoint.clone(), profile.region.clone());
     let endpoint = resolved.as_ref().ok().map(|(endpoint, _)| endpoint.clone());
 
@@ -2643,11 +3391,14 @@ async fn network_check(global: &GlobalArgs, args: &DoctorArgs) -> Result<DoctorC
             },
             message: resolved
                 .as_ref()
-                .map(|_| "network endpoint is explicit or derived from ADRIVE_REGION".to_string())
+                .map(|_| "network endpoint is explicitly configured".to_string())
                 .unwrap_or_else(|err| err.to_string()),
+            fix_command: resolved
+                .is_err()
+                .then(|| resource_config_fix_command(has_explicit_endpoint).to_string()),
             details: json!({
                 "endpoint": endpoint,
-                "has_explicit_endpoint": profile.endpoint.is_some(),
+                "has_explicit_endpoint": has_explicit_endpoint,
                 "has_region": profile.region.is_some(),
                 "live_check": false,
                 "hint": "pass --live-network to perform a real probe",
@@ -2665,6 +3416,7 @@ async fn network_check(global: &GlobalArgs, args: &DoctorArgs) -> Result<DoctorC
                 .err()
                 .map(|err| err.to_string())
                 .unwrap_or_else(|| "no endpoint configured; cannot probe".to_string()),
+            fix_command: Some(resource_config_fix_command(has_explicit_endpoint).to_string()),
             details: json!({ "live_check": true, "skipped": true }),
         });
     };
@@ -2686,6 +3438,7 @@ async fn network_check(global: &GlobalArgs, args: &DoctorArgs) -> Result<DoctorC
                 name: "network",
                 status: "failed",
                 message: format!("failed to build HTTP client: {err}"),
+                fix_command: None,
                 details: json!({ "live_check": true, "url": url }),
             });
         }
@@ -2712,6 +3465,7 @@ async fn network_check(global: &GlobalArgs, args: &DoctorArgs) -> Result<DoctorC
                     latency_ms,
                     status_code.as_u16()
                 ),
+                fix_command: None,
                 details: json!({
                     "live_check": true,
                     "url": url,
@@ -2724,6 +3478,7 @@ async fn network_check(global: &GlobalArgs, args: &DoctorArgs) -> Result<DoctorC
             name: "network",
             status: "failed",
             message: format!("probe failed after {}ms: {}", latency_ms, err),
+            fix_command: None,
             details: json!({
                 "live_check": true,
                 "url": url,
@@ -2736,11 +3491,20 @@ async fn network_check(global: &GlobalArgs, args: &DoctorArgs) -> Result<DoctorC
     }
 }
 
+fn resource_config_fix_command(has_endpoint: bool) -> &'static str {
+    if has_endpoint {
+        "ve-adrive config set region <region>"
+    } else {
+        "ve-adrive config set endpoint <endpoint>"
+    }
+}
+
 fn registry_check() -> DoctorCheck {
     DoctorCheck {
         name: "registry",
         status: "passed",
         message: "capability registry is available".to_string(),
+        fix_command: None,
         details: json!({
             "capabilities": capabilities().len(),
             "domains": command_domains(),
@@ -2787,6 +3551,7 @@ fn principles_check() -> DoctorCheck {
         } else {
             "six-principle invariants failed".to_string()
         },
+        fix_command: None,
         details: json!({
             "capabilities": rows.len(),
             "skill_definitions": skill_domains.len(),
@@ -2812,6 +3577,7 @@ fn mcp_check() -> DoctorCheck {
         name: "mcp",
         status: "passed",
         message: "MCP runtime is available for stdio and SSE transports".to_string(),
+        fix_command: None,
         details: json!({
             "capabilities": capabilities().len(),
             "runtime": "available",
@@ -2827,6 +3593,7 @@ fn completion_check() -> DoctorCheck {
         name: "completion",
         status: "passed",
         message: "completion generation is registry-backed".to_string(),
+        fix_command: None,
         details: json!({ "shells": ["bash", "zsh", "fish", "powershell"] }),
     }
 }
@@ -2834,6 +3601,471 @@ fn completion_check() -> DoctorCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    fn missing_chinese(context: &str, source: &str) -> Option<String> {
+        let chinese = adrive_metadata_translation_zh(source);
+        let is_missing = chinese.is_none_or(|value| {
+            value == source || value.contains("原始英文说明") || value.contains(source)
+        });
+        is_missing.then(|| format!("command/parameter={context}, source={source:?}"))
+    }
+
+    fn schema_descriptions(schema: &Value) -> Vec<(String, String)> {
+        let mut descriptions = Vec::new();
+        let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+            return descriptions;
+        };
+        for (name, property) in properties {
+            if let Some(description) = property.get("description").and_then(Value::as_str) {
+                descriptions.push((name.clone(), description.to_string()));
+            }
+        }
+        descriptions
+    }
+
+    fn collect_human_metadata(
+        value: &Value,
+        path: &str,
+        context: ADriveMetadataContext,
+        prose: &mut Vec<(String, String)>,
+    ) {
+        match value {
+            Value::String(source) if context == ADriveMetadataContext::HumanText => {
+                prose.push((path.to_string(), source.clone()));
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    let item_context = adrive_array_item_context(context, item);
+                    collect_human_metadata(item, &format!("{path}[{index}]"), item_context, prose);
+                }
+            }
+            Value::Object(map) => {
+                for (key, child) in map {
+                    let child_path = format!("{path}.{key}");
+                    let child_context = adrive_child_metadata_context(context, key, child);
+                    collect_human_metadata(child, &child_path, child_context, prose);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn describe_human_prose(document: &Value) -> Vec<(String, String)> {
+        let mut prose = Vec::new();
+        collect_human_metadata(document, "$", ADriveMetadataContext::Structured, &mut prose);
+        prose
+    }
+
+    fn missing_describe_translations(command: &str, document: &Value) -> BTreeSet<String> {
+        describe_human_prose(document)
+            .into_iter()
+            .filter_map(|(field, source)| missing_chinese(&format!("{command} {field}"), &source))
+            .collect()
+    }
+
+    fn external_describe_documents() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "ve-adrive",
+                json!({
+                    "description": "ADrive CLI high-level file operations and agent utilities",
+                    "groups": [
+                        {"description": "File management operations with adrive:// URI and flag targets"},
+                        {"description": "Discovery, configuration, diagnostics, completion, skill, API passthrough, and MCP utilities"},
+                    ],
+                }),
+            ),
+            (
+                "ve-adrive api <group> <action>",
+                json!({"description": "Guarded ADrive utility API planning; direct raw execution is not implemented yet"}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn chinese_catalog_recursively_covers_every_adrive_describe_path() {
+        let mut documents = external_describe_documents();
+        documents.push(("ve-adrive config", describe_config_group()));
+        for command in [
+            "ve-adrive config init",
+            "ve-adrive config show",
+            "ve-adrive config set",
+        ] {
+            let document = describe_adrive_command_metadata(command)
+                .unwrap_or_else(|| panic!("missing Describe metadata for {command}"));
+            documents.push((command, document));
+        }
+        let mut missing = BTreeSet::new();
+        for (command, document) in documents {
+            missing.extend(missing_describe_translations(command, &document));
+        }
+        assert!(
+            missing.is_empty(),
+            "missing recursive Describe translations:\n{}",
+            missing.into_iter().collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    #[test]
+    fn chinese_owner_catalog_covers_every_capability_and_parameter() {
+        let mut missing = BTreeSet::new();
+        for row in capabilities() {
+            missing.extend(missing_chinese(row.command, row.description));
+            for parameter in row.parameters {
+                let context = format!("{} --{}", row.command, parameter.name);
+                missing.extend(missing_chinese(&context, parameter.description));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "missing Chinese metadata:\n{}",
+            missing.into_iter().collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    #[test]
+    fn chinese_owner_catalog_has_unique_english_sources() {
+        let mut sources = BTreeSet::new();
+        let duplicates = ADRIVE_METADATA_TRANSLATIONS_ZH
+            .iter()
+            .filter_map(|(english, _)| (!sources.insert(*english)).then_some(*english))
+            .collect::<Vec<_>>();
+
+        assert!(
+            duplicates.is_empty(),
+            "duplicate ADrive Chinese owner sources: {duplicates:?}"
+        );
+    }
+
+    #[test]
+    fn chinese_skill_definitions_localize_all_human_descriptions() {
+        let english = skill_definitions_for_language(DocumentationLanguage::En);
+        let chinese = skill_definitions_for_language(DocumentationLanguage::Zh);
+        for source_skill in english {
+            let localized = chinese
+                .iter()
+                .find(|skill| skill.command == source_skill.command)
+                .expect("Chinese skill matches English command");
+            assert_ne!(
+                localized.description, source_skill.description,
+                "command={}",
+                source_skill.command
+            );
+            assert!(
+                !localized.description.contains("原始英文说明"),
+                "command={}",
+                source_skill.command
+            );
+            let source_value =
+                serde_json::to_value(&source_skill).expect("serialize English Skill");
+            let missing = missing_describe_translations(&source_skill.command, &source_value);
+            assert!(
+                missing.is_empty(),
+                "missing recursive Skill translations:\n{}",
+                missing.into_iter().collect::<Vec<_>>().join("\n")
+            );
+            let localized_schema = schema_descriptions(&localized.input_schema);
+            for (parameter, source) in schema_descriptions(&source_skill.input_schema) {
+                let (_, translated) = localized_schema
+                    .iter()
+                    .find(|(name, _)| name == &parameter)
+                    .expect("Chinese schema preserves parameter");
+                assert_ne!(
+                    translated, &source,
+                    "command={}, parameter={parameter}, source={source:?}",
+                    source_skill.command
+                );
+                assert!(
+                    !translated.contains("原始英文说明"),
+                    "command={}, parameter={parameter}",
+                    source_skill.command
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chinese_catalog_localizes_every_high_level_describe_document() {
+        let mut missing = BTreeSet::new();
+        for row in capabilities()
+            .iter()
+            .filter(|row| row.layer == "high-level")
+        {
+            let description =
+                crate::handler::high_level::describe_high_level_command_path(row.command)
+                    .expect("high-level registry command has Describe metadata");
+            let document = serde_json::to_value(description).expect("serialize Describe");
+            missing.extend(missing_describe_translations(row.command, &document));
+        }
+        assert!(
+            missing.is_empty(),
+            "missing high-level Describe translations:\n{}",
+            missing.into_iter().collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    #[test]
+    fn chinese_catalog_localizes_every_utility_describe_document() {
+        let mut missing = BTreeSet::new();
+        for command in [
+            "ve-adrive capabilities",
+            "ve-adrive api",
+            "ve-adrive config",
+            "ve-adrive completion",
+            "ve-adrive serve",
+            "ve-adrive skill list",
+            "ve-adrive skill export",
+            "ve-adrive doctor",
+            "ve-adrive auth",
+        ] {
+            let document =
+                describe_adrive_command_metadata(command).expect("utility Describe metadata");
+            missing.extend(missing_describe_translations(command, &document));
+        }
+        assert!(
+            missing.is_empty(),
+            "missing utility Describe translations:\n{}",
+            missing.into_iter().collect::<Vec<_>>().join("\n")
+        );
+        let mut auth = describe_adrive_command_metadata("ve-adrive auth").expect("auth Describe");
+        let precedence = auth["scenario_routing"]["mode_resolution"].clone();
+        localize_adrive_auth_documentation_zh(&mut auth);
+        assert_eq!(auth["scenario_routing"]["mode_resolution"], precedence);
+    }
+
+    #[test]
+    fn chinese_localizer_preserves_catalog_collisions_in_machine_fields() {
+        let mut document = json!({
+            "description": "Configuration management",
+            "command": "Configuration management",
+            "name": "Sort field",
+            "type": "Configuration management",
+            "enum": ["Configuration management"],
+            "examples": ["Configuration management"],
+            "scenario_routing": {
+                "operation": "Configuration management",
+                "command": "Configuration management",
+                "mode_resolution": "Configuration management",
+            },
+            "recovery": {
+                "description": "Configuration management",
+                "command": "Configuration management",
+                "code": "Sort field",
+            },
+        });
+
+        localize_adrive_auth_documentation_zh(&mut document);
+
+        assert_eq!(document["description"], "配置管理");
+        assert_eq!(document["scenario_routing"]["operation"], "配置管理");
+        assert_eq!(document["recovery"]["description"], "配置管理");
+        for (pointer, expected) in [
+            ("/command", "Configuration management"),
+            ("/name", "Sort field"),
+            ("/type", "Configuration management"),
+            ("/enum/0", "Configuration management"),
+            ("/examples/0", "Configuration management"),
+        ] {
+            assert_eq!(document.pointer(pointer).unwrap(), expected);
+        }
+        assert_eq!(
+            document["scenario_routing"]["mode_resolution"],
+            "Configuration management"
+        );
+        assert_eq!(
+            document["scenario_routing"]["command"],
+            "Configuration management"
+        );
+        assert_eq!(document["recovery"]["command"], "Configuration management");
+        assert_eq!(document["recovery"]["code"], "Sort field");
+    }
+
+    #[test]
+    fn unified_auth_doctor_check_exposes_only_approved_metadata() {
+        let resolved = crate::domain::auth::ResolvedAuthMode {
+            mode: AuthMode::Unified,
+            source: crate::domain::auth::AuthModeSource::Config,
+        };
+        let inspection = crate::handler::common::UnifiedCredentialInspection {
+            provider_name: Some("safe-provider".to_string()),
+            has_session_token: true,
+            ready: true,
+            sdk_code: None,
+        };
+
+        let check = unified_auth_doctor_check("selected", resolved, &inspection);
+        let keys = check
+            .details
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(check.status, "passed");
+        assert_eq!(check.fix_command, None);
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "has_session_token",
+                "mode",
+                "profile",
+                "provider_name",
+                "ready",
+                "source",
+            ])
+        );
+    }
+
+    #[test]
+    fn unified_auth_prompts_external_credential_management() {
+        let credentials = crate::domain::auth::CredentialAvailability {
+            has_access_key: None,
+            has_secret_key: None,
+            has_security_token: None,
+            access_key_source: None,
+            secret_key_source: None,
+            security_token_source: None,
+            has_access_token: None,
+            has_refresh_token: None,
+            access_token_expiry: None,
+            expires_at: None,
+            scope: None,
+            instance_id: None,
+            ready: false,
+            oauth_service_integration: "not_applicable",
+            credential_source: "external",
+        };
+
+        assert_eq!(
+            auth_fix_command(AuthMode::Unified, &credentials, false, false).as_deref(),
+            Some("ve login")
+        );
+        assert_eq!(
+            auth_check_message(AuthMode::Unified, &credentials, false, false),
+            "ADrive unified credentials are managed externally"
+        );
+    }
+
+    #[tokio::test]
+    async fn unified_full_doctor_checks_ignore_unselected_local_secrets() {
+        let directory = std::env::temp_dir().join(format!(
+            "ve-adrive-unified-doctor-isolation-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.toml");
+        let credentials_path = directory.join("credentials.toml");
+        std::fs::write(
+            &config_path,
+            r#"[selected.adrive]
+auth_mode = "unified"
+endpoint = "https://resource.example.com"
+region = "cn-test"
+access_key_id = "ENC:not-valid"
+secret_access_key = "ENC:not-valid"
+"#,
+        )
+        .unwrap();
+        std::fs::write(&credentials_path, "not valid toml = [").unwrap();
+        let global = GlobalArgs {
+            profile: "selected".to_string(),
+            config_path: Some(config_path),
+            credentials_path: Some(credentials_path),
+            ..GlobalArgs::default()
+        };
+        let args = DoctorArgs {
+            check: None,
+            live_network: false,
+            network_timeout_ms: 5_000,
+        };
+
+        let config = config_check(&global, AuthMode::Unified).unwrap();
+        let network = network_check(&global, &args, AuthMode::Unified)
+            .await
+            .unwrap();
+
+        assert_eq!(config.status, "passed");
+        assert_eq!(network.status, "passed");
+        assert!(!directory.join(".key").exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn registry_only_doctor_check_remains_independent_of_auth_config() {
+        let directory = std::env::temp_dir().join(format!(
+            "ve-adrive-registry-doctor-isolation-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.toml");
+        std::fs::write(&config_path, "not valid toml = [").unwrap();
+        let global = GlobalArgs {
+            config_path: Some(config_path),
+            ..GlobalArgs::default()
+        };
+        let auth = ADriveAuthArgs { auth_mode: None };
+        let args = DoctorArgs {
+            check: Some("registry".to_string()),
+            live_network: false,
+            network_timeout_ms: 5_000,
+        };
+
+        let checks = build_doctor_checks(&global, &auth, &args)
+            .await
+            .expect("registry diagnostics must not depend on auth config");
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "registry");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn full_doctor_reports_auth_config_errors_without_aborting_other_checks() {
+        let directory = std::env::temp_dir().join(format!(
+            "ve-adrive-full-doctor-error-isolation-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.toml");
+        std::fs::write(&config_path, "not valid toml = [").unwrap();
+        let global = GlobalArgs {
+            config_path: Some(config_path),
+            ..GlobalArgs::default()
+        };
+        let auth = ADriveAuthArgs { auth_mode: None };
+        let args = DoctorArgs {
+            check: None,
+            live_network: false,
+            network_timeout_ms: 5_000,
+        };
+
+        let checks = build_doctor_checks(&global, &auth, &args)
+            .await
+            .expect("full doctor must retain independent diagnostics");
+
+        for name in ["config", "auth", "network"] {
+            assert_eq!(
+                checks
+                    .iter()
+                    .find(|check| check.name == name)
+                    .unwrap()
+                    .status,
+                "failed"
+            );
+        }
+        assert!(checks
+            .iter()
+            .any(|check| check.name == "registry" && check.status == "passed"));
+        assert!(checks
+            .iter()
+            .any(|check| check.name == "mcp" && check.status == "passed"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     #[tokio::test]
     async fn mcp_serve_execute_is_rejected() {
@@ -2850,5 +4082,23 @@ mod tests {
             Err(CliError::ValidationError(message))
                 if message.contains("only supports planning")
         ));
+    }
+
+    #[test]
+    fn auth_describe_metadata_exposes_unified_contract() {
+        let description = describe_adrive_command_metadata("ve-adrive auth")
+            .expect("auth metadata must be registered");
+        let rendered = serde_json::to_string(&description).unwrap();
+
+        for expected in [
+            "--auth-mode <MODE>",
+            "ADRIVE_AUTH_MODE",
+            "same-name external profile",
+            "ve login",
+            "ve logout",
+        ] {
+            assert!(rendered.contains(expected), "describe missing {expected}");
+        }
+        assert_eq!(description["supports_dry_run"], json!(true));
     }
 }

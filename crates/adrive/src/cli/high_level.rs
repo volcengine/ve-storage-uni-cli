@@ -34,6 +34,47 @@ pub enum OverwriteStrategy {
     Newer,
 }
 
+/// Service tier assigned when creating an ADrive Instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ServiceType {
+    /// Software-as-a-service Instance.
+    Saas,
+    /// Platform-as-a-service Instance.
+    Paas,
+    /// ArkClaw service Instance.
+    Arkclaw,
+}
+
+impl ServiceType {
+    /// Return the lower-case value accepted by IDS.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Saas => "saas",
+            Self::Paas => "paas",
+            Self::Arkclaw => "arkclaw",
+        }
+    }
+}
+
+/// Ownership collection selected for an ADrive Space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OwnerType {
+    /// Space owned by a user.
+    User,
+    /// Space owned by a group.
+    Group,
+}
+
+impl OwnerType {
+    /// Return the lower-case value accepted by IDS.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Group => "group",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Args)]
 #[command(
     after_help = "Examples:\n  ve-adrive-cli cp ./file.txt adrive://inst/space/docs/file.txt\n  ve-adrive-cli cp adrive://inst/space/docs/ ./local/ --recursive\n  ve-adrive-cli cp ./dir/ adrive://inst/space/backup/ --recursive --include \"*.log\""
@@ -276,7 +317,7 @@ pub struct SyncArgs {
 
 #[derive(Debug, Clone, Args)]
 #[command(
-    after_help = "Examples:\n  ve-adrive-cli crt adrive://inst-name\n  ve-adrive-cli crt adrive://inst-id/space-name\n  ve-adrive-cli crt --instance inst-id --space docs --index-enabled"
+    after_help = "Examples:\n  ve-adrive-cli --auth-mode aksk crt adrive://inst-name                  # AK/SK Instance default: arkclaw\n  ve-adrive-cli --auth-mode oauth crt adrive://inst-name                 # OAuth Instance default: paas\n  ve-adrive-cli --auth-mode oauth crt adrive://inst-id/personal          # OAuth user Space default: logged-in user_id\n  ve-adrive-cli --auth-mode oauth crt adrive://inst-id/team --owner-type group --owner-id group-id\n  ve-adrive-cli crt --instance inst-id --space docs --index-enabled"
 )]
 pub struct CreateArgs {
     /// Resource to create (adrive://instance-name or adrive://instance-id/space-name)
@@ -300,6 +341,15 @@ pub struct CreateArgs {
     /// Enable search indexing for a newly-created space
     #[arg(long)]
     pub index_enabled: bool,
+    /// Service tier for a newly-created Instance. Defaults to arkclaw for AK/SK and paas for OAuth
+    #[arg(long, value_enum)]
+    pub service_type: Option<ServiceType>,
+    /// Owner collection for a newly-created Space. OAuth user Space ownership defaults to the logged-in user_id; OAuth group Space ownership requires --owner-id
+    #[arg(long, value_enum)]
+    pub owner_type: Option<OwnerType>,
+    /// Owner identifier for a newly-created Space. OAuth user ownership defaults to the logged-in user_id; OAuth group ownership requires --owner-id
+    #[arg(long)]
+    pub owner_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -410,7 +460,7 @@ pub enum RecursiveDeleteMode {
 
 #[derive(Debug, Clone, Args)]
 #[command(
-    after_help = "Examples:\n  ve-adrive-cli ls\n  ve-adrive-cli ls --instance myinst\n  ve-adrive-cli ls --instance myinst --space myspace\n  ve-adrive-cli ls adrive://myinst/myspace/prefix/ --max-keys 100"
+    after_help = "Examples:\n  ve-adrive-cli ls\n  ve-adrive-cli ls --instance myinst\n  ve-adrive-cli ls adrive://myinst --owner-type group\n  ve-adrive-cli ls --instance myinst --space myspace\n  ve-adrive-cli ls adrive://myinst/myspace/prefix/ --max-keys 100"
 )]
 pub struct LsArgs {
     /// Path to list (adrive://instance/space or adrive://instance/space/folder/)
@@ -434,6 +484,9 @@ pub struct LsArgs {
     /// Pagination marker returned by a previous listing
     #[arg(long)]
     pub marker: Option<String>,
+    /// OAuth Space owner collection to list
+    #[arg(long, value_enum)]
+    pub owner_type: Option<OwnerType>,
     /// Human-readable sizes
     #[arg(long, short = 'H')]
     pub human_readable: bool,
@@ -665,4 +718,32 @@ pub struct MkdirArgs {
     /// Create parent folders as needed
     #[arg(long, short = 'p')]
     pub parents: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::ValueEnum;
+
+    use super::{OwnerType, ServiceType};
+
+    #[test]
+    fn owner_type_accepts_only_lowercase_public_values() {
+        assert_eq!(OwnerType::from_str("user", false).unwrap(), OwnerType::User);
+        assert_eq!(
+            OwnerType::from_str("group", false).unwrap(),
+            OwnerType::Group
+        );
+        assert!(OwnerType::from_str("User", false).is_err());
+    }
+
+    #[test]
+    fn service_type_accepts_the_frozen_public_values() {
+        for (value, expected) in [
+            ("saas", ServiceType::Saas),
+            ("paas", ServiceType::Paas),
+            ("arkclaw", ServiceType::Arkclaw),
+        ] {
+            assert_eq!(ServiceType::from_str(value, false).unwrap(), expected);
+        }
+    }
 }

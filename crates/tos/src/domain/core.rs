@@ -16,15 +16,17 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 
 use reqwest::{Body, Method, Response};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tos_core::agent::envelope::Envelope;
 use tos_core::agent::error::CliError;
-use tos_core::infra::client::{ReplayableStreamingRequest, TosClient};
+use tos_core::infra::client::{ReplayableRequest, ReplayableStreamingRequest, TosClient};
 
 const MAX_RAW_RESPONSE_BODY_BYTES: u64 = 10 * 1024 * 1024;
+const RETRYABLE_RESPONSE_DECODE_MARKER: &str = "__tos_retryable_response_decode__";
 
 /// Serialized view of a low-level raw response.
 #[derive(Debug, Serialize)]
@@ -47,6 +49,30 @@ pub struct DownloadResult {
     pub headers: BTreeMap<String, String>,
 }
 
+/// Fully consumed text response for list and metadata APIs.
+pub struct TextResponseData {
+    /// Service request identifier, when present.
+    pub request_id: String,
+    /// HTTP status code returned by the service.
+    pub status_code: u16,
+    /// Response headers normalized to string pairs.
+    pub headers: BTreeMap<String, String>,
+    /// Complete response body decoded as text.
+    pub body: String,
+}
+
+/// Fully consumed and decoded text response for typed list and metadata APIs.
+pub struct ParsedTextResponse<T> {
+    /// Service request identifier, when present.
+    pub request_id: String,
+    /// HTTP status code returned by the service.
+    pub status_code: u16,
+    /// Response headers normalized to string pairs.
+    pub headers: BTreeMap<String, String>,
+    /// Typed value decoded from the complete response body.
+    pub value: T,
+}
+
 /// Object request metadata for a replayable streaming upload.
 pub struct ReplayableObjectRequest<'a> {
     /// Command name written to the response envelope.
@@ -63,6 +89,36 @@ pub struct ReplayableObjectRequest<'a> {
     pub headers: BTreeMap<String, String>,
     /// Precomputed SHA256 payload hash.
     pub payload_hash: String,
+}
+
+/// Object request metadata for a replayable in-memory body or body-less GET.
+pub struct ReplayableObjectBytesRequest<'a> {
+    /// HTTP method used for the request.
+    pub method: Method,
+    /// Destination bucket.
+    pub bucket: &'a str,
+    /// Destination object key.
+    pub key: &'a str,
+    /// Signed query parameters.
+    pub query: BTreeMap<String, String>,
+    /// Signed request headers.
+    pub headers: BTreeMap<String, String>,
+    /// Optional byte body cloned for each attempt.
+    pub body: Option<Vec<u8>>,
+}
+
+/// Bucket request metadata for a replayable in-memory body or body-less GET.
+pub struct ReplayableBucketBytesRequest<'a> {
+    /// HTTP method used for the request.
+    pub method: Method,
+    /// Destination bucket.
+    pub bucket: &'a str,
+    /// Signed query parameters.
+    pub query: BTreeMap<String, String>,
+    /// Signed request headers.
+    pub headers: BTreeMap<String, String>,
+    /// Optional byte body cloned for each attempt.
+    pub body: Option<Vec<u8>>,
 }
 
 /// Execute a bucket-scoped request whose path is `/{bucket}`.
@@ -142,6 +198,34 @@ pub async fn send_object_request(
         .await
 }
 
+/// Execute a replayable object request and consume its response completely
+/// inside the HTTP retry boundary.
+pub async fn send_object_request_with_consumer<T, C, CFut>(
+    client: &TosClient,
+    request: ReplayableObjectBytesRequest<'_>,
+    consume: C,
+) -> Result<T, CliError>
+where
+    C: FnMut(Response) -> CFut,
+    CFut: Future<Output = Result<T, CliError>>,
+{
+    let url = client.object_endpoint(request.bucket, request.key)?;
+    let path = client.object_request_path(request.bucket, request.key)?;
+    client
+        .send_request_with_consumer(
+            ReplayableRequest {
+                method: request.method,
+                url,
+                path,
+                query_params: request.query,
+                extra_headers: request.headers,
+                body: request.body,
+            },
+            consume,
+        )
+        .await
+}
+
 /// Execute an object-scoped request with a streaming body and return a structured response.
 pub async fn execute_object_streaming_request(
     client: &TosClient,
@@ -179,8 +263,8 @@ where
     let url = client.object_endpoint(request.bucket, request.key)?;
     let path = client.object_request_path(request.bucket, request.key)?;
     let command = request.command;
-    let response = client
-        .send_replayable_streaming_request(
+    client
+        .send_replayable_streaming_request_with_consumer(
             ReplayableStreamingRequest {
                 method: request.method,
                 url,
@@ -190,9 +274,9 @@ where
                 payload_hash: request.payload_hash,
             },
             body_factory,
+            |response| streaming_response_envelope(client, command, response),
         )
-        .await?;
-    streaming_response_envelope(client, command, response).await
+        .await
 }
 
 async fn streaming_response_envelope(
@@ -270,6 +354,236 @@ pub async fn send_bucket_request(
         .await
 }
 
+/// Execute a replayable bucket request and return its fully consumed text body.
+pub async fn send_bucket_request_text(
+    client: &TosClient,
+    request: ReplayableBucketBytesRequest<'_>,
+) -> Result<TextResponseData, CliError> {
+    let url = client.bucket_endpoint(request.bucket)?;
+    let path = client.bucket_request_path(request.bucket)?;
+    send_request_text(
+        client,
+        ReplayableRequest {
+            method: request.method,
+            url,
+            path,
+            query_params: request.query,
+            extra_headers: request.headers,
+            body: request.body,
+        },
+    )
+    .await
+}
+
+/// Execute a replayable object request and return its fully consumed text body.
+pub async fn send_object_request_text(
+    client: &TosClient,
+    method: Method,
+    bucket: &str,
+    key: &str,
+    query: BTreeMap<String, String>,
+    headers: BTreeMap<String, String>,
+    body: Option<Vec<u8>>,
+) -> Result<TextResponseData, CliError> {
+    let url = client.object_endpoint(bucket, key)?;
+    let path = client.object_request_path(bucket, key)?;
+    send_request_text(
+        client,
+        ReplayableRequest {
+            method,
+            url,
+            path,
+            query_params: query,
+            extra_headers: headers,
+            body,
+        },
+    )
+    .await
+}
+
+/// Execute a replayable request with an already resolved URL and signing path,
+/// returning its fully consumed text body.
+pub async fn send_resolved_request_text(
+    client: &TosClient,
+    method: Method,
+    url: String,
+    path: String,
+    query: BTreeMap<String, String>,
+    headers: BTreeMap<String, String>,
+    body: Option<Vec<u8>>,
+) -> Result<TextResponseData, CliError> {
+    send_request_text(
+        client,
+        ReplayableRequest {
+            method,
+            url,
+            path,
+            query_params: query,
+            extra_headers: headers,
+            body,
+        },
+    )
+    .await
+}
+
+/// Execute a replayable bucket request and decode its complete text body
+/// inside the HTTP attempt boundary.
+pub async fn send_bucket_request_parsed<T, P>(
+    client: &TosClient,
+    request: ReplayableBucketBytesRequest<'_>,
+    parse: P,
+) -> Result<ParsedTextResponse<T>, CliError>
+where
+    P: Fn(&str) -> Result<T, CliError> + Clone,
+{
+    let url = client.bucket_endpoint(request.bucket)?;
+    let path = client.bucket_request_path(request.bucket)?;
+    send_request_parsed(
+        client,
+        ReplayableRequest {
+            method: request.method,
+            url,
+            path,
+            query_params: request.query,
+            extra_headers: request.headers,
+            body: request.body,
+        },
+        parse,
+    )
+    .await
+}
+
+/// Execute a replayable object request and decode its complete text body
+/// inside the HTTP attempt boundary.
+pub async fn send_object_request_parsed<T, P>(
+    client: &TosClient,
+    request: ReplayableObjectBytesRequest<'_>,
+    parse: P,
+) -> Result<ParsedTextResponse<T>, CliError>
+where
+    P: Fn(&str) -> Result<T, CliError> + Clone,
+{
+    let url = client.object_endpoint(request.bucket, request.key)?;
+    let path = client.object_request_path(request.bucket, request.key)?;
+    send_request_parsed(
+        client,
+        ReplayableRequest {
+            method: request.method,
+            url,
+            path,
+            query_params: request.query,
+            extra_headers: request.headers,
+            body: request.body,
+        },
+        parse,
+    )
+    .await
+}
+
+/// Execute a replayable request with an already resolved URL and signing path,
+/// decoding its complete text body inside the HTTP attempt boundary.
+pub async fn send_resolved_request_parsed<T, P>(
+    client: &TosClient,
+    request: ReplayableRequest,
+    parse: P,
+) -> Result<ParsedTextResponse<T>, CliError>
+where
+    P: Fn(&str) -> Result<T, CliError> + Clone,
+{
+    send_request_parsed(client, request, parse).await
+}
+
+async fn send_request_text(
+    client: &TosClient,
+    request: ReplayableRequest,
+) -> Result<TextResponseData, CliError> {
+    client
+        .send_request_with_consumer(request, |response| async move {
+            let request_id = extract_request_id(&response);
+            let status_code = response.status().as_u16();
+            let headers = extract_headers(&response);
+            let response = client.check_response(response).await?;
+            let body = response.text().await.map_err(CliError::Http)?;
+            Ok(TextResponseData {
+                request_id,
+                status_code,
+                headers,
+                body,
+            })
+        })
+        .await
+}
+
+async fn send_request_parsed<T, P>(
+    client: &TosClient,
+    request: ReplayableRequest,
+    parse: P,
+) -> Result<ParsedTextResponse<T>, CliError>
+where
+    P: Fn(&str) -> Result<T, CliError> + Clone,
+{
+    let last_decode_error = Arc::new(Mutex::new(None));
+    let attempt_decode_error = Arc::clone(&last_decode_error);
+    let result = client
+        .send_request_with_consumer(request, move |response| {
+            let parse_attempt = parse.clone();
+            let attempt_decode_error = Arc::clone(&attempt_decode_error);
+            consume_parsed_response(client, response, parse_attempt, attempt_decode_error)
+        })
+        .await;
+
+    match result {
+        Err(CliError::TransferFailed(message)) if message == RETRYABLE_RESPONSE_DECODE_MARKER => {
+            match last_decode_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                Some(error) => Err(error),
+                None => Err(CliError::TransferFailed(
+                    "response decode retry exhausted without a recorded error".to_string(),
+                )),
+            }
+        }
+        other => other,
+    }
+}
+
+async fn consume_parsed_response<T, P>(
+    client: &TosClient,
+    response: Response,
+    parse: P,
+    last_decode_error: Arc<Mutex<Option<CliError>>>,
+) -> Result<ParsedTextResponse<T>, CliError>
+where
+    P: Fn(&str) -> Result<T, CliError>,
+{
+    let request_id = extract_request_id(&response);
+    let status_code = response.status().as_u16();
+    let headers = extract_headers(&response);
+    let response = client.check_response(response).await?;
+    let body = response.text().await.map_err(CliError::Http)?;
+    // [Review Fix #8] Decode before declaring the attempt successful. The
+    // marker enables retries while preserving the existing final error.
+    let value = match parse(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            *last_decode_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+            return Err(CliError::TransferFailed(
+                RETRYABLE_RESPONSE_DECODE_MARKER.to_string(),
+            ));
+        }
+    };
+    Ok(ParsedTextResponse {
+        request_id,
+        status_code,
+        headers,
+        value,
+    })
+}
+
 async fn execute_request(
     client: &TosClient,
     command: &str,
@@ -280,25 +594,19 @@ async fn execute_request(
     headers: BTreeMap<String, String>,
     body: Option<Vec<u8>>,
 ) -> Result<Envelope<RawResponseData>, CliError> {
-    let resp = client
-        .send_request(method, url, path, query, headers, body)
-        .await?;
-    let request_id = extract_request_id(&resp);
-    let status_code = resp.status().as_u16();
-    let headers = extract_headers(&resp);
-    let resp = client.check_response(resp).await?;
-    let (body_format, body_value) = read_body(resp).await?;
-
-    Ok(Envelope::success(
-        command,
-        RawResponseData {
-            status_code,
-            headers,
-            body_format,
-            body: body_value,
-        },
-    )
-    .with_request_id(request_id))
+    client
+        .send_request_with_consumer(
+            ReplayableRequest {
+                method,
+                url: url.to_string(),
+                path: path.to_string(),
+                query_params: query,
+                extra_headers: headers,
+                body,
+            },
+            |response| streaming_response_envelope(client, command, response),
+        )
+        .await
 }
 
 async fn read_body(resp: Response) -> Result<(Option<String>, Option<Value>), CliError> {
@@ -319,18 +627,7 @@ async fn read_body(resp: Response) -> Result<(Option<String>, Option<Value>), Cl
         let chunk = match resp.chunk().await {
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
-            Err(err) => {
-                // [Review Fix #3] Raw low-level commands should preserve a
-                // successful service response even when the optional response
-                // body cannot be decoded by reqwest.
-                return Ok((
-                    Some("body_decode_error".to_string()),
-                    Some(json!({
-                        "error": err.to_string(),
-                        "bytes_read": bytes.len(),
-                    })),
-                ));
-            }
+            Err(err) => return Err(CliError::Http(err)),
         };
 
         if bytes.len() as u64 + chunk.len() as u64 > MAX_RAW_RESPONSE_BODY_BYTES {
@@ -556,8 +853,10 @@ pub fn extract_request_id(resp: &Response) -> String {
     resp.headers()
         .get("x-tos-request-id")
         .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_string()
+        // [Review Fix #6] Typed TOS responses must obey the same safety
+        // boundary as the invocation trace before handlers attach the ID.
+        .and_then(tos_core::agent::request_id::sanitize_request_id)
+        .unwrap_or_default()
 }
 
 pub fn extract_headers(resp: &Response) -> BTreeMap<String, String> {

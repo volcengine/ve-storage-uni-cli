@@ -23,3 +23,4 @@ pub mod global_args;
 pub mod output;
 pub mod pagination;
 pub mod progress;
+pub mod request_id;

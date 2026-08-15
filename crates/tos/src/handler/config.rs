@@ -32,7 +32,10 @@
 use std::collections::HashMap;
 
 use crate::cli::meta::ConfigAction;
-use crate::handler::common::{active_tos_config_binary, output_result};
+use crate::domain::auth::AuthMode;
+use crate::handler::common::{
+    active_tos_config_binary, output_result, resolve_auth_mode_from_config,
+};
 use tos_core::agent::describe::{CommandDescription, CommandLayer, RiskLevel};
 use tos_core::agent::dryrun::{DryRunResult, Impact};
 use tos_core::agent::envelope::Envelope;
@@ -41,7 +44,7 @@ use tos_core::agent::global_args::GlobalArgs;
 use tos_core::agent::output::OutputFormat;
 use tos_core::infra::config::{
     has_only_sibling_tos_namespace, overlay_effective_credentials, redact_effective, Binary,
-    ConfigFile, EffectiveProfile,
+    ConfigFile, EffectiveProfile, Profile,
 };
 use tos_core::infra::credentials::{CredentialSection, CredentialsFile};
 
@@ -167,14 +170,24 @@ fn describe_config_action(action: &ConfigAction) -> CommandDescription {
 }
 
 fn config_set_description() -> String {
-    if active_tos_config_binary() == Binary::VeTos {
-        "Set a configuration value. Bare keys use the active --profile; explicit key formats include staging.endpoint / default.ve-tos.control_endpoint".to_string()
+    config_set_description_for(active_tos_config_binary())
+}
+
+// [Review Fix #2] Keep describe metadata testable without mutating the
+// process-wide binary selector, which is shared by parallel tests.
+fn config_set_description_for(binary: Binary) -> String {
+    if binary == Binary::VeTos {
+        "Set a configuration value. VeTos auth_mode supports aksk or unified; Unified selects the same-name external profile and uses `ve login`. Bare credential keys write to the active profile's ve-tos credentials; explicit key formats include staging.endpoint / default.ve-tos.control_endpoint".to_string()
     } else {
-        "Set a configuration value. Bare keys use the active --profile; explicit key formats include staging.endpoint / default.tos.psm".to_string()
+        "Set a configuration value. Bare credential keys write to the active profile's tos credentials; explicit key formats include staging.endpoint / default.tos.psm".to_string()
     }
 }
 
 fn config_set_scenario_routing() -> HashMap<String, String> {
+    config_set_scenario_routing_for(active_tos_config_binary())
+}
+
+fn config_set_scenario_routing_for(binary: Binary) -> HashMap<String, String> {
     let mut routing = HashMap::from([
         (
             "Set shared region".to_string(),
@@ -190,8 +203,20 @@ fn config_set_scenario_routing() -> HashMap<String, String> {
             "Set staging access key".to_string(),
             crate::registry::public_tos_command("ve-tos config set staging.access_key_id AKxxx"),
         ),
+        (
+            "Set active surface access key".to_string(),
+            crate::registry::public_tos_command("ve-tos config set access_key_id AKxxx"),
+        ),
     ]);
-    if active_tos_config_binary() == Binary::VeTos {
+    if binary == Binary::VeTos {
+        routing.insert(
+            "Select Unified authentication".to_string(),
+            crate::registry::public_tos_command("ve-tos config set auth_mode unified"),
+        );
+        routing.insert(
+            "Invoke with Unified authentication".to_string(),
+            crate::registry::public_tos_command("ve-tos --profile default --auth-mode unified ls"),
+        );
         routing.insert(
             "Set control endpoint".to_string(),
             crate::registry::public_tos_command(
@@ -232,32 +257,48 @@ fn handle_dry_run(global: &GlobalArgs, action: &ConfigAction) -> Result<i32, Cli
         ConfigAction::Init { profile } => {
             let profile_name = effective_config_init_profile(global, profile.as_deref())?;
             let path = global.config_path();
-            let mut plan = vec![
-                format!("CREATE template config file at '{}'", path.display()),
-                format!(
-                    "WRITE [{}] with placeholder region + AK/SK (will be AES-256-GCM encrypted on real credential write)",
-                    profile_name
-                ),
-                format!(
-                    "WRITE [{}.{}] section with default endpoint",
-                    profile_name,
-                    active_tos_config_binary().as_str()
-                ),
-            ];
-            if active_tos_config_binary() == Binary::VeTos {
+            let active_binary = active_tos_config_binary();
+            let mut plan = vec![format!(
+                "CREATE template config file at '{}'",
+                path.display()
+            )];
+            if active_binary == Binary::VeTos {
+                plan.extend([
+                    format!(
+                        "WRITE [{}] with default region + AK/SK placeholders",
+                        profile_name
+                    ),
+                    format!(
+                        "WRITE [{}.{}] section with default endpoint",
+                        profile_name,
+                        active_binary.as_str()
+                    ),
+                ]);
                 // [Review Fix #4] Only `ve-tos` has a control plane endpoint;
                 // ByteCloud `tos` config init must not describe one.
                 plan.push(format!(
                     "DERIVE [{}.{}].control_endpoint from endpoint unless explicitly configured",
                     profile_name,
-                    active_tos_config_binary().as_str()
+                    active_binary.as_str()
                 ));
+            } else {
+                plan.extend([
+                    format!(
+                        "WRITE [{}] with AK/SK placeholders; network settings omitted",
+                        profile_name
+                    ),
+                    format!(
+                        "CREATE [{}.{}] section",
+                        profile_name,
+                        active_binary.as_str()
+                    ),
+                ]);
             }
             plan.extend([
                 format!(
                     "WRITE [{}.{}].checkpoint_dir default",
                     profile_name,
-                    active_tos_config_binary().as_str()
+                    active_binary.as_str()
                 ),
                 format!(
                     "WRITE [{}.{}].batch_report_dir default",
@@ -414,11 +455,12 @@ async fn handle_init(global: &GlobalArgs, profile: Option<&str>) -> Result<i32, 
 
     let mut config = ConfigFile::load_from(&path)?;
     let created = !config.profiles.contains_key(profile_name);
+    let active_binary = active_tos_config_binary();
     {
         let p = config.get_or_insert_profile(profile_name);
-        // [Review Fix #4] `init` 应补齐 shared + 当前 TOS 入口专属 section
-        // 的缺失字段，避免 ve-tos 与 tos-cli 共享同一个配置命名空间。
-        if p.region.is_none() {
+        // Only ve-tos has a stable production default pair. ByteTOS deployments
+        // must select endpoint or PSM explicitly.
+        if active_binary == Binary::VeTos && p.region.is_none() {
             p.region = Some("cn-beijing".to_string());
         }
         // 明显的占位符以 `<...>` 包裹，save() 时不会被加密
@@ -428,11 +470,11 @@ async fn handle_init(global: &GlobalArgs, profile: Option<&str>) -> Result<i32, 
         if p.secret_access_key.is_none() {
             p.secret_access_key = Some("<YOUR_SECRET_ACCESS_KEY>".to_string());
         }
-        let tos_override = match active_tos_config_binary() {
+        let tos_override = match active_binary {
             Binary::VeTos => p.ve_tos.get_or_insert_with(TosOverride::default),
             _ => p.tos.get_or_insert_with(TosOverride::default),
         };
-        if tos_override.endpoint.is_none() {
+        if active_binary == Binary::VeTos && tos_override.endpoint.is_none() {
             tos_override.endpoint = Some("tos-cn-beijing.volces.com".to_string());
         }
         if tos_override.checkpoint_dir.is_none() {
@@ -503,46 +545,38 @@ async fn handle_show(global: &GlobalArgs) -> Result<i32, CliError> {
     let path = global.config_path();
     let config_dir = ConfigFile::config_dir_from_path(&path);
     let config = ConfigFile::load_from(&path)?;
-    // [Review Fix #9] An explicit missing credentials path must not be
-    // silently treated as an empty store by inspection commands.
-    let credentials_path = global.existing_runtime_credentials_path()?;
-    let credentials = CredentialsFile::load_from(&credentials_path)?;
-
-    if config.profiles.is_empty() && credentials.profile_names().is_empty() {
-        return Err(CliError::ConfigMissing(format!(
-            "No config file found at {}. Run '{}' to create one.",
-            path.display(),
-            crate::registry::public_tos_command("ve-tos config init")
-        )));
-    }
-
-    // 当前 handler 所在 TOS 入口：`tos-cli` 使用 [profile.tos]，
-    // `ve-tos-cli` 使用 [profile.ve-tos]。
     let binary = active_tos_config_binary();
-
-    let mut display_config = config.clone();
-    for profile_name in credentials.profile_names() {
-        display_config.get_or_insert_profile(&profile_name);
-    }
-
-    let mut effective: Vec<EffectiveProfile> = Vec::new();
-    for (profile_name, profile) in &display_config.profiles {
-        let stored = credentials.effective_aksk(
-            profile_name,
-            credential_section_for_binary(binary),
-            &credentials_path,
-        )?;
-        if !config.profiles.contains_key(profile_name) && stored.is_empty() {
-            continue;
+    let selected_mode = if binary == Binary::VeTos {
+        resolve_auth_mode_from_config(global, &config)?.mode
+    } else {
+        AuthMode::Aksk
+    };
+    let credentials_path = global.credentials_path();
+    let effective = match selected_mode {
+        // [Review Fix #6] A unified inspection is selected-profile-only and
+        // never validates, reads, or decrypts the local credentials store.
+        AuthMode::Unified => {
+            if config.profiles.is_empty() {
+                return Err(config_show_missing_error(&path));
+            }
+            build_unified_config_show_profiles(global, &config, &config_dir, binary)?
         }
-        if has_only_sibling_tos_namespace(profile, binary) && stored.is_empty() {
-            continue;
+        AuthMode::Aksk => {
+            let existing_path = global.existing_runtime_credentials_path()?;
+            let credentials = CredentialsFile::load_from(&existing_path)?;
+            if config.profiles.is_empty() && credentials.profile_names().is_empty() {
+                return Err(config_show_missing_error(&path));
+            }
+            build_aksk_config_show_profiles(AkskConfigShowContext {
+                config: &config,
+                config_dir: &config_dir,
+                binary,
+                credentials_path: &credentials_path,
+                credentials: &credentials,
+                selected_profile: &global.profile,
+            })?
         }
-        let mut eff =
-            display_config.get_effective_profile_in_dir(profile_name, binary, &config_dir)?;
-        overlay_effective_credentials(&mut eff, &stored);
-        effective.push(redact_effective(eff));
-    }
+    };
 
     let format = global.output.unwrap_or_else(OutputFormat::auto_detect);
     match format {
@@ -600,6 +634,99 @@ async fn handle_show(global: &GlobalArgs) -> Result<i32, CliError> {
         }
     }
     Ok(0)
+}
+
+fn config_show_missing_error(path: &std::path::Path) -> CliError {
+    CliError::ConfigMissing(format!(
+        "No config file found at {}. Run '{}' to create one.",
+        path.display(),
+        crate::registry::public_tos_command("ve-tos config init")
+    ))
+}
+
+fn build_unified_config_show_profiles(
+    global: &GlobalArgs,
+    config: &ConfigFile,
+    config_dir: &std::path::Path,
+    binary: Binary,
+) -> Result<Vec<EffectiveProfile>, CliError> {
+    let effective = config.get_effective_profile_without_credentials_in_dir(
+        &global.profile,
+        binary,
+        config_dir,
+    )?;
+    Ok(vec![redact_effective(effective)])
+}
+
+struct AkskConfigShowContext<'a> {
+    config: &'a ConfigFile,
+    config_dir: &'a std::path::Path,
+    binary: Binary,
+    credentials_path: &'a std::path::Path,
+    credentials: &'a CredentialsFile,
+    selected_profile: &'a str,
+}
+
+fn build_aksk_config_show_profiles(
+    context: AkskConfigShowContext<'_>,
+) -> Result<Vec<EffectiveProfile>, CliError> {
+    let mut display_config = context.config.clone();
+    for profile_name in context.credentials.profile_names() {
+        display_config.get_or_insert_profile(&profile_name);
+    }
+    let mut effective = Vec::new();
+    for (profile_name, profile) in &display_config.profiles {
+        let is_unified_sibling = profile_name != context.selected_profile
+            && configured_unified_profile(profile, context.binary)?;
+        let stored = if is_unified_sibling {
+            Default::default()
+        } else {
+            context.credentials.effective_aksk(
+                profile_name,
+                credential_section_for_binary(context.binary),
+                context.credentials_path,
+            )?
+        };
+        if !context.config.profiles.contains_key(profile_name) && stored.is_empty() {
+            continue;
+        }
+        if has_only_sibling_tos_namespace(profile, context.binary) && stored.is_empty() {
+            continue;
+        }
+        let mut profile = if is_unified_sibling {
+            display_config.get_effective_profile_without_credentials_in_dir(
+                profile_name,
+                context.binary,
+                context.config_dir,
+            )?
+        } else {
+            display_config.get_effective_profile_in_dir(
+                profile_name,
+                context.binary,
+                context.config_dir,
+            )?
+        };
+        if !is_unified_sibling {
+            overlay_effective_credentials(&mut profile, &stored);
+        }
+        effective.push(redact_effective(profile));
+    }
+    Ok(effective)
+}
+
+fn configured_unified_profile(profile: &Profile, binary: Binary) -> Result<bool, CliError> {
+    if binary != Binary::VeTos {
+        return Ok(false);
+    }
+    // [Review Fix #6] A unified sibling remains non-secret even while the
+    // selected invocation uses AKSK and displays other credential profiles.
+    profile
+        .ve_tos
+        .as_ref()
+        .and_then(|settings| settings.auth_mode.as_deref())
+        .map(|value| AuthMode::parse(value, "profile config").map(|mode| mode == AuthMode::Unified))
+        .transpose()
+        .map(Option::unwrap_or_default)
 }
 
 fn credential_section_for_binary(binary: Binary) -> CredentialSection {
@@ -770,6 +897,7 @@ fn credential_section_path(profile_name: &str, section: CredentialSection) -> St
 /// 将 `ve-tos-cli config set` 的 key 解析为 1~3 段，并应用当前 TOS 入口的专属 section 默认路由规则。
 ///
 /// - `region`               → ["<active-profile>", "region"]
+/// - `access_key_id`        → ["<active-profile>", "<active-binary>", "access_key_id"]
 /// - `endpoint`             → ["<active-profile>", "<active-binary>", "endpoint"]
 /// - `control_endpoint`     → ["<active-profile>", "<active-binary>", "control_endpoint"]
 /// - `account_id`           → ["<active-profile>", "<active-binary>", "account_id"]
@@ -779,12 +907,58 @@ fn credential_section_path(profile_name: &str, section: CredentialSection) -> St
 /// - `requesttimeout`       → ["<active-profile>", "<active-binary>", "requesttimeout"]
 /// - `connecttimeout`       → ["<active-profile>", "<active-binary>", "connecttimeout"]
 /// - `maxconnections`       → ["<active-profile>", "<active-binary>", "maxconnections"]
+/// - `auth_mode`            → ["<active-profile>", "<active-binary>", "auth_mode"]
 /// - `staging.region`       → ["staging", "region"]
 /// - `staging.endpoint`     → ["staging", "<active-binary>", "endpoint"]
 /// - `staging.control_endpoint` → ["staging", "<active-binary>", "control_endpoint"]
 /// - `staging.account_id`   → ["staging", "<active-binary>", "account_id"]
 /// - `default.tos.endpoint` → ["default", "tos", "endpoint"]（显式指定）
 fn parse_key_path_for_tos(key: &str, active_profile: &str) -> Result<Vec<String>, CliError> {
+    parse_key_path_for_tos_binary(key, active_profile, active_tos_config_binary())
+}
+
+fn parse_key_path_for_tos_binary(
+    key: &str,
+    active_profile: &str,
+    active_binary: Binary,
+) -> Result<Vec<String>, CliError> {
+    // [Review Fix #2] Keep validation separate from binary routing so each
+    // helper remains focused and under the project function-size limit.
+    let parts = parse_config_key_parts(key, active_profile)?;
+    // [Review Fix #5] 技术方案 7.3 规定 TOS 专属字段默认写入当前入口的
+    // binary override，而不是 shared `[profile]`。
+    let routed = match parts.as_slice() {
+        [field] if is_aksk_credential_key(field) => {
+            vec![
+                active_profile.to_string(),
+                active_binary.as_str().to_string(),
+                field.clone(),
+            ]
+        }
+        [field] if is_default_tos_override_key(field) => {
+            vec![
+                active_profile.to_string(),
+                active_binary.as_str().to_string(),
+                field.clone(),
+            ]
+        }
+        [field] => vec![active_profile.to_string(), field.clone()],
+        [profile, field] if is_default_tos_override_key(field) => {
+            vec![
+                profile.clone(),
+                active_binary.as_str().to_string(),
+                field.clone(),
+            ]
+        }
+        _ => parts,
+    };
+    reject_unsupported_tos_control_endpoint(&routed)?;
+    reject_unsupported_psm_config_fields(&routed, active_binary)?;
+    validate_auth_mode_route(&routed, active_binary)?;
+    Ok(routed)
+}
+
+fn parse_config_key_parts(key: &str, active_profile: &str) -> Result<Vec<String>, CliError> {
     if active_profile.is_empty() {
         // [Review Fix #18] Bare config keys need a concrete destination profile.
         return Err(CliError::ValidationError(
@@ -805,43 +979,38 @@ fn parse_key_path_for_tos(key: &str, active_profile: &str) -> Result<Vec<String>
             key
         )));
     }
-    // [Review Fix #5] 技术方案 7.3 规定 TOS 专属字段默认写入当前入口的
-    // binary override，而不是 shared `[profile]`。
-    let routed = match parts.as_slice() {
-        [field] if is_default_tos_override_key(field) => {
-            vec![
-                active_profile.to_string(),
-                active_tos_config_binary().as_str().to_string(),
-                field.clone(),
-            ]
-        }
-        [field] => vec![active_profile.to_string(), field.clone()],
-        [profile, field] if is_default_tos_override_key(field) => {
-            vec![
-                profile.clone(),
-                active_tos_config_binary().as_str().to_string(),
-                field.clone(),
-            ]
-        }
-        _ => parts,
-    };
-    reject_unsupported_tos_control_endpoint(&routed)?;
-    reject_unsupported_psm_config_fields(&routed)?;
-    reject_non_adrive_auth_mode(&routed)?;
-    Ok(routed)
+    Ok(parts)
 }
 
-fn reject_non_adrive_auth_mode(path: &[String]) -> Result<(), CliError> {
-    // [Review Fix #18] The shared config parser understands ADrive sections,
-    // but auth-mode ownership remains exclusive to the ADrive CLI surface.
-    if path.len() == 3 && Binary::parse(&path[1]) == Some(Binary::Adrive) && path[2] == "auth_mode"
-    {
+fn is_aksk_credential_key(field: &str) -> bool {
+    matches!(
+        field,
+        "access_key_id" | "secret_access_key" | "security_token"
+    )
+}
+
+fn validate_auth_mode_route(path: &[String], active_binary: Binary) -> Result<(), CliError> {
+    if path.last().map(String::as_str) != Some("auth_mode") {
+        return Ok(());
+    }
+    if active_binary == Binary::Tos {
         return Err(CliError::ValidationError(
-            "auth_mode is only supported by ve-adrive; use `ve-adrive config set auth_mode <aksk|oauth>`"
+            "auth_mode is not supported by tos; use `ve-tos config set auth_mode <aksk|unified>`"
                 .to_string(),
         ));
     }
-    Ok(())
+    if path.len() == 3 && Binary::parse(&path[1]) == Some(Binary::VeTos) {
+        return Ok(());
+    }
+    if path.len() == 3 && Binary::parse(&path[1]) == Some(Binary::Adrive) {
+        return Err(CliError::ValidationError(
+            "auth_mode for adrive is only supported by ve-adrive; use `ve-adrive config set auth_mode <aksk|oauth|unified>`".to_string(),
+        ));
+    }
+    let namespace = path.get(1).map(String::as_str).unwrap_or("shared");
+    Err(CliError::ValidationError(format!(
+        "auth_mode is not supported in the {namespace} config namespace"
+    )))
 }
 
 fn reject_unsupported_tos_control_endpoint(path: &[String]) -> Result<(), CliError> {
@@ -857,13 +1026,16 @@ fn reject_unsupported_tos_control_endpoint(path: &[String]) -> Result<(), CliErr
     Ok(())
 }
 
-fn reject_unsupported_psm_config_fields(path: &[String]) -> Result<(), CliError> {
+fn reject_unsupported_psm_config_fields(
+    path: &[String],
+    active_binary: Binary,
+) -> Result<(), CliError> {
     let Some(field) = path.last() else {
         return Ok(());
     };
     // [Review Fix #3] The ve-tos entry must not write PSM fields even through
     // explicit sibling paths such as `default.tos.psm`.
-    if active_tos_config_binary() != Binary::Tos && is_psm_config_field(field) {
+    if active_binary != Binary::Tos && is_psm_config_field(field) {
         return Err(CliError::ValidationError(
             "PSM config fields are only supported by tos".to_string(),
         ));
@@ -905,6 +1077,7 @@ fn is_default_tos_override_key(field: &str) -> bool {
             | "connect_timeout"
             | "maxconnections"
             | "max_connections"
+            | "auth_mode"
     )
 }
 
@@ -993,4 +1166,251 @@ fn output_envelope<T: serde::Serialize>(
     envelope: &Envelope<T>,
 ) -> Result<(), CliError> {
     output_result(global, envelope)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn config_describe_documents_unified_only_for_ve_tos() {
+        let ve_tos_description = config_set_description_for(Binary::VeTos);
+        let ve_tos_routing = config_set_scenario_routing_for(Binary::VeTos);
+        assert!(ve_tos_description.contains("aksk or unified"));
+        assert!(ve_tos_description.contains("ve login"));
+        assert!(ve_tos_routing
+            .values()
+            .any(|command| command.contains("auth_mode unified")));
+
+        assert!(!config_set_description_for(Binary::Tos).contains("unified"));
+        assert!(!config_set_scenario_routing_for(Binary::Tos)
+            .values()
+            .any(|command| command.contains("unified")));
+    }
+
+    #[tokio::test]
+    async fn unified_config_show_ignores_malformed_credentials_and_encrypted_config_secrets() {
+        let _lock = CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let original_binary = std::env::var_os("VE_STORAGE_UNI_TOS_CONFIG_BINARY");
+        std::env::set_var("VE_STORAGE_UNI_TOS_CONFIG_BINARY", "ve-tos");
+        let directory = std::env::temp_dir().join(format!(
+            "ve-tos-unified-config-show-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.toml");
+        let credentials_path = directory.join("malformed-credentials.toml");
+        std::fs::write(
+            &config_path,
+            concat!(
+                "[selected]\n",
+                "region = \"cn-beijing\"\n",
+                "access_key_id = \"ENC:not-valid\"\n",
+                "secret_access_key = \"ENC:not-valid\"\n",
+                "security_token = \"ENC:not-valid\"\n",
+                "[selected.ve-tos]\n",
+                "auth_mode = \"unified\"\n",
+                "endpoint = \"https://tos.example.com\"\n",
+                "[unselected]\n",
+                "access_key_id = \"ENC:not-valid\"\n",
+                "secret_access_key = \"ENC:not-valid\"\n",
+                "[unselected.ve-tos]\n",
+                "auth_mode = \"aksk\"\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(&credentials_path, "[this is not valid TOML").unwrap();
+        let mut global = GlobalArgs::default();
+        global.profile = "selected".to_string();
+        global.config_path = Some(config_path);
+        global.credentials_path = Some(credentials_path.clone());
+        global.ve_tos_auth_mode = Some("unified".to_string());
+        global.output = Some(OutputFormat::Json);
+
+        let result = handle_show(&global).await;
+
+        assert!(result.is_ok(), "result={result:?}");
+        assert_eq!(
+            std::fs::read_to_string(&credentials_path).unwrap(),
+            "[this is not valid TOML"
+        );
+        assert!(!directory.join(".key").exists());
+        match original_binary {
+            Some(value) => std::env::set_var("VE_STORAGE_UNI_TOS_CONFIG_BINARY", value),
+            None => std::env::remove_var("VE_STORAGE_UNI_TOS_CONFIG_BINARY"),
+        }
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn unified_config_show_profiles_only_include_selected_profile() {
+        let directory = std::env::temp_dir().join(format!(
+            "ve-tos-unified-selected-show-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut config = ConfigFile::default();
+        let selected = config.get_or_insert_profile("selected");
+        selected.region = Some("cn-beijing".to_string());
+        selected.access_key_id = Some("ENC:not-valid".to_string());
+        selected.secret_access_key = Some("ENC:not-valid".to_string());
+        selected
+            .ve_tos
+            .get_or_insert_with(Default::default)
+            .auth_mode = Some("unified".to_string());
+        let unselected = config.get_or_insert_profile("unselected");
+        unselected.access_key_id = Some("ENC:not-valid".to_string());
+        unselected.secret_access_key = Some("ENC:not-valid".to_string());
+
+        let mut global = GlobalArgs::default();
+        global.profile = "selected".to_string();
+        let profiles =
+            build_unified_config_show_profiles(&global, &config, &directory, Binary::VeTos)
+                .unwrap();
+
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].profile_name, "selected");
+        assert_eq!(profiles[0].region.value.as_deref(), Some("cn-beijing"));
+        assert!(profiles[0].access_key_id.value.is_none());
+        assert!(profiles[0].secret_access_key.value.is_none());
+        assert!(profiles[0].security_token.value.is_none());
+        assert!(!directory.join(".key").exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn aksk_config_show_keeps_selected_credentials_and_isolates_unified_sibling() {
+        let directory = std::env::temp_dir().join(format!(
+            "ve-tos-mixed-auth-show-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let credentials_path = directory.join("credentials.toml");
+        let mut config = ConfigFile::default();
+        config
+            .get_or_insert_profile("selected")
+            .ve_tos
+            .get_or_insert_with(Default::default)
+            .auth_mode = Some("unified".to_string());
+        let unified = config.get_or_insert_profile("unified");
+        unified.access_key_id = Some("ENC:not-valid".to_string());
+        unified.secret_access_key = Some("ENC:not-valid".to_string());
+        unified
+            .ve_tos
+            .get_or_insert_with(Default::default)
+            .auth_mode = Some("unified".to_string());
+
+        let mut credentials = CredentialsFile::default();
+        for (profile_name, access_key, secret_key) in [
+            ("selected", "selected-ak", "selected-sk"),
+            ("unified", "unified-ak", "unified-sk"),
+        ] {
+            credentials
+                .set_aksk_field(
+                    profile_name,
+                    CredentialSection::VeTos,
+                    "access_key_id",
+                    access_key,
+                )
+                .unwrap();
+            credentials
+                .set_aksk_field(
+                    profile_name,
+                    CredentialSection::VeTos,
+                    "secret_access_key",
+                    secret_key,
+                )
+                .unwrap();
+        }
+        credentials.save_to_path(&credentials_path).unwrap();
+        let loaded = CredentialsFile::load_from(&credentials_path).unwrap();
+
+        let profiles = build_aksk_config_show_profiles(AkskConfigShowContext {
+            config: &config,
+            config_dir: &directory,
+            binary: Binary::VeTos,
+            credentials_path: &credentials_path,
+            credentials: &loaded,
+            selected_profile: "selected",
+        })
+        .unwrap();
+        let selected = profiles
+            .iter()
+            .find(|profile| profile.profile_name == "selected")
+            .unwrap();
+        let unified = profiles
+            .iter()
+            .find(|profile| profile.profile_name == "unified")
+            .unwrap();
+
+        assert!(selected.access_key_id.value.is_some());
+        assert_eq!(
+            selected.access_key_id.source,
+            tos_core::infra::config::FieldSource::CredentialsFile
+        );
+        assert!(selected.secret_access_key.value.is_some());
+        assert!(unified.access_key_id.value.is_none());
+        assert!(unified.secret_access_key.value.is_none());
+        assert!(unified.security_token.value.is_none());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn bare_ve_tos_auth_mode_routes_to_active_profile_override() {
+        assert_eq!(
+            parse_key_path_for_tos_binary("auth_mode", "staging", Binary::VeTos).unwrap(),
+            ["staging", "ve-tos", "auth_mode"]
+        );
+        assert_eq!(
+            parse_key_path_for_tos_binary("dev.auth_mode", "default", Binary::VeTos).unwrap(),
+            ["dev", "ve-tos", "auth_mode"]
+        );
+    }
+
+    #[test]
+    fn tos_surface_rejects_auth_mode_for_bare_and_explicit_namespaces() {
+        for key in [
+            "auth_mode",
+            "default.auth_mode",
+            "default.tos.auth_mode",
+            "default.ve-tos.auth_mode",
+        ] {
+            let error = parse_key_path_for_tos_binary(key, "default", Binary::Tos).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Validation error: auth_mode is not supported by tos; use `ve-tos config set auth_mode <aksk|unified>`",
+                "key={key}"
+            );
+        }
+    }
+
+    #[test]
+    fn ve_tos_surface_rejects_auth_mode_for_other_service_namespaces() {
+        let adrive_error =
+            parse_key_path_for_tos_binary("default.adrive.auth_mode", "default", Binary::VeTos)
+                .unwrap_err();
+        assert_eq!(
+            adrive_error.to_string(),
+            "Validation error: auth_mode for adrive is only supported by ve-adrive; use `ve-adrive config set auth_mode <aksk|oauth|unified>`"
+        );
+
+        for namespace in ["tos", "tosvector", "tostable"] {
+            let key = format!("default.{namespace}.auth_mode");
+            let error = parse_key_path_for_tos_binary(&key, "default", Binary::VeTos).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Validation error: auth_mode is not supported in the {namespace} config namespace"
+                )
+            );
+        }
+    }
 }

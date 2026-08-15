@@ -25,10 +25,76 @@ use tos_core::agent::envelope::Envelope;
 use tos_core::agent::error::CliError;
 use tos_core::agent::global_args::GlobalArgs;
 use tos_core::agent::output::{format_markdown, format_table, format_xml, OutputFormat};
+use tos_core::infra::client::TosClient;
 use tos_core::infra::config::{merge_tos_runtime_profile, Binary, ConfigFile, Profile};
 use tos_core::infra::credentials::{CredentialSection, CredentialsFile};
+use tos_core::infra::unified_credentials::UnifiedCredentialProvider;
+
+use crate::domain::auth::{AuthMode, AuthModeSource, ResolvedAuthMode};
 
 const TOS_CONFIG_BINARY_ENV: &str = "VE_STORAGE_UNI_TOS_CONFIG_BINARY";
+
+enum RuntimeAuth {
+    Aksk,
+    Unified(UnifiedCredentialProvider),
+}
+
+/// One invocation's profile and authentication mode resolved from one config snapshot.
+pub(crate) struct TosRuntime {
+    /// Effective resource and HTTP profile for the invocation.
+    pub(crate) profile: Profile,
+    /// Effective authentication mode and its source.
+    pub(crate) auth_mode: ResolvedAuthMode,
+    auth: RuntimeAuth,
+}
+
+impl TosRuntime {
+    /// Build a client using this runtime's effective profile and request trace.
+    pub(crate) fn client(&self, global: &GlobalArgs, service: &str) -> Result<TosClient, CliError> {
+        self.client_with_profile(global, service, &self.profile)
+    }
+
+    /// Build a client for a resource override without re-resolving authentication mode.
+    pub(crate) fn client_with_profile(
+        &self,
+        global: &GlobalArgs,
+        service: &str,
+        profile: &Profile,
+    ) -> Result<TosClient, CliError> {
+        self.client_with_request_trace(
+            service,
+            profile,
+            std::sync::Arc::clone(&global.request_trace),
+        )
+    }
+
+    /// Build a client with an explicit trace while preserving this runtime's auth mode.
+    pub(crate) fn client_with_request_trace(
+        &self,
+        service: &str,
+        profile: &Profile,
+        request_trace: std::sync::Arc<tos_core::agent::request_id::ServiceRequestTrace>,
+    ) -> Result<TosClient, CliError> {
+        // [Review Fix #1] Match both representations so a future constructor
+        // change cannot silently route Unified mode through static credentials.
+        match (self.auth_mode.mode, &self.auth) {
+            (AuthMode::Aksk, RuntimeAuth::Aksk) => {
+                TosClient::new_with_request_trace(profile, service, request_trace)
+            }
+            (AuthMode::Unified, RuntimeAuth::Unified(provider)) => {
+                TosClient::new_with_unified_credentials_and_request_trace(
+                    profile,
+                    service,
+                    provider.clone(),
+                    request_trace,
+                )
+            }
+            _ => Err(CliError::Unknown(
+                "TOS runtime authentication invariant violated".to_string(),
+            )),
+        }
+    }
+}
 
 /// Build the effective runtime profile for TOS commands.
 ///
@@ -41,6 +107,11 @@ const TOS_CONFIG_BINARY_ENV: &str = "VE_STORAGE_UNI_TOS_CONFIG_BINARY";
 /// through `Profile::from_env()` so they sit at the lowest precedence and
 /// never get silently promoted above the config file.
 pub(crate) fn build_profile(global: &GlobalArgs) -> Result<Profile, CliError> {
+    Ok(build_runtime(global)?.profile)
+}
+
+/// Resolve one invocation's profile and authentication mode from one config snapshot.
+pub(crate) fn build_runtime(global: &GlobalArgs) -> Result<TosRuntime, CliError> {
     if global.profile.is_empty() {
         // [Review Fix #22] Runtime commands must not silently fall back to env/default
         // credentials when the selected profile name is empty.
@@ -53,25 +124,67 @@ pub(crate) fn build_profile(global: &GlobalArgs) -> Result<Profile, CliError> {
     let config_dir = ConfigFile::config_dir_from_path(&config_path);
     let config = ConfigFile::load_from(&config_path)?;
     let active_binary = active_tos_config_binary();
-    let env_profile = match active_binary {
-        Binary::Tos => Profile::from_byte_tos_env(),
+    // [Review Fix #1] Resolve mode and resources from one config snapshot so
+    // a concurrent config rewrite cannot select AK/SK after unified was read.
+    let auth_mode = if active_binary == Binary::VeTos {
+        resolve_auth_mode_from_config(global, &config)?
+    } else {
+        ResolvedAuthMode {
+            mode: AuthMode::Aksk,
+            source: AuthModeSource::CompatibilityDefault,
+        }
+    };
+    let env_profile = match (active_binary, auth_mode.mode) {
+        (Binary::Tos, _) => Profile::from_byte_tos_env(),
+        // [Review Fix #4] Use the constructor that never queries TOS
+        // credential variables for the unified path.
+        (Binary::VeTos, AuthMode::Unified) => Profile::from_env_without_credentials(),
         _ => Profile::from_env(),
     };
-    let credentials_path = global.existing_runtime_credentials_path()?;
-    let credentials = CredentialsFile::load_from(&credentials_path)?;
-    let credential_section = match active_binary {
-        Binary::Tos => CredentialSection::Tos,
-        _ => CredentialSection::VeTos,
+    let stored_credentials = match auth_mode.mode {
+        AuthMode::Unified => None,
+        AuthMode::Aksk => {
+            let credentials_path = global.existing_runtime_credentials_path()?;
+            let credentials = CredentialsFile::load_from(&credentials_path)?;
+            let credential_section = match active_binary {
+                Binary::Tos => CredentialSection::Tos,
+                _ => CredentialSection::VeTos,
+            };
+            Some(credentials.effective_aksk(
+                &global.profile,
+                credential_section,
+                &credentials_path,
+            )?)
+        }
     };
-    let stored_credentials =
-        credentials.effective_aksk(&global.profile, credential_section, &credentials_path)?;
     let mut config_profile = if config.profiles.is_empty() && global.profile == "default" {
         Profile::default()
     } else {
-        match config.get_effective_profile_in_dir(&global.profile, active_binary, &config_dir) {
+        // [Review Fix #3] Runtime-only controls may establish a missing named
+        // profile only for ve-tos unified; AKSK and tos retain legacy fallback.
+        let has_environment_profile =
+            if active_binary == Binary::VeTos && auth_mode.mode == AuthMode::Unified {
+                has_unified_non_secret_env_profile_values(&env_profile)
+            } else {
+                has_tos_env_profile_values(&env_profile)
+            };
+        let effective_profile = match auth_mode.mode {
+            AuthMode::Aksk => {
+                config.get_effective_profile_in_dir(&global.profile, active_binary, &config_dir)
+            }
+            AuthMode::Unified => config.get_effective_profile_without_credentials_in_dir(
+                &global.profile,
+                active_binary,
+                &config_dir,
+            ),
+        };
+        match effective_profile {
             Ok(effective) => effective.into_flat_profile(),
             Err(CliError::ConfigMissing(_))
-                if has_tos_env_profile_values(&env_profile) || !stored_credentials.is_empty() =>
+                if has_environment_profile
+                    || stored_credentials
+                        .as_ref()
+                        .is_some_and(|credentials| !credentials.is_empty()) =>
             {
                 // [Review Fix #10] Keep runtime env-only profiles working for
                 // the active surface: `ve-tos` consumes TOS_* while the new
@@ -82,7 +195,9 @@ pub(crate) fn build_profile(global: &GlobalArgs) -> Result<Profile, CliError> {
             Err(err) => return Err(err),
         }
     };
-    stored_credentials.apply_to_profile(&mut config_profile);
+    if let Some(stored_credentials) = stored_credentials {
+        stored_credentials.apply_to_profile(&mut config_profile);
+    }
 
     let cli_profile = Profile {
         region: global.region.clone(),
@@ -125,7 +240,76 @@ pub(crate) fn build_profile(global: &GlobalArgs) -> Result<Profile, CliError> {
         env_profile.merge(&config_profile).merge(&cli_profile)
     };
     validate_tos_psm_cli_modifiers(global, &effective_profile)?;
-    Ok(effective_profile)
+    let auth = match auth_mode.mode {
+        AuthMode::Aksk => RuntimeAuth::Aksk,
+        AuthMode::Unified => {
+            RuntimeAuth::Unified(UnifiedCredentialProvider::new(global.profile.clone()))
+        }
+    };
+    Ok(TosRuntime {
+        profile: effective_profile,
+        auth_mode,
+        auth,
+    })
+}
+
+/// Resolve the effective ve-tos authentication mode without reading credentials.
+#[cfg(test)]
+pub(crate) fn resolve_auth_mode(global: &GlobalArgs) -> Result<ResolvedAuthMode, CliError> {
+    if global.profile.is_empty() {
+        return Err(CliError::ValidationError(
+            "Invalid profile name: profile must not be empty".to_string(),
+        ));
+    }
+    if let Some(value) = global.ve_tos_auth_mode.as_deref() {
+        return Ok(ResolvedAuthMode {
+            mode: AuthMode::parse(value, "command line")?,
+            source: AuthModeSource::CommandLine,
+        });
+    }
+
+    let config_path = global.existing_runtime_config_path()?;
+    let config = ConfigFile::load_from(&config_path)?;
+    resolve_auth_mode_from_config(global, &config)
+}
+
+pub(crate) fn resolve_auth_mode_from_config(
+    global: &GlobalArgs,
+    config: &ConfigFile,
+) -> Result<ResolvedAuthMode, CliError> {
+    if global.profile.is_empty() {
+        return Err(CliError::ValidationError(
+            "Invalid profile name: profile must not be empty".to_string(),
+        ));
+    }
+    if let Some(value) = global.ve_tos_auth_mode.as_deref() {
+        return Ok(ResolvedAuthMode {
+            mode: AuthMode::parse(value, "command line")?,
+            source: AuthModeSource::CommandLine,
+        });
+    }
+    if let Some(value) = config
+        .profiles
+        .get(&global.profile)
+        .and_then(|profile| profile.ve_tos.as_ref())
+        .and_then(|settings| settings.auth_mode.as_deref())
+    {
+        return Ok(ResolvedAuthMode {
+            mode: AuthMode::parse(value, "profile config")?,
+            source: AuthModeSource::Config,
+        });
+    }
+    if let Ok(value) = std::env::var("TOS_AUTH_MODE") {
+        return Ok(ResolvedAuthMode {
+            mode: AuthMode::parse(&value, "TOS_AUTH_MODE")?,
+            source: AuthModeSource::Environment,
+        });
+    }
+
+    Ok(ResolvedAuthMode {
+        mode: AuthMode::Aksk,
+        source: AuthModeSource::CompatibilityDefault,
+    })
 }
 
 fn validate_tos_psm_cli_modifiers(global: &GlobalArgs, profile: &Profile) -> Result<(), CliError> {
@@ -162,6 +346,28 @@ fn has_tos_env_profile_values(profile: &Profile) -> bool {
         || profile.batch_report_dir.is_some()
         || profile.batch_report_format.is_some()
         || profile.progress_enabled.is_some()
+        || profile.max_retry_count.is_some()
+        || profile.requesttimeout.is_some()
+        || profile.connecttimeout.is_some()
+        || profile.maxconnections.is_some()
+}
+
+fn has_unified_non_secret_env_profile_values(profile: &Profile) -> bool {
+    profile.region.is_some()
+        || profile.endpoint.is_some()
+        || profile.psm.is_some()
+        || profile.control_endpoint.is_some()
+        || profile.account_id.is_some()
+        || profile.checkpoint_dir.is_some()
+        || profile.batch_report_dir.is_some()
+        || profile.batch_report_format.is_some()
+        || profile.progress_enabled.is_some()
+        || profile.checkpoint_threshold.is_some()
+        || profile.batch_concurrency.is_some()
+        || profile.list_concurrency.is_some()
+        || profile.multipart_concurrency.is_some()
+        || profile.progress_granularity.is_some()
+        || profile.overwrite_strategy.is_some()
         || profile.max_retry_count.is_some()
         || profile.requesttimeout.is_some()
         || profile.connecttimeout.is_some()
@@ -460,7 +666,13 @@ pub fn output_result_with_columns<T: Serialize>(
     result: &T,
     columns: Option<&'static [&'static str]>,
 ) -> Result<(), CliError> {
-    let raw = serde_json::to_value(result)?;
+    let mut raw = serde_json::to_value(result)?;
+    if global.uses_chinese_documentation() && active_tos_config_binary() == Binary::VeTos {
+        // [Review Fix #GlobalZh3] Localize the canonical VeTos Describe
+        // document at its shared output boundary so command-group and dynamic
+        // API handlers keep their full machine-readable payload.
+        crate::handler::meta::localize_ve_tos_auth_documentation_zh(&mut raw);
+    }
     let enveloped = ensure_envelope(global, raw);
     let value = apply_query(global, enveloped)?;
     render_value(global, &value, columns)
@@ -468,32 +680,20 @@ pub fn output_result_with_columns<T: Serialize>(
 
 /// [Review Fix #1] 检测是否已是 Envelope，不是则自动包装。
 fn ensure_envelope(global: &GlobalArgs, value: Value) -> Value {
-    let was_envelope = is_envelope_shape(&value);
-    let mut value = if was_envelope {
+    let mut value = if is_envelope_shape(&value) {
         value
     } else {
         let command = describe_command(global);
         let envelope = Envelope::success(command, value);
         serde_json::to_value(envelope).unwrap_or(Value::Null)
     };
-    // [Review Fix #1] Raw values pass through Envelope::success first, which
-    // generates a fallback ULID; prefer the upstream request id when present.
-    if !was_envelope {
-        if let Some(id) = last_request_id_from_env() {
-            if let Value::Object(map) = &mut value {
-                map.insert("request_id".to_string(), Value::String(id));
-            }
-        }
-    }
-    // [G8] Auto-inject a request_id if the caller did not set one. Priority:
-    //   1. Existing request_id on the Envelope (set by handlers that already
-    //      surfaced an upstream X-Tos-Request-Id header).
-    //   1.5 Explicit null request_id, used by aggregate commands with no
-    //       single upstream request ID.
-    //   2. The TOS_LAST_REQUEST_ID env var (set by infra::client when an
-    //      HTTP response carried X-Tos-Request-Id) — lets us correlate even
-    //      for handlers that haven't been refactored.
-    //   3. Generated ULID, so every Agent invocation has a stable handle.
+    tos_core::agent::request_id::apply_service_trace_to_success_envelope(
+        &mut value,
+        &global.request_trace.snapshot(),
+    );
+    // [Review Fix #4] Successful output only trusts explicitly propagated or
+    // invocation-traced IDs. The process environment can be stale across
+    // local commands and concurrent work, so fallback generation is local.
     inject_request_id(&mut value);
     normalize_envelope_command(&mut value);
     value
@@ -538,14 +738,10 @@ fn inject_request_id(value: &mut Value) {
     if !needs_id {
         return;
     }
-    let id = last_request_id_from_env().unwrap_or_else(|| ulid::Ulid::new().to_string());
-    map.insert("request_id".to_string(), Value::String(id));
-}
-
-fn last_request_id_from_env() -> Option<String> {
-    std::env::var("TOS_LAST_REQUEST_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
+    map.insert(
+        "request_id".to_string(),
+        Value::String(ulid::Ulid::new().to_string()),
+    );
 }
 
 fn is_envelope_shape(value: &Value) -> bool {
@@ -1017,7 +1213,9 @@ pub(crate) fn marker_query(flags: &[&str]) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::auth::{AuthMode, AuthModeSource};
     use serde_json::json;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     /// [G8] Tests that read or write the `TOS_LAST_REQUEST_ID` env var must
@@ -1028,6 +1226,469 @@ mod tests {
 
     fn global() -> GlobalArgs {
         GlobalArgs::default()
+    }
+
+    struct EnvironmentRestore {
+        values: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvironmentRestore {
+        fn capture(names: &[&'static str]) -> Self {
+            Self {
+                values: names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvironmentRestore {
+        fn drop(&mut self) {
+            for (name, value) in self.values.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn test_directory(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "ve-tos-auth-{label}-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn write_config(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn resolve_auth_mode_uses_cli_config_environment_default_precedence() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _restore = EnvironmentRestore::capture(&["TOS_AUTH_MODE"]);
+        let directory = test_directory("precedence");
+        let config_path = directory.join("config.toml");
+        write_config(
+            &config_path,
+            concat!(
+                "[selected.ve-tos]\n",
+                "auth_mode = \"unified\"\n",
+                "[other.ve-tos]\n",
+                "auth_mode = \"aksk\"\n",
+            ),
+        );
+        std::env::set_var("TOS_AUTH_MODE", "aksk");
+        let mut selected = global();
+        selected.profile = "selected".to_string();
+        selected.config_path = Some(config_path.clone());
+        selected.ve_tos_auth_mode = Some("aksk".to_string());
+
+        let cli = resolve_auth_mode(&selected).unwrap();
+        assert_eq!(cli.mode, AuthMode::Aksk);
+        assert_eq!(cli.source, AuthModeSource::CommandLine);
+
+        selected.ve_tos_auth_mode = None;
+        let config = resolve_auth_mode(&selected).unwrap();
+        assert_eq!(config.mode, AuthMode::Unified);
+        assert_eq!(config.source, AuthModeSource::Config);
+
+        selected.profile = "environment".to_string();
+        let environment = resolve_auth_mode(&selected).unwrap();
+        assert_eq!(environment.mode, AuthMode::Aksk);
+        assert_eq!(environment.source, AuthModeSource::Environment);
+
+        std::env::remove_var("TOS_AUTH_MODE");
+        let compatibility = resolve_auth_mode(&selected).unwrap();
+        assert_eq!(compatibility.mode, AuthMode::Aksk);
+        assert_eq!(compatibility.source, AuthModeSource::CompatibilityDefault);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn resolve_auth_mode_rejects_invalid_environment_value() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _restore = EnvironmentRestore::capture(&["TOS_AUTH_MODE"]);
+        std::env::set_var("TOS_AUTH_MODE", "oauth");
+        let directory = test_directory("invalid-environment");
+        let config_path = directory.join("config.toml");
+        write_config(&config_path, "");
+        let mut selected = global();
+        selected.profile = "environment-only".to_string();
+        selected.config_path = Some(config_path);
+
+        let error = resolve_auth_mode(&selected).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Validation error: invalid ve-tos auth mode 'oauth' from TOS_AUTH_MODE; expected aksk or unified"
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn unified_profile_ignores_all_local_credentials_and_keeps_resources() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _restore = EnvironmentRestore::capture(&[
+            TOS_CONFIG_BINARY_ENV,
+            "TOS_AUTH_MODE",
+            "TOS_ACCESS_KEY",
+            "TOS_SECRET_KEY",
+            "TOS_SECURITY_TOKEN",
+            "TOS_ENDPOINT",
+        ]);
+        std::env::set_var(TOS_CONFIG_BINARY_ENV, "ve-tos");
+        std::env::set_var("TOS_AUTH_MODE", "unified");
+        std::env::set_var("TOS_ACCESS_KEY", "ignored-env-ak");
+        std::env::set_var("TOS_SECRET_KEY", "ignored-env-sk");
+        std::env::set_var("TOS_SECURITY_TOKEN", "ignored-env-token");
+        std::env::set_var("TOS_ENDPOINT", "https://environment.example.com");
+        let directory = test_directory("unified-profile");
+        let config_path = directory.join("config.toml");
+        let credentials_path = directory.join("missing-credentials.toml");
+        write_config(
+            &config_path,
+            concat!(
+                "[selected]\n",
+                "region = \"cn-beijing\"\n",
+                "access_key_id = \"ENC:not-valid\"\n",
+                "secret_access_key = \"ENC:not-valid\"\n",
+                "security_token = \"ENC:not-valid\"\n",
+                "[selected.ve-tos]\n",
+                "endpoint = \"https://config.example.com\"\n",
+                "control_endpoint = \"https://control.example.com\"\n",
+                "max_retry_count = 8\n",
+            ),
+        );
+        let mut selected = global();
+        selected.profile = "selected".to_string();
+        selected.config_path = Some(config_path);
+        selected.credentials_path = Some(credentials_path.clone());
+
+        let profile = build_profile(&selected).unwrap();
+
+        assert_eq!(profile.region.as_deref(), Some("cn-beijing"));
+        assert_eq!(
+            profile.endpoint.as_deref(),
+            Some("https://config.example.com")
+        );
+        assert_eq!(
+            profile.control_endpoint.as_deref(),
+            Some("https://control.example.com")
+        );
+        assert_eq!(profile.max_retry_count, Some(8));
+        assert!(profile.access_key_id.is_none());
+        assert!(profile.secret_access_key.is_none());
+        assert!(profile.security_token.is_none());
+        assert!(!credentials_path.exists());
+        assert!(!directory.join(".key").exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn unified_profile_does_not_read_malformed_credentials_file() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _restore = EnvironmentRestore::capture(&[
+            TOS_CONFIG_BINARY_ENV,
+            "TOS_AUTH_MODE",
+            "TOS_ACCESS_KEY",
+            "TOS_SECRET_KEY",
+            "TOS_SECURITY_TOKEN",
+        ]);
+        std::env::set_var(TOS_CONFIG_BINARY_ENV, "ve-tos");
+        std::env::set_var("TOS_AUTH_MODE", "unified");
+        std::env::remove_var("TOS_ACCESS_KEY");
+        std::env::remove_var("TOS_SECRET_KEY");
+        std::env::remove_var("TOS_SECURITY_TOKEN");
+        let directory = test_directory("malformed-credentials");
+        let config_path = directory.join("config.toml");
+        let credentials_path = directory.join("credentials.toml");
+        write_config(
+            &config_path,
+            "[selected.ve-tos]\nendpoint = \"tos.example.com\"\n",
+        );
+        write_config(&credentials_path, "this is not valid credentials TOML");
+        let mut selected = global();
+        selected.profile = "selected".to_string();
+        selected.config_path = Some(config_path);
+        selected.credentials_path = Some(credentials_path.clone());
+
+        let profile = build_profile(&selected).unwrap();
+
+        assert_eq!(profile.endpoint.as_deref(), Some("tos.example.com"));
+        assert_eq!(
+            std::fs::read_to_string(&credentials_path).unwrap(),
+            "this is not valid credentials TOML"
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn unified_named_profile_uses_non_secret_environment_fallback_only() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _restore = EnvironmentRestore::capture(&[
+            TOS_CONFIG_BINARY_ENV,
+            "TOS_AUTH_MODE",
+            "TOS_ACCESS_KEY",
+            "TOS_SECRET_KEY",
+            "TOS_SECURITY_TOKEN",
+            "TOS_REGION",
+            "TOS_ENDPOINT",
+            "TOS_CONTROL_ENDPOINT",
+            "TOS_ACCOUNT_ID",
+            "TOS_CHECKPOINT_DIR",
+            "TOS_BATCH_REPORT_DIR",
+            "TOS_BATCH_REPORT_FORMAT",
+            "TOS_PROGRESS_ENABLED",
+            "TOS_BATCH_CONCURRENCY",
+            "TOS_MAX_RETRY_COUNT",
+            "TOS_REQUESTTIMEOUT",
+            "TOS_REQUEST_TIMEOUT",
+            "TOS_CONNECTTIMEOUT",
+            "TOS_CONNECT_TIMEOUT",
+            "TOS_MAXCONNECTIONS",
+            "TOS_MAX_CONNECTIONS",
+        ]);
+        std::env::set_var(TOS_CONFIG_BINARY_ENV, "ve-tos");
+        std::env::set_var("TOS_AUTH_MODE", "unified");
+        std::env::set_var("TOS_ACCESS_KEY", "ignored-env-ak");
+        std::env::set_var("TOS_SECRET_KEY", "ignored-env-sk");
+        for name in [
+            "TOS_SECURITY_TOKEN",
+            "TOS_REGION",
+            "TOS_ENDPOINT",
+            "TOS_CONTROL_ENDPOINT",
+            "TOS_ACCOUNT_ID",
+            "TOS_CHECKPOINT_DIR",
+            "TOS_BATCH_REPORT_DIR",
+            "TOS_BATCH_REPORT_FORMAT",
+            "TOS_PROGRESS_ENABLED",
+            "TOS_BATCH_CONCURRENCY",
+            "TOS_MAX_RETRY_COUNT",
+            "TOS_REQUESTTIMEOUT",
+            "TOS_REQUEST_TIMEOUT",
+            "TOS_CONNECTTIMEOUT",
+            "TOS_CONNECT_TIMEOUT",
+            "TOS_MAXCONNECTIONS",
+            "TOS_MAX_CONNECTIONS",
+        ] {
+            std::env::remove_var(name);
+        }
+        let directory = test_directory("environment-fallback");
+        let config_path = directory.join("config.toml");
+        write_config(&config_path, "");
+        let mut selected = global();
+        selected.profile = "missing-profile".to_string();
+        selected.config_path = Some(config_path.clone());
+
+        let credentials_only_error = build_profile(&selected).unwrap_err();
+        assert!(matches!(credentials_only_error, CliError::ConfigMissing(_)));
+
+        std::env::set_var("TOS_BATCH_CONCURRENCY", "5");
+        let profile = build_profile(&selected).unwrap();
+        assert_eq!(profile.batch_concurrency, Some(5));
+        assert!(profile.access_key_id.is_none());
+        assert!(profile.secret_access_key.is_none());
+        assert!(config_path.exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn ve_tos_aksk_missing_named_profile_rejects_runtime_only_environment_controls() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let environment_names = [
+            TOS_CONFIG_BINARY_ENV,
+            "TOS_AUTH_MODE",
+            "TOS_ACCESS_KEY",
+            "TOS_SECRET_KEY",
+            "TOS_SECURITY_TOKEN",
+            "TOS_REGION",
+            "TOS_ENDPOINT",
+            "TOS_CONTROL_ENDPOINT",
+            "TOS_ACCOUNT_ID",
+            "TOS_CHECKPOINT_DIR",
+            "TOS_BATCH_REPORT_DIR",
+            "TOS_BATCH_REPORT_FORMAT",
+            "TOS_PROGRESS_ENABLED",
+            "TOS_CHECKPOINT_THRESHOLD",
+            "TOS_BATCH_CONCURRENCY",
+            "TOS_LIST_CONCURRENCY",
+            "TOS_MULTIPART_CONCURRENCY",
+            "TOS_PROGRESS_GRANULARITY",
+            "TOS_OVERWRITE_STRATEGY",
+            "TOS_MAX_RETRY_COUNT",
+            "TOS_REQUESTTIMEOUT",
+            "TOS_REQUEST_TIMEOUT",
+            "TOS_CONNECTTIMEOUT",
+            "TOS_CONNECT_TIMEOUT",
+            "TOS_MAXCONNECTIONS",
+            "TOS_MAX_CONNECTIONS",
+        ];
+        let _restore = EnvironmentRestore::capture(&environment_names);
+        for name in environment_names {
+            std::env::remove_var(name);
+        }
+        std::env::set_var(TOS_CONFIG_BINARY_ENV, "ve-tos");
+        std::env::set_var("TOS_AUTH_MODE", "aksk");
+        std::env::set_var("TOS_BATCH_CONCURRENCY", "5");
+        std::env::set_var("TOS_PROGRESS_GRANULARITY", "part");
+        let directory = test_directory("aksk-runtime-controls");
+        let config_path = directory.join("config.toml");
+        let credentials_path = directory.join("credentials.toml");
+        write_config(&config_path, "");
+        write_config(&credentials_path, "schema_version = 1\n");
+        let mut selected = global();
+        selected.profile = "missing-profile".to_string();
+        selected.config_path = Some(config_path);
+        selected.credentials_path = Some(credentials_path);
+
+        let error = build_profile(&selected).unwrap_err();
+
+        assert!(matches!(error, CliError::ConfigMissing(_)));
+        assert!(error.to_string().contains("Profile 'missing-profile'"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn tos_cli_missing_named_profile_rejects_runtime_only_environment_controls() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let environment_names = [
+            TOS_CONFIG_BINARY_ENV,
+            "BYTE_TOS_ACCESS_KEY",
+            "BYTE_TOS_SECRET_KEY",
+            "BYTE_TOS_SECURITY_TOKEN",
+            "BYTE_TOS_REGION",
+            "BYTE_TOS_ENDPOINT",
+            "BYTE_TOS_PSM",
+            "BYTE_TOS_CONTROL_ENDPOINT",
+            "BYTE_TOS_ACCOUNT_ID",
+            "BYTE_TOS_CHECKPOINT_DIR",
+            "BYTE_TOS_BATCH_REPORT_DIR",
+            "BYTE_TOS_BATCH_REPORT_FORMAT",
+            "BYTE_TOS_PROGRESS_ENABLED",
+            "BYTE_TOS_CHECKPOINT_THRESHOLD",
+            "BYTE_TOS_BATCH_CONCURRENCY",
+            "BYTE_TOS_LIST_CONCURRENCY",
+            "BYTE_TOS_MULTIPART_CONCURRENCY",
+            "BYTE_TOS_PROGRESS_GRANULARITY",
+            "BYTE_TOS_OVERWRITE_STRATEGY",
+            "BYTE_TOS_MAX_RETRY_COUNT",
+            "BYTE_TOS_REQUESTTIMEOUT",
+            "BYTE_TOS_REQUEST_TIMEOUT",
+            "BYTE_TOS_CONNECTTIMEOUT",
+            "BYTE_TOS_CONNECT_TIMEOUT",
+            "BYTE_TOS_MAXCONNECTIONS",
+            "BYTE_TOS_MAX_CONNECTIONS",
+        ];
+        let _restore = EnvironmentRestore::capture(&environment_names);
+        for name in environment_names {
+            std::env::remove_var(name);
+        }
+        std::env::set_var(TOS_CONFIG_BINARY_ENV, "tos");
+        std::env::set_var("BYTE_TOS_BATCH_CONCURRENCY", "5");
+        std::env::set_var("BYTE_TOS_PROGRESS_GRANULARITY", "part");
+        let directory = test_directory("tos-runtime-controls");
+        let config_path = directory.join("config.toml");
+        let credentials_path = directory.join("credentials.toml");
+        write_config(&config_path, "");
+        write_config(&credentials_path, "schema_version = 1\n");
+        let mut selected = global();
+        selected.profile = "missing-profile".to_string();
+        selected.config_path = Some(config_path);
+        selected.credentials_path = Some(credentials_path);
+
+        let error = build_profile(&selected).unwrap_err();
+
+        assert!(matches!(error, CliError::ConfigMissing(_)));
+        assert!(error.to_string().contains("Profile 'missing-profile'"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn unified_runtime_builds_dynamic_client_without_reading_static_credentials() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _restore = EnvironmentRestore::capture(&[
+            TOS_CONFIG_BINARY_ENV,
+            "TOS_AUTH_MODE",
+            "TOS_ACCESS_KEY",
+            "TOS_SECRET_KEY",
+            "TOS_SECURITY_TOKEN",
+        ]);
+        std::env::set_var(TOS_CONFIG_BINARY_ENV, "ve-tos");
+        std::env::remove_var("TOS_AUTH_MODE");
+        std::env::remove_var("TOS_ACCESS_KEY");
+        std::env::remove_var("TOS_SECRET_KEY");
+        std::env::remove_var("TOS_SECURITY_TOKEN");
+        let directory = test_directory("unified-runtime-client");
+        let config_path = directory.join("config.toml");
+        write_config(
+            &config_path,
+            concat!(
+                "[selected]\n",
+                "region = \"cn-beijing\"\n",
+                "[selected.ve-tos]\n",
+                "auth_mode = \"unified\"\n",
+                "endpoint = \"https://tos-cn-beijing.volces.com\"\n",
+            ),
+        );
+        let mut selected = global();
+        selected.profile = "selected".to_string();
+        selected.config_path = Some(config_path);
+        selected.credentials_path = Some(directory.join("missing-credentials.toml"));
+
+        let runtime = build_runtime(&selected).expect("unified runtime");
+        let client = runtime.client(&selected, "tos").expect("dynamic client");
+
+        assert_eq!(runtime.auth_mode.mode, AuthMode::Unified);
+        assert!(runtime.profile.access_key_id.is_none());
+        assert!(runtime.profile.secret_access_key.is_none());
+        assert_eq!(
+            client.service_endpoint(),
+            "https://tos-cn-beijing.volces.com"
+        );
+        assert!(!selected.credentials_path.as_ref().unwrap().exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn aksk_profile_still_decrypts_legacy_config_credentials() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _restore = EnvironmentRestore::capture(&[
+            TOS_CONFIG_BINARY_ENV,
+            "TOS_AUTH_MODE",
+            "TOS_ACCESS_KEY",
+            "TOS_SECRET_KEY",
+            "TOS_SECURITY_TOKEN",
+        ]);
+        std::env::set_var(TOS_CONFIG_BINARY_ENV, "ve-tos");
+        std::env::remove_var("TOS_AUTH_MODE");
+        std::env::remove_var("TOS_ACCESS_KEY");
+        std::env::remove_var("TOS_SECRET_KEY");
+        std::env::remove_var("TOS_SECURITY_TOKEN");
+        let directory = test_directory("aksk-decryption");
+        let config_path = directory.join("config.toml");
+        let mut config = ConfigFile::default();
+        let profile = config.get_or_insert_profile("selected");
+        profile.access_key_id = Some("legacy-ak".to_string());
+        profile.secret_access_key = Some("legacy-sk".to_string());
+        profile.security_token = Some("legacy-token".to_string());
+        config.save_to(&directory, &config_path).unwrap();
+        let mut selected = global();
+        selected.profile = "selected".to_string();
+        selected.config_path = Some(config_path);
+
+        let profile = build_profile(&selected).unwrap();
+
+        assert_eq!(profile.access_key_id.as_deref(), Some("legacy-ak"));
+        assert_eq!(profile.secret_access_key.as_deref(), Some("legacy-sk"));
+        assert_eq!(profile.security_token.as_deref(), Some("legacy-token"));
+        assert!(directory.join(".key").exists());
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     // [Review Fix #1] 已是 Envelope 形态时不应被双重包装
@@ -1069,6 +1730,25 @@ mod tests {
         assert!(out["request_id"].as_str().map_or(false, |s| !s.is_empty()));
     }
 
+    #[test]
+    fn ensure_envelope_prefers_invocation_service_request_id() {
+        let global = global();
+        global
+            .request_trace
+            .record_response(Some("tos-service-id"), true);
+        let envelope = json!({
+            "success": true,
+            "status": "success",
+            "command": "ve-tos object list",
+            "request_id": "generated-id",
+            "data": {"objects": []},
+        });
+
+        let out = ensure_envelope(&global, envelope);
+
+        assert_eq!(out["request_id"], "tos-service-id");
+    }
+
     // [G8] When the Envelope already has a request_id, do not overwrite it.
     #[test]
     fn ensure_envelope_preserves_existing_request_id() {
@@ -1100,16 +1780,33 @@ mod tests {
         std::env::remove_var("TOS_LAST_REQUEST_ID");
     }
 
-    // [G8] When no request_id is present, prefer TOS_LAST_REQUEST_ID over a
-    // freshly generated ULID so the Envelope carries the upstream TOS RequestId.
     #[test]
-    fn ensure_envelope_uses_env_request_id_when_present() {
+    fn ensure_envelope_ignores_stale_env_request_id_for_local_success() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TOS_LAST_REQUEST_ID", "tos-upstream-id");
         let raw = json!({"foo": "bar"});
         let out = ensure_envelope(&global(), raw);
-        assert_eq!(out["request_id"], "tos-upstream-id");
+        let request_id = out["request_id"].as_str().expect("fallback request id");
+        assert_eq!(request_id.len(), 26);
+        assert_ne!(request_id, "tos-upstream-id");
         std::env::remove_var("TOS_LAST_REQUEST_ID");
+    }
+
+    #[test]
+    fn ensure_envelope_replaces_unsafe_success_id_with_ulid() {
+        let out = ensure_envelope(
+            &global(),
+            json!({
+                "success": true,
+                "status": "success",
+                "command": "ve-tos object list",
+                "request_id": "x".repeat(257),
+                "data": {},
+            }),
+        );
+
+        let request_id = out["request_id"].as_str().expect("fallback request id");
+        assert_eq!(request_id.len(), 26);
     }
 
     // [G8] Without env var, the injector must fall back to a generated ULID

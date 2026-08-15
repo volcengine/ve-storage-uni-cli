@@ -234,6 +234,67 @@ fn three_cli_surfaces_write_isolated_credential_sections() {
 }
 
 #[test]
+fn bare_credential_keys_write_to_the_active_surface() {
+    let home = tempdir("bare-surface-routing");
+    for (surface, access_key, secret_key) in [
+        ("tos", "BYTE_AK", "BYTE_SK"),
+        ("ve-tos", "VE_TOS_AK", "VE_TOS_SK"),
+        ("ve-adrive", "ADRIVE_AK", "ADRIVE_SK"),
+    ] {
+        assert_success(&cli(
+            &home,
+            &[surface, "config", "set", "access_key_id", access_key],
+            &[],
+        ));
+        assert_success(&cli(
+            &home,
+            &[surface, "config", "set", "secret_access_key", secret_key],
+            &[],
+        ));
+    }
+
+    let content = std::fs::read_to_string(home.join(".tos").join("credentials.toml"))
+        .expect("read credentials");
+    assert!(content.contains("[default.tos]"), "content={content}");
+    assert!(content.contains("[default.ve-tos]"), "content={content}");
+    assert!(content.contains("[default.adrive]"), "content={content}");
+    assert!(!content.contains("\n[default]\n"), "content={content}");
+
+    assert_success(&cli(
+        &home,
+        &[
+            "--profile",
+            "staging",
+            "tos",
+            "config",
+            "set",
+            "security_token",
+            "BYTE_TOKEN",
+        ],
+        &[],
+    ));
+    let content = std::fs::read_to_string(home.join(".tos").join("credentials.toml"))
+        .expect("read credentials");
+    assert!(content.contains("[staging.tos]"), "content={content}");
+}
+
+#[test]
+fn explicit_profile_credential_key_still_writes_shared_credentials() {
+    let home = tempdir("explicit-shared-routing");
+    assert_success(&cli(
+        &home,
+        &["tos", "config", "set", "default.access_key_id", "SHARED_AK"],
+        &[],
+    ));
+
+    let content = std::fs::read_to_string(home.join(".tos").join("credentials.toml"))
+        .expect("read credentials");
+    assert!(content.contains("\n[default]\n"), "content={content}");
+    assert!(!content.contains("[default.tos]"), "content={content}");
+    assert!(!content.contains("[default.ve-tos]"), "content={content}");
+}
+
+#[test]
 fn runtime_auth_checks_use_credentials_file_for_all_surfaces() {
     let home = tempdir("runtime-resolution");
     for (surface, access_key, secret_key) in [
@@ -567,12 +628,15 @@ fn adrive_config_set_preserves_explicit_tos_credential_routing() {
 
 #[test]
 fn adrive_config_show_includes_masked_oauth_credentials() {
+    const OAUTH_USER_ID_MUST_NOT_LEAK: &str = "UNIQUE_OAUTH_USER_ID_MUST_NOT_LEAK";
     let home = tempdir("oauth-config-show");
     let config_dir = home.join(".tos");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
         config_dir.join("credentials.toml"),
-        "schema_version = 1\n[default.adrive.oauth]\naccess_token = \"OAUTH_ACCESS_RAW\"\nrefresh_token = \"OAUTH_REFRESH_RAW\"\n",
+        &format!(
+            "schema_version = 1\n[default.adrive.oauth]\naccess_token = \"OAUTH_ACCESS_RAW\"\nrefresh_token = \"OAUTH_REFRESH_RAW\"\nuser_id = \"{OAUTH_USER_ID_MUST_NOT_LEAK}\"\n"
+        ),
     )
     .unwrap();
     let show = cli(
@@ -588,9 +652,15 @@ fn adrive_config_show_includes_masked_oauth_credentials() {
     let text = String::from_utf8_lossy(&show.stdout);
     assert!(!text.contains("OAUTH_ACCESS_RAW"), "stdout={text}");
     assert!(!text.contains("OAUTH_REFRESH_RAW"), "stdout={text}");
+    // [Review Fix #2] Preserve config-show's privacy contract for identity metadata.
+    assert!(!text.contains(OAUTH_USER_ID_MUST_NOT_LEAK), "stdout={text}");
+    let serialized = serde_json::to_string(&json).unwrap();
+    assert!(!serialized.contains(OAUTH_USER_ID_MUST_NOT_LEAK));
 }
 
 #[test]
+// [Review Fix #6] Both surfaces reject an explicit ADrive namespace, but tos
+// now points callers to the supported VeTos aksk/unified auth_mode contract.
 fn auth_mode_config_is_rejected_by_non_adrive_surfaces() {
     for surface in ["tos", "ve-tos"] {
         let home = tempdir(&format!("auth-mode-scope-{surface}"));
@@ -606,10 +676,19 @@ fn auth_mode_config_is_rejected_by_non_adrive_surfaces() {
             &[],
         );
         assert!(!output.status.success(), "surface={surface}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let expected = if surface == "tos" {
+            "auth_mode is not supported by tos"
+        } else {
+            "only supported by ve-adrive"
+        };
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("only supported by ve-adrive"),
-            "surface={surface}, stderr={}",
-            String::from_utf8_lossy(&output.stderr)
+            stderr.contains(expected),
+            "surface={surface}, stderr={stderr}"
+        );
+        assert!(
+            stderr.contains("unified"),
+            "surface={surface}, stderr={stderr}"
         );
     }
 }

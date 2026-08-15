@@ -64,6 +64,11 @@ pub enum ADriveCommand {
     /// Generate shell completion
     Completion(meta::CompletionArgs),
     /// Start MCP server
+    ///
+    /// SSE is same-host only. After binding, it prints a fresh Bearer token once to stderr.
+    /// Every HTTP request must send it in the Authorization header. The Host header must be
+    /// exact loopback plus the configured port. Native clients may omit the Origin header;
+    /// when present, the Origin header must be the matching HTTP loopback origin and port.
     Serve(meta::ServeArgs),
     /// Manage/export skill metadata
     Skill(meta::SkillCommand),
@@ -106,12 +111,12 @@ pub fn command_path(command: &ADriveCommand) -> String {
 }
 
 fn auth_command_path(cmd: &auth::AuthCommand) -> String {
-    let Some(action) = cmd.action else {
+    let Some(action) = cmd.action.as_ref() else {
         return "ve-adrive auth".to_string();
     };
     let action = match action {
         auth::AuthAction::Status => "status",
-        auth::AuthAction::Login => "login",
+        auth::AuthAction::Login(_) => "login",
         auth::AuthAction::Logout => "logout",
     };
     format!("ve-adrive auth {action}")
@@ -135,6 +140,11 @@ fn config_command_path(cmd: &meta::ConfigCommand) -> String {
 
 /// Print grouped help output for the `adrive` tool.
 pub fn print_grouped_help() {
+    print!("{}", grouped_help_text());
+}
+
+fn grouped_help_text() -> String {
+    // [Review Fix #6] Keep hand-authored grouped help synchronized with the ValueEnum.
     const HELP: &str = r#"ADrive CLI — Agent-Native
 
 Usage:
@@ -175,7 +185,7 @@ Global Options:
   -P, --profile <PROFILE>          Configuration profile name
       --config-path <PATH>         Path to config TOML (env: TOS_CONFIG_PATH)
       --credentials-path <PATH>    Path to credentials TOML (env: TOS_CREDENTIALS_PATH)
-      --auth-mode <MODE>           ADrive authentication mode (aksk or oauth)
+      --auth-mode <MODE>           Authentication mode: aksk, oauth, or unified (env: ADRIVE_AUTH_MODE)
   -r, --region <REGION>            Region
   -e, --endpoint <ENDPOINT>        Custom ADrive endpoint
   -o, --output <FORMAT>            Output format (json, table, csv, yaml, markdown)
@@ -188,6 +198,26 @@ Global Options:
   -v, --verbose                    Include extra diagnostic output where supported
   -q, --quiet                      Disable prompts and progress output
 
+OAuth Authentication:
+  ve-adrive-cli config set auth_mode oauth
+  ve-adrive-cli config set auth_endpoint https://idsauth.volces.com
+  ve-adrive-cli auth login --instance inst-1
+  ve-adrive-cli auth status
+  ve-adrive-cli auth logout
+
+  Login runs Device Authorization in the foreground. Business commands refresh
+  file-backed credentials on demand and return login_required when user action
+  is needed; they never start an interactive login automatically.
+
+Unified Authentication:
+  ve-adrive-cli --profile default --auth-mode unified ls
+  ve-adrive-cli config set auth_mode unified
+  ve login
+  ve logout
+
+  Unified selects the same-name externally managed profile, ignores local
+  AK/SK and OAuth credentials, and delegates login and logout to `ve`.
+
 Examples:
   ve-adrive-cli crt adrive://inst-1
   ve-adrive-cli crt adrive://inst-1/space-1
@@ -198,6 +228,7 @@ Examples:
   ve-adrive-cli cat adrive://inst-1/space-1/docs/a.txt | gzip | ve-adrive-cli put adrive://inst-1/space-1/docs/a.txt.gz
   ve-adrive-cli rm adrive://inst-1/space-1/docs/a.txt --force --confirm adrive://inst-1/space-1/docs/a.txt
   ve-adrive-cli del adrive://inst-1/space-1 --force --confirm adrive://inst-1/space-1
+  ve-adrive-cli --auth-mode oauth auth login --instance inst-1 --auth-endpoint https://idsauth.volces.com
 
 General:
   -h, --help                        Print help
@@ -210,7 +241,7 @@ Run 've-adrive-cli <command> --help' for details on a specific command.
 Run 've-adrive-cli capabilities --view groups' for machine-readable command listing.
 Run 've-adrive-cli doctor' for environment diagnostics.
 "#;
-    print!("{}", contextualized_grouped_help(HELP));
+    contextualized_grouped_help(HELP)
 }
 
 fn contextualized_grouped_help(help: &str) -> String {
@@ -243,5 +274,19 @@ mod tests {
         });
 
         assert_eq!(command_path(&command), "ve-adrive capabilities");
+    }
+
+    #[test]
+    fn grouped_help_documents_unified_authentication() {
+        let help = grouped_help_text();
+        for expected in [
+            "--auth-mode <MODE>",
+            "ADRIVE_AUTH_MODE",
+            "Unified Authentication:",
+            "ve login",
+            "ve logout",
+        ] {
+            assert!(help.contains(expected), "grouped help missing {expected}");
+        }
     }
 }

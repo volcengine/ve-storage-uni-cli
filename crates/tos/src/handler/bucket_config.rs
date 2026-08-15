@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::cli::low_level::*;
 use crate::domain::core;
 use crate::handler::common::{
-    build_profile, build_query, ensure_force_for_destructive, output_result, parse_kv_pairs,
+    build_query, build_runtime, ensure_force_for_destructive, output_result, parse_kv_pairs,
     read_json_input,
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -33,7 +33,6 @@ use tos_core::agent::dryrun::{DryRunResult, Impact};
 use tos_core::agent::envelope::Envelope;
 use tos_core::agent::error::CliError;
 use tos_core::agent::global_args::GlobalArgs;
-use tos_core::infra::client::TosClient;
 
 #[derive(Debug)]
 struct BucketConfigOperation {
@@ -723,8 +722,8 @@ where
         ensure_force_for_destructive(global, op.force, op.command, &op.bucket)?;
     }
 
-    let profile = build_profile(global)?;
-    let client = TosClient::new(&profile, "tos")?;
+    let runtime = build_runtime(global)?;
+    let client = runtime.client(global, "tos")?;
     let result = core::execute_bucket_request(
         &client, op.command, op.method, &op.bucket, op.query, op.headers, op.body,
     )

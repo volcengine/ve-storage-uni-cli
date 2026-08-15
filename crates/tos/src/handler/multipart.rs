@@ -20,7 +20,7 @@ use crate::cli::low_level::*;
 use crate::domain::core;
 use crate::domain::multipart as multipart_domain;
 use crate::handler::common::{
-    build_profile, build_query, classify_body_input, ensure_force_for_destructive, marker_query,
+    build_query, build_runtime, classify_body_input, ensure_force_for_destructive, marker_query,
     output_result, output_result_with_columns, parse_object_target, read_json_input, BodyInput,
 };
 use reqwest::Method;
@@ -82,8 +82,8 @@ pub async fn handle_multipart_command(
         )));
     }
 
-    let profile = build_profile(global)?;
-    let client = TosClient::new(&profile, "tos")?;
+    let runtime = build_runtime(global)?;
+    let client = runtime.client(global, "tos")?;
 
     match action {
         MultipartAction::Create(args) => handle_create(global, &client, args).await,

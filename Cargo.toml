@@ -40,14 +40,19 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
+httpdate = "1"
 url = "2"
+fs2 = "0.4"
 jmespath = "0.3"
 strsim = "0.11"
 ulid = "1"
+unicode-segmentation = "1"
+unicode-width = "0.2"
 quick-xml = { version = "0.36", features = ["serialize"] }
 rmcp = { version = "0.8", default-features = false, features = ["server", "transport-async-rw", "transport-io", "transport-sse-server", "macros", "base64"] }
 futures = "0.3"
 crc64fast = "1"
+volcengine-rust-sdk-auth = "=0.1.1"
 
 [package]
 name = "ve-storage-uni-cli"

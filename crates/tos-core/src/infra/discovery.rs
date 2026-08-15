@@ -664,13 +664,76 @@ fn static_endpoints_from_env() -> Option<Vec<WeightedEndpoint>> {
     }
 }
 
+/// Resolve the Consul agent `host:port` authority from environment variables.
+///
+/// Supported inputs (highest priority first):
+/// 1. `CONSUL_HTTP_ADDR` — standard Consul env var, `host:port` format.
+/// 2. `CONSUL_HTTP_HOST` — may be a bare host, `host:port`, or a raw/bracketed
+///    IPv6 address; port falls back to `CONSUL_HTTP_PORT` or 2280.
+/// 3. `MY_HOST_IP` / `TCE_HOST_IP` / `MY_HOST_IPV6` — TCE-injected addresses
+///    (always bare, port from `CONSUL_HTTP_PORT` or 2280).
+/// 4. Default `127.0.0.1:2280`.
 fn consul_addr_from_env() -> String {
-    let host = consul_host_from_env();
+    // CONSUL_HTTP_ADDR is the standard Consul env var in host:port form.
+    if let Some(addr) = non_empty_string(std::env::var("CONSUL_HTTP_ADDR").ok().as_deref()) {
+        if let Ok(authority) = normalize_authority(&addr, DEFAULT_CONSUL_PORT) {
+            return authority;
+        }
+    }
+
     let port = std::env::var("CONSUL_HTTP_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(DEFAULT_CONSUL_PORT);
-    format!("{host}:{port}")
+
+    let host = consul_host_from_env();
+    // consul_host_from_env wraps MY_HOST_IPV6 in [brackets]; CONSUL_HTTP_HOST
+    // may be anything, so normalize to handle host:port and raw IPv6.
+    normalize_authority(&host, port).unwrap_or_else(|_| format!("{host}:{port}"))
+}
+
+/// Normalize a host-or-addr string into a valid `host:port` authority.
+///
+/// Accepts: plain host/IPv4, `host:port`, `[ipv6]`, `[ipv6]:port`, raw IPv6.
+/// Returns an error only for clearly malformed bracketed IPv6.
+fn normalize_authority(raw: &str, default_port: u16) -> Result<String, CliError> {
+    let raw = raw.trim();
+
+    // Bracketed IPv6: [::1] or [::1]:8500
+    if raw.starts_with('[') {
+        let bracket_end = raw.find(']').ok_or_else(|| {
+            CliError::ValidationError(format!("Unclosed IPv6 bracket in '{raw}'"))
+        })?;
+        let after = &raw[bracket_end + 1..];
+        return if after.is_empty() {
+            Ok(format!("{raw}:{default_port}"))
+        } else if let Some(port_str) = after.strip_prefix(':') {
+            port_str.parse::<u16>().map_err(|_| {
+                CliError::ValidationError(format!("Invalid port in Consul address '{raw}'"))
+            })?;
+            Ok(raw.to_string())
+        } else {
+            Err(CliError::ValidationError(format!(
+                "Unexpected characters after IPv6 bracket in '{raw}'"
+            )))
+        };
+    }
+
+    // Raw IPv6 (multiple colons, e.g. "::1" or "2001:db8::1"): wrap in brackets.
+    if raw.matches(':').count() > 1 {
+        return Ok(format!("[{raw}]:{default_port}"));
+    }
+
+    // host:port with exactly one colon (IPv4 or hostname with explicit port).
+    if let Some(idx) = raw.rfind(':') {
+        let possible_port = &raw[idx + 1..];
+        if possible_port.parse::<u16>().is_ok() {
+            return Ok(raw.to_string());
+        }
+    }
+
+    // Plain hostname or IPv4 without port.
+    Ok(format!("{raw}:{default_port}"))
 }
 
 fn consul_host_from_env() -> String {
@@ -862,5 +925,89 @@ mod tests {
         assert_eq!(choose_tosv_endpoint("sg1"), super::TOSV_SG_ENDPOINT);
         assert_eq!(choose_tosv_endpoint("ttp2"), super::TOSV_TTP2_ENDPOINT);
         assert_eq!(choose_tosv_endpoint("cn"), super::TOSV_ENDPOINT);
+    }
+
+    #[test]
+    fn normalize_authority_handles_all_forms() {
+        // Plain host/IPv4 gets default port appended.
+        assert_eq!(
+            super::normalize_authority("127.0.0.1", 2280).unwrap(),
+            "127.0.0.1:2280"
+        );
+        assert_eq!(
+            super::normalize_authority("consul.local", 2280).unwrap(),
+            "consul.local:2280"
+        );
+
+        // host:port is used as-is.
+        assert_eq!(
+            super::normalize_authority("10.0.0.1:8500", 2280).unwrap(),
+            "10.0.0.1:8500"
+        );
+        assert_eq!(
+            super::normalize_authority("consul.local:8500", 2280).unwrap(),
+            "consul.local:8500"
+        );
+
+        // Bracketed IPv6 without port gets default port.
+        assert_eq!(
+            super::normalize_authority("[::1]", 2280).unwrap(),
+            "[::1]:2280"
+        );
+
+        // Bracketed IPv6 with port is used as-is.
+        assert_eq!(
+            super::normalize_authority("[::1]:8500", 2280).unwrap(),
+            "[::1]:8500"
+        );
+
+        // Raw IPv6 gets wrapped in brackets with default port.
+        assert_eq!(
+            super::normalize_authority("::1", 2280).unwrap(),
+            "[::1]:2280"
+        );
+        assert_eq!(
+            super::normalize_authority("2001:db8::1", 2280).unwrap(),
+            "[2001:db8::1]:2280"
+        );
+    }
+
+    #[test]
+    fn consul_addr_from_env_accepts_host_with_port() {
+        let _guard = DISCOVERY_ENV_LOCK.lock().expect("env lock");
+        let old = (
+            std::env::var("CONSUL_HTTP_HOST").ok(),
+            std::env::var("CONSUL_HTTP_PORT").ok(),
+            std::env::var("CONSUL_HTTP_ADDR").ok(),
+            std::env::var("MY_HOST_IP").ok(),
+            std::env::var("TCE_HOST_IP").ok(),
+            std::env::var("MY_HOST_IPV6").ok(),
+        );
+        std::env::remove_var("CONSUL_HTTP_PORT");
+        std::env::remove_var("CONSUL_HTTP_ADDR");
+        std::env::remove_var("MY_HOST_IP");
+        std::env::remove_var("TCE_HOST_IP");
+        std::env::remove_var("MY_HOST_IPV6");
+
+        // host:port in CONSUL_HTTP_HOST should not double up the port.
+        std::env::set_var("CONSUL_HTTP_HOST", "10.0.0.1:8500");
+        assert_eq!(super::consul_addr_from_env(), "10.0.0.1:8500");
+
+        // CONSUL_HTTP_ADDR takes precedence over CONSUL_HTTP_HOST.
+        std::env::set_var("CONSUL_HTTP_ADDR", "10.0.0.2:9999");
+        assert_eq!(super::consul_addr_from_env(), "10.0.0.2:9999");
+        std::env::remove_var("CONSUL_HTTP_ADDR");
+
+        // Bare host uses CONSUL_HTTP_PORT.
+        std::env::set_var("CONSUL_HTTP_HOST", "10.0.0.1");
+        std::env::set_var("CONSUL_HTTP_PORT", "8500");
+        assert_eq!(super::consul_addr_from_env(), "10.0.0.1:8500");
+
+        restore_env("CONSUL_HTTP_HOST", old.0);
+        restore_env("CONSUL_HTTP_PORT", old.1);
+        restore_env("CONSUL_HTTP_ADDR", old.2);
+        restore_env("MY_HOST_IP", old.3);
+        restore_env("TCE_HOST_IP", old.4);
+        restore_env("MY_HOST_IPV6", old.5);
     }
 }

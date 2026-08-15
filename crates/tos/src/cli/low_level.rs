@@ -1452,10 +1452,12 @@ pub struct ObjectGetRetentionArgs {
 // =============================================================================
 
 #[derive(Debug, Args)]
+// [Review Fix #12] Keep every documented multipart example parseable by the
+// current Clap contract, including the required completed-parts manifest.
 #[command(
     about = "Multipart core APIs",
     long_about = "Low-Level API — Core: multipart upload operations.",
-    after_help = "Examples:\n  ve-tos-cli multipart create --bucket mybucket --key bigfile.bin\n  ve-tos-cli multipart upload --bucket mybucket --key bigfile.bin --upload-id xxx --part-number 1 --body file://part1\n  ve-tos-cli multipart complete --bucket mybucket --key bigfile.bin --upload-id xxx --complete-all\n  ve-tos-cli multipart list --bucket mybucket\n  ve-tos-cli multipart abort --bucket mybucket --key bigfile.bin --upload-id xxx --force"
+    after_help = "Examples:\n  ve-tos-cli multipart create --bucket mybucket --key bigfile.bin\n  ve-tos-cli multipart upload --bucket mybucket --key bigfile.bin --upload-id xxx --part-number 1 --body file://part1\n  ve-tos-cli multipart complete --bucket mybucket --key bigfile.bin --upload-id xxx --parts '[{\"PartNumber\":1,\"ETag\":\"etag\"}]' --complete-all\n  ve-tos-cli multipart list --bucket mybucket\n  ve-tos-cli multipart abort --bucket mybucket --key bigfile.bin --upload-id xxx --force"
 )]
 pub struct MultipartCommand {
     #[command(subcommand)]
@@ -2246,8 +2248,10 @@ pub struct VersioningSetArgs {
 // =============================================================================
 
 #[derive(Debug, Args)]
+// [Review Fix #13] Replication deletion removes the bucket configuration;
+// it has no rule-id argument, so the example documents supported syntax only.
 #[command(
-    after_help = "Examples:\n  ve-tos-cli replication get --bucket mybucket\n  ve-tos-cli replication set --bucket mybucket --config file://replication.json\n  ve-tos-cli replication delete --bucket mybucket --rule-id rule-1 --force"
+    after_help = "Examples:\n  ve-tos-cli replication get --bucket mybucket\n  ve-tos-cli replication set --bucket mybucket --config file://replication.json\n  ve-tos-cli replication delete --bucket mybucket --force"
 )]
 pub struct ReplicationCommand {
     #[command(subcommand)]

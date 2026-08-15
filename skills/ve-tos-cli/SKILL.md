@@ -36,6 +36,41 @@ ve-tos-cli doctor --output json
 ve-tos-cli config show --output json
 ```
 
+## Connection configuration
+
+`ve-tos-cli config init` writes the production defaults `cn-beijing` and
+`tos-cn-beijing.volces.com`. If they are replaced, configure endpoint
+explicitly; the CLI never constructs an endpoint from region. A recognizable
+endpoint may still supply the signing region, while a custom endpoint needs an
+explicit region.
+
+```bash
+ve-tos-cli config init
+ve-tos-cli config set access_key_id <volcengine-tos-access-key>
+ve-tos-cli config set secret_access_key <volcengine-tos-secret-key>
+ve-tos-cli config set endpoint https://tos-cn-shanghai.volces.com
+```
+
+Bare AK/SK keys are stored under the active profile's `[profile.ve-tos]`
+credentials section, independently from `tos-cli` credentials.
+
+## Authentication mode
+
+`ve-tos-cli` supports `aksk or unified`. The precedence is `--auth-mode` >
+`[profile.ve-tos].auth_mode` > `TOS_AUTH_MODE` > `aksk`.
+
+Unified selects the same-name profile from the external login framework. It
+ignores local AK/SK and does not copy external credentials into TOS config.
+Run `ve login` to create or refresh that external login; the CLI only asks the
+SDK for signing credentials when it sends an HTTP attempt.
+
+```bash
+ve-tos-cli --profile default --auth-mode unified ls
+ve-tos-cli config set auth_mode unified
+ve login
+ve-tos-cli doctor --check auth --profile default
+```
+
 ## Common Commands
 
 ```bash

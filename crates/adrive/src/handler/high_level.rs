@@ -42,29 +42,33 @@ use tos_core::agent::error::CliError;
 use tos_core::agent::global_args::GlobalArgs;
 use tos_core::agent::output::OutputFormat;
 use tos_core::infra::config::{
-    DEFAULT_BATCH_CONCURRENCY, DEFAULT_LIST_CONCURRENCY, DEFAULT_MULTIPART_CONCURRENCY,
+    Profile, DEFAULT_BATCH_CONCURRENCY, DEFAULT_LIST_CONCURRENCY, DEFAULT_MULTIPART_CONCURRENCY,
     DEFAULT_OVERWRITE_STRATEGY, DEFAULT_PROGRESS_GRANULARITY, DEFAULT_TOS_BATCH_REPORT_FORMAT,
     DEFAULT_TOS_PROGRESS_ENABLED, DEFAULT_TRANSFER_CHECKPOINT_THRESHOLD,
 };
 
-use crate::domain::client::{Client as IdsClient, Error as IdsSdkError};
+use crate::domain::auth::AuthMode;
+use crate::domain::client::{
+    Client as IdsClient, ClientOptions, Error as IdsSdkError, InstanceListingScope,
+};
 use crate::domain::rate_limiter::RateLimiter;
+use crate::domain::token_manager::OAuthTokenManager;
 use crate::domain::types::{
     AbortMultipartUploadInput, Body as IdsBody, CompleteMultipartUploadInput, CopyFileInput,
     CreateFolderInput, CreateInstanceInput, CreateSpaceInput, DeleteFileInput, DeleteFolderInput,
     DeleteInstanceInput, DeleteSpaceInput, FileInfo, FolderInfo, GetFileInput, GetFileOutput,
     GetInstanceByNameInput, GetInstanceInput, GetSpaceByNameInput, GetSpaceInput, HeadFileInput,
     InitiateMultipartUploadInput, InstanceInfo, ListFilesInput, ListInstancesInput,
-    ListSpacesInput, PartInfo, PutFileInput, RenameFileInput, RenameFolderInput, SpaceInfo,
-    UploadPartInput,
+    ListMyGroupSpacesInput, ListMySpacesInput, ListSpacesInput, PartInfo, PutFileInput,
+    RenameFileInput, RenameFolderInput, SpaceInfo, UploadPartInput,
 };
 
 use crate::cli::high_level::*;
 use crate::cli::{ADriveAuthArgs, ADriveCommand};
 use crate::handler::common::{
-    build_ids_client, build_profile, ensure_force_for_destructive, map_ids_error, output_envelope,
-    output_result_with_columns, parse_adrive_uri, public_adrive_command_path, resolve_target,
-    ParsedADriveUri,
+    build_adrive_dry_run_runtime, build_adrive_runtime, build_ids_client, build_profile,
+    ensure_force_for_destructive, map_ids_error, output_envelope, output_result_with_columns,
+    parse_adrive_uri, public_adrive_command_path, resolve_target, ParsedADriveUri,
 };
 use crate::registry::{find_capability, RegistryParameter};
 
@@ -573,6 +577,12 @@ enum ADriveCreateTarget {
     Space { instance: String, name: String },
 }
 
+struct CreateAuthContext {
+    is_oauth: bool,
+    needs_oauth_user_default: bool,
+    oauth_user_id: Option<String>,
+}
+
 impl ADriveTarget {
     fn display(&self) -> String {
         match self {
@@ -733,7 +743,9 @@ async fn resolve_create_args_by_name(
         return Ok(resolved);
     }
     if let ADriveCreateTarget::Space { instance, .. } = resolve_create_target(args)? {
-        let instance_info = get_instance_info(client, &instance).await?;
+        // [Review Fix #1] Resolve names through the name endpoint before OAuth
+        // enforces the stored Instance-ID binding on the create request.
+        let instance_info = get_instance_info_by_name(client, &instance).await?;
         if let Some(path) = resolved.path.as_deref() {
             let parsed = parse_adrive_uri(path, true)?;
             resolved.path = Some(format_target(&ParsedADriveUri {
@@ -910,22 +922,25 @@ async fn execute_command(
     auth: &ADriveAuthArgs,
     command: &ADriveCommand,
 ) -> Result<i32, CliError> {
-    let client = build_ids_client(global, auth.auth_mode)?;
+    let runtime = build_adrive_runtime(global, auth.auth_mode)?;
+    let _resolved_auth_mode = runtime.resolved_auth_mode;
+    let profile = &runtime.profile;
+    let client = &runtime.client;
 
     match command {
-        ADriveCommand::Cp(args) => execute_cp(global, &client, args).await,
-        ADriveCommand::Mv(args) => execute_mv(global, &client, args).await,
-        ADriveCommand::Sync(args) => execute_sync(global, &client, args).await,
-        ADriveCommand::Crt(args) => execute_create(global, &client, args).await,
-        ADriveCommand::Del(args) => execute_delete(global, &client, args).await,
-        ADriveCommand::Rm(args) => execute_rm(global, &client, args).await,
-        ADriveCommand::Ls(args) => execute_ls(global, &client, args).await,
-        ADriveCommand::Stat(args) => execute_stat(global, &client, args).await,
-        ADriveCommand::Du(args) => execute_du(global, &client, args).await,
-        ADriveCommand::Find(args) => execute_find(global, &client, args).await,
-        ADriveCommand::Cat(args) => execute_cat(global, &client, args).await,
-        ADriveCommand::Put(args) => execute_put(global, &client, args).await,
-        ADriveCommand::Mkdir(args) => execute_mkdir(global, &client, args).await,
+        ADriveCommand::Cp(args) => execute_cp(global, profile, client, args).await,
+        ADriveCommand::Mv(args) => execute_mv(global, profile, client, args).await,
+        ADriveCommand::Sync(args) => execute_sync(global, profile, client, args).await,
+        ADriveCommand::Crt(args) => execute_create(global, client, args).await,
+        ADriveCommand::Del(args) => execute_delete(global, client, args).await,
+        ADriveCommand::Rm(args) => execute_rm(global, profile, client, args).await,
+        ADriveCommand::Ls(args) => execute_ls(global, client, args).await,
+        ADriveCommand::Stat(args) => execute_stat(global, client, args).await,
+        ADriveCommand::Du(args) => execute_du(global, profile, client, args).await,
+        ADriveCommand::Find(args) => execute_find(global, client, args).await,
+        ADriveCommand::Cat(args) => execute_cat(global, client, args).await,
+        ADriveCommand::Put(args) => execute_put(global, profile, client, args).await,
+        ADriveCommand::Mkdir(args) => execute_mkdir(global, client, args).await,
         _ => Err(CliError::ValidationError(
             "unsupported high-level command".to_string(),
         )),
@@ -936,14 +951,15 @@ async fn execute_command(
 
 async fn execute_cp(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &IdsClient,
     args: &CpArgs,
 ) -> Result<i32, CliError> {
     let resolved_args = resolve_cp_args_by_name(client, args).await?;
     let args = &resolved_args;
-    let runtime = effective_cp_runtime_config(global, args)?;
+    let runtime = effective_cp_runtime_config(profile, args)?;
     if args.recursive {
-        return execute_recursive_cp(global, client, args, runtime).await;
+        return execute_recursive_cp(global, profile, client, args, runtime).await;
     }
     reject_single_transfer_artifacts(
         "ve-adrive cp",
@@ -958,7 +974,7 @@ async fn execute_cp(
     let source_is_remote = args.source.starts_with("adrive://");
     let dest_is_remote = args.destination.starts_with("adrive://");
     match (source_is_remote, dest_is_remote) {
-        (false, true) => upload_file(global, client, args, runtime).await,
+        (false, true) => upload_file(global, profile, client, args, runtime).await,
         (true, false) => download_file(global, client, args, runtime).await,
         (true, true) => copy_remote_file(global, client, args, runtime).await,
         (false, false) => Err(CliError::ValidationError(
@@ -969,17 +985,19 @@ async fn execute_cp(
 
 async fn execute_recursive_cp(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &IdsClient,
     args: &CpArgs,
     runtime: TransferRuntimeConfig,
 ) -> Result<i32, CliError> {
-    let progress_enabled = effective_progress_enabled(global, args.progress, args.no_progress)?;
+    let progress_enabled =
+        effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
     let list_echo_enabled = effective_list_echo_enabled(global, args.list_echo, args.no_list_echo);
     if args.no_manifest {
         let report_path =
-            effective_report_path(global, args.report_path.as_deref(), "ve-adrive cp")?;
+            effective_report_path(profile, args.report_path.as_deref(), "ve-adrive cp")?;
         let manifest_path = effective_optional_manifest_path(
-            global,
+            profile,
             args.manifest_path.as_deref(),
             args.no_manifest,
             "ve-adrive cp",
@@ -997,9 +1015,9 @@ async fn execute_recursive_cp(
     }
     let report =
         recursive_cp_report(client, args, runtime, list_echo_enabled, progress_enabled).await?;
-    let report_path = effective_report_path(global, args.report_path.as_deref(), "ve-adrive cp")?;
+    let report_path = effective_report_path(profile, args.report_path.as_deref(), "ve-adrive cp")?;
     let manifest_path = effective_optional_manifest_path(
-        global,
+        profile,
         args.manifest_path.as_deref(),
         args.no_manifest,
         "ve-adrive cp",
@@ -2118,6 +2136,7 @@ async fn copy_remote_recursive(
 
 async fn upload_file(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &IdsClient,
     args: &CpArgs,
     runtime: TransferRuntimeConfig,
@@ -2162,6 +2181,7 @@ async fn upload_file(
     if should_use_multipart(size, args.checkpoint, runtime.checkpoint_threshold) {
         return upload_file_multipart(
             global,
+            profile,
             client,
             args,
             runtime,
@@ -2225,6 +2245,7 @@ async fn upload_file(
 
 async fn upload_file_multipart(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &IdsClient,
     args: &CpArgs,
     runtime: TransferRuntimeConfig,
@@ -2271,7 +2292,8 @@ async fn upload_file_multipart(
         .ok_or_else(|| CliError::ValidationError("multipart upload id is missing".to_string()))?;
     let rate_limiter = rate_limiter_from_limit(args.bandwidth_limit.as_deref())?;
     let part_count = file_size.div_ceil(checkpoint.part_size);
-    let progress_enabled = effective_progress_enabled(global, args.progress, args.no_progress)?;
+    let progress_enabled =
+        effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
     let progress = batch_progress(
         "ve-adrive cp upload",
         progress_units_for_size(file_size, runtime),
@@ -2713,28 +2735,45 @@ async fn download_adrive_file_simple(
     space: &str,
     remote_path: &str,
     etag: &str,
+    expected_size: u64,
     expected_crc64: u64,
     destination_path: &Path,
 ) -> Result<(), CliError> {
     let mut input = GetFileInput::new(instance, space, remote_path);
     input.if_match = Some(etag.to_string());
-    let out = client.get_file(&input).await.map_err(map_ids_error)?;
-    let bytes = out.read_all().await.map_err(map_ids_error)?;
-    if expected_crc64 != 0 {
-        let mut digest = Digest::new();
-        let _ = digest.write(&bytes);
-        let local_crc64 = digest.sum64();
-        if local_crc64 != expected_crc64 {
-            return Err(CliError::TransferFailed(format!(
-                "CRC64 mismatch for '{}': local={}, remote={}",
-                destination_path.display(),
-                local_crc64,
-                expected_crc64
-            )));
-        }
-    }
-    tokio::fs::write(destination_path, &bytes).await?;
-    Ok(())
+    let retry_destination = destination_path.to_path_buf();
+    client
+        .get_file_with_consumer(&input, move |output| {
+            let attempt_destination = retry_destination.clone();
+            Box::pin(async move {
+                let bytes = output.read_all().await?;
+                validate_adrive_download_length(
+                    &attempt_destination,
+                    expected_size,
+                    bytes.len() as u64,
+                )
+                .map_err(IdsSdkError::Cli)?;
+                if expected_crc64 != 0 {
+                    let mut digest = Digest::new();
+                    digest.write(&bytes);
+                    let local_crc64 = digest.sum64();
+                    if local_crc64 != expected_crc64 {
+                        return Err(IdsSdkError::Cli(CliError::TransferFailed(format!(
+                            "CRC64 mismatch for '{}': local={}, remote={}",
+                            attempt_destination.display(),
+                            local_crc64,
+                            expected_crc64
+                        ))));
+                    }
+                }
+                tokio::fs::write(&attempt_destination, &bytes)
+                    .await
+                    .map_err(CliError::Io)?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(map_ids_error)
 }
 
 async fn download_adrive_file_for_batch(
@@ -2787,6 +2826,7 @@ async fn download_adrive_file_for_batch(
         space,
         remote_path,
         etag,
+        file_size,
         expected_crc64,
         destination_path,
     )
@@ -2943,22 +2983,56 @@ async fn download_file(
     if resume_offset > 0 {
         input = input.with_range_raw(format!("bytes={resume_offset}-"));
     }
-    let out = client.get_file(&input).await.map_err(map_ids_error)?;
     let rate_limiter = rate_limiter_from_limit(args.bandwidth_limit.as_deref())?;
-    let bytes_written =
-        write_download_stream(out, &dest_path, resume_offset > 0, rate_limiter).await?;
-    if head.hash_crc64_ecma != 0 {
-        let local_crc64 = local_file_crc64(&dest_path).await?;
-        if local_crc64 != head.hash_crc64_ecma {
-            let _ = tokio::fs::remove_file(&dest_path).await;
-            return Err(CliError::TransferFailed(format!(
-                "CRC64 mismatch for '{}': local={}, remote={}",
-                dest_path.display(),
-                local_crc64,
-                head.hash_crc64_ecma
-            )));
-        }
-    }
+    let retry_destination = dest_path.clone();
+    let expected_crc64 = head.hash_crc64_ecma;
+    let expected_attempt_size = source_size.saturating_sub(resume_offset);
+    let bytes_written = client
+        .get_file_with_consumer(&input, move |output| {
+            let attempt_destination = retry_destination.clone();
+            let attempt_rate_limiter = rate_limiter.clone();
+            Box::pin(async move {
+                if resume_offset > 0 {
+                    let file = tokio::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        // [Review Fix #3] Keep the checkpoint prefix and use
+                        // set_len below as the explicit attempt rollback.
+                        .truncate(false)
+                        .open(&attempt_destination)
+                        .await
+                        .map_err(CliError::Io)?;
+                    file.set_len(resume_offset).await.map_err(CliError::Io)?;
+                }
+                let bytes_written = write_download_stream_retryable(
+                    output,
+                    &attempt_destination,
+                    resume_offset > 0,
+                    attempt_rate_limiter,
+                )
+                .await?;
+                validate_adrive_download_length(
+                    &attempt_destination,
+                    expected_attempt_size,
+                    bytes_written,
+                )
+                .map_err(IdsSdkError::Cli)?;
+                if expected_crc64 != 0 {
+                    let local_crc64 = local_file_crc64(&attempt_destination).await?;
+                    if local_crc64 != expected_crc64 {
+                        return Err(IdsSdkError::Cli(CliError::TransferFailed(format!(
+                            "CRC64 mismatch for '{}': local={}, remote={}",
+                            attempt_destination.display(),
+                            local_crc64,
+                            expected_crc64
+                        ))));
+                    }
+                }
+                Ok(bytes_written)
+            })
+        })
+        .await
+        .map_err(map_ids_error)?;
     write_adrive_single_report(
         args.report_path.as_deref(),
         "ve-adrive cp",
@@ -3139,24 +3213,42 @@ async fn copy_single_for_move(
                 source_head.is_folder,
                 args.recursive,
             )?;
-            let out = client
-                .get_file(&GetFileInput::new(
-                    &source.instance,
-                    &source.space,
-                    &source.path,
-                ))
-                .await
-                .map_err(map_ids_error)?;
             let dest_path = local_destination_path(&args.destination, &source)?;
             if let Some(parent) = dest_path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            let bytes = out.read_all().await.map_err(map_ids_error)?;
-            tokio::fs::write(&dest_path, &bytes).await?;
+            let input = GetFileInput::new(&source.instance, &source.space, &source.path);
+            let retry_destination = dest_path.clone();
+            let expected_size = u64::try_from(source_head.content_length).map_err(|_| {
+                CliError::TransferFailed(format!(
+                    "invalid negative content length for '{}': {}",
+                    args.source, source_head.content_length
+                ))
+            })?;
+            let bytes_written = client
+                .get_file_with_consumer(&input, move |output| {
+                    let attempt_destination = retry_destination.clone();
+                    Box::pin(async move {
+                        let bytes = output.read_all().await?;
+                        let bytes_written = bytes.len();
+                        validate_adrive_download_length(
+                            &attempt_destination,
+                            expected_size,
+                            bytes_written as u64,
+                        )
+                        .map_err(IdsSdkError::Cli)?;
+                        tokio::fs::write(&attempt_destination, &bytes)
+                            .await
+                            .map_err(CliError::Io)?;
+                        Ok(bytes_written)
+                    })
+                })
+                .await
+                .map_err(map_ids_error)?;
             Ok(json!({
                 "operation": "download",
                 "destination": dest_path.display().to_string(),
-                "bytes": bytes.len(),
+                "bytes": bytes_written,
             }))
         }
         (true, true) => {
@@ -3258,6 +3350,7 @@ fn adrive_recursive_mv_destination_folder_path(
 
 async fn execute_mv(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &IdsClient,
     args: &MvArgs,
 ) -> Result<i32, CliError> {
@@ -3372,8 +3465,11 @@ async fn execute_mv(
 
     if args.recursive {
         if args.no_manifest {
-            let runtime = effective_mv_runtime_config(global, args)?;
-            return execute_recursive_mv_streaming_no_manifest(global, client, args, runtime).await;
+            let runtime = effective_mv_runtime_config(profile, args)?;
+            return execute_recursive_mv_streaming_no_manifest(
+                global, profile, client, args, runtime,
+            )
+            .await;
         }
         let cp_args = CpArgs {
             source: args.source.clone(),
@@ -3403,8 +3499,9 @@ async fn execute_mv(
             force: args.force,
             no_clobber: false,
         };
-        let runtime = effective_cp_runtime_config(global, &cp_args)?;
-        let progress_enabled = effective_progress_enabled(global, args.progress, args.no_progress)?;
+        let runtime = effective_cp_runtime_config(profile, &cp_args)?;
+        let progress_enabled =
+            effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
         let list_echo_enabled =
             effective_list_echo_enabled(global, args.list_echo, args.no_list_echo);
         let mut report = recursive_cp_report(
@@ -3445,9 +3542,9 @@ async fn execute_mv(
             }
         }
         let report_path =
-            effective_report_path(global, args.report_path.as_deref(), "ve-adrive mv")?;
+            effective_report_path(profile, args.report_path.as_deref(), "ve-adrive mv")?;
         let manifest_path = effective_optional_manifest_path(
-            global,
+            profile,
             args.manifest_path.as_deref(),
             args.no_manifest,
             "ve-adrive mv",
@@ -3528,7 +3625,7 @@ async fn execute_mv(
 }
 
 fn effective_mv_runtime_config(
-    global: &GlobalArgs,
+    profile: &Profile,
     args: &MvArgs,
 ) -> Result<TransferRuntimeConfig, CliError> {
     let cp_args = CpArgs {
@@ -3559,17 +3656,19 @@ fn effective_mv_runtime_config(
         force: args.force,
         no_clobber: false,
     };
-    effective_cp_runtime_config(global, &cp_args)
+    effective_cp_runtime_config(profile, &cp_args)
 }
 
 async fn execute_recursive_mv_streaming_no_manifest(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &IdsClient,
     args: &MvArgs,
     runtime: TransferRuntimeConfig,
 ) -> Result<i32, CliError> {
-    let report_path = effective_report_path(global, args.report_path.as_deref(), "ve-adrive mv")?;
-    let progress_enabled = effective_progress_enabled(global, args.progress, args.no_progress)?;
+    let report_path = effective_report_path(profile, args.report_path.as_deref(), "ve-adrive mv")?;
+    let progress_enabled =
+        effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
     let progress = streaming_batch_progress(progress_enabled, "ve-adrive mv");
     let mut report = BatchReport::new("ve-adrive mv");
     let stream_result = {
@@ -4082,6 +4181,7 @@ fn record_adrive_stream_move_result(
 
 async fn execute_sync(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &IdsClient,
     args: &SyncArgs,
 ) -> Result<i32, CliError> {
@@ -4115,8 +4215,9 @@ async fn execute_sync(
         force: args.force,
         no_clobber: false,
     };
-    let runtime = effective_cp_runtime_config(global, &cp_args)?;
-    let progress_enabled = effective_progress_enabled(global, args.progress, args.no_progress)?;
+    let runtime = effective_cp_runtime_config(profile, &cp_args)?;
+    let progress_enabled =
+        effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
     let list_echo_enabled = effective_list_echo_enabled(global, args.list_echo, args.no_list_echo);
     if !args.source.starts_with("adrive://") && !args.destination.starts_with("adrive://") {
         return Err(CliError::ValidationError(
@@ -4174,9 +4275,10 @@ async fn execute_sync(
         (report, Ok(()), Ok(()))
     };
     let copy_had_fatal_error = copy_stream_result.is_err() || copy_drain_result.is_err();
-    let report_path = effective_report_path(global, args.report_path.as_deref(), "ve-adrive sync")?;
+    let report_path =
+        effective_report_path(profile, args.report_path.as_deref(), "ve-adrive sync")?;
     let manifest_path = effective_optional_manifest_path(
-        global,
+        profile,
         args.manifest_path.as_deref(),
         args.no_manifest,
         "ve-adrive sync",
@@ -4274,61 +4376,261 @@ async fn execute_create(
     client: &IdsClient,
     args: &CreateArgs,
 ) -> Result<i32, CliError> {
+    // [Review Fix #1] Reject target-specific create options before --by-name
+    // resolution can issue a Resource request.
+    let auth_context = create_auth_context(client, args)?;
+    prevalidate_create_options(
+        args,
+        auth_context.is_oauth,
+        auth_context.oauth_user_id.as_deref(),
+    )?;
     let resolved_args = resolve_create_args_by_name(client, args).await?;
-    let args = &resolved_args;
-    let response = match resolve_create_target(args)? {
-        ADriveCreateTarget::Instance { name } => {
-            let input = CreateInstanceInput {
-                name: name.clone(),
-                display_name: args.display_name.clone(),
-                description: args.description.clone().unwrap_or_default(),
-                ..Default::default()
-            };
-            let out = client
-                .create_instance(&input)
-                .await
-                .map_err(map_ids_error)?;
-            let request_id = out.response_info.request_id().to_string();
-            let instance = out.instance;
-            json!({
-                "resource_type": "instance",
-                "target": format!("adrive://{}", instance.instance_id),
-                "instance_id": instance.instance_id,
-                "name": instance.name,
-                "display_name": instance.display_name,
-                "description": instance.description,
-                "request_id": request_id,
-                "status": "succeeded",
-            })
-        }
-        ADriveCreateTarget::Space { instance, name } => {
-            let input = CreateSpaceInput {
-                instance_id: instance.clone(),
-                space_name: name.clone(),
-                display_name: args.display_name.clone(),
-                index_enabled: args.index_enabled,
-                description: args.description.clone(),
-                ..Default::default()
-            };
-            let out = client.create_space(&input).await.map_err(map_ids_error)?;
-            let request_id = out.response_info.request_id().to_string();
-            let space = out.space;
-            json!({
-                "resource_type": "space",
-                "target": format!("adrive://{}/{}", instance, space.space_id),
-                "instance_id": instance,
-                "space_id": space.space_id,
-                "name": space.name,
-                "display_name": space.display_name,
-                "description": space.description,
-                "index_enabled": args.index_enabled,
-                "request_id": request_id,
-                "status": "succeeded",
-            })
-        }
-    };
+    let response = execute_create_target(client, &resolved_args, &auth_context).await?;
     output_envelope(global, &Envelope::success("ve-adrive crt", response))?;
     Ok(0)
+}
+
+fn create_auth_context(
+    client: &IdsClient,
+    args: &CreateArgs,
+) -> Result<CreateAuthContext, CliError> {
+    let is_oauth = client.uses_oauth();
+    let needs_oauth_user_default = create_requires_oauth_user_id(args, is_oauth)?;
+    let oauth_user_id = load_oauth_user_id_if_needed(needs_oauth_user_default, || {
+        client.oauth_user_id().map_err(map_ids_error)
+    })?;
+    Ok(CreateAuthContext {
+        is_oauth,
+        needs_oauth_user_default,
+        oauth_user_id,
+    })
+}
+
+async fn execute_create_target(
+    client: &IdsClient,
+    args: &CreateArgs,
+    auth: &CreateAuthContext,
+) -> Result<Value, CliError> {
+    match resolve_create_target(args)? {
+        ADriveCreateTarget::Instance { name } => {
+            execute_create_instance(client, args, &name, auth).await
+        }
+        ADriveCreateTarget::Space { instance, name } => {
+            execute_create_space(client, args, &instance, &name, auth).await
+        }
+    }
+}
+
+async fn execute_create_instance(
+    client: &IdsClient,
+    args: &CreateArgs,
+    name: &str,
+    auth: &CreateAuthContext,
+) -> Result<Value, CliError> {
+    let input = build_create_instance_input(name, args, auth.is_oauth)?;
+    let out = client
+        .create_instance(&input)
+        .await
+        .map_err(map_ids_error)?;
+    let request_id = out.response_info.request_id().to_string();
+    let instance = out.instance;
+    Ok(json!({
+        "resource_type": "instance",
+        "target": format!("adrive://{}", instance.instance_id),
+        "instance_id": instance.instance_id,
+        "name": instance.name,
+        "display_name": instance.display_name,
+        "description": instance.description,
+        "request_id": request_id,
+        "status": "succeeded",
+    }))
+}
+
+async fn execute_create_space(
+    client: &IdsClient,
+    args: &CreateArgs,
+    instance: &str,
+    name: &str,
+    auth: &CreateAuthContext,
+) -> Result<Value, CliError> {
+    let input = build_create_space_input(
+        instance,
+        name,
+        args,
+        auth.is_oauth,
+        auth.oauth_user_id.as_deref(),
+    )?;
+    let out = if auth.needs_oauth_user_default {
+        client.create_space_with_oauth_default_owner(&input).await
+    } else {
+        client.create_space(&input).await
+    }
+    .map_err(map_ids_error)?;
+    let request_id = out.response_info.request_id().to_string();
+    let space = out.space;
+    Ok(json!({
+        "resource_type": "space",
+        "target": format!("adrive://{instance}/{}", space.space_id),
+        "instance_id": instance,
+        "space_id": space.space_id,
+        "name": space.name,
+        "display_name": space.display_name,
+        "description": space.description,
+        "index_enabled": args.index_enabled,
+        "request_id": request_id,
+        "status": "succeeded",
+    }))
+}
+
+fn build_create_instance_input(
+    name: &str,
+    args: &CreateArgs,
+    is_oauth: bool,
+) -> Result<CreateInstanceInput, CliError> {
+    if args.owner_type.is_some() || args.owner_id.is_some() {
+        return Err(CliError::ValidationError(
+            "--owner-type and --owner-id are valid only when creating a Space".to_string(),
+        ));
+    }
+    let default_service_type = if is_oauth { "paas" } else { "arkclaw" };
+    let service_type = args
+        .service_type
+        .map(|value| value.as_str())
+        .unwrap_or(default_service_type);
+    Ok(CreateInstanceInput {
+        name: name.to_string(),
+        display_name: args.display_name.clone(),
+        description: args.description.clone().unwrap_or_default(),
+        service_type: Some(service_type.to_string()),
+        ..Default::default()
+    })
+}
+
+fn build_create_space_input(
+    instance: &str,
+    name: &str,
+    args: &CreateArgs,
+    is_oauth: bool,
+    oauth_user_id: Option<&str>,
+) -> Result<CreateSpaceInput, CliError> {
+    if args.service_type.is_some() {
+        return Err(CliError::ValidationError(
+            "--service-type is valid only when creating an Instance".to_string(),
+        ));
+    }
+    let owner_type = args
+        .owner_type
+        .map(|value| value.as_str().to_string())
+        .or_else(|| is_oauth.then(|| "user".to_string()));
+    let owner_id = resolve_create_space_owner_id(
+        args.owner_id.as_deref(),
+        owner_type.as_deref(),
+        is_oauth,
+        oauth_user_id,
+    )?;
+    Ok(CreateSpaceInput {
+        instance_id: instance.to_string(),
+        space_name: name.to_string(),
+        display_name: args.display_name.clone(),
+        index_enabled: args.index_enabled,
+        description: args.description.clone(),
+        owner_type,
+        owner_id,
+        ..Default::default()
+    })
+}
+
+fn resolve_create_space_owner_id(
+    explicit_owner_id: Option<&str>,
+    owner_type: Option<&str>,
+    is_oauth: bool,
+    oauth_user_id: Option<&str>,
+) -> Result<Option<String>, CliError> {
+    let owner_id = normalized_owner_id(explicit_owner_id)?;
+    if owner_id.is_some() || !is_oauth {
+        return Ok(owner_id);
+    }
+    if owner_type == Some("group") {
+        return Err(CliError::ValidationError(
+            "--owner-id is required when creating a Space with --owner-type group in OAuth mode"
+                .to_string(),
+        ));
+    }
+    normalized_owner_id(oauth_user_id)
+        .map_err(|_| oauth_user_id_required_error())?
+        .ok_or_else(oauth_user_id_required_error)
+        .map(Some)
+}
+
+fn oauth_user_id_required_error() -> CliError {
+    // [Review Fix #2] Keep the stable error code while making remediation executable.
+    CliError::ValidationError(
+        "[oauth_user_id_required] OAuth Space creation requires --owner-id or ve-adrive auth login --instance <instance_id> to load the selected user's ID"
+            .to_string(),
+    )
+}
+
+fn normalized_owner_id(owner_id: Option<&str>) -> Result<Option<String>, CliError> {
+    let Some(owner_id) = owner_id else {
+        return Ok(None);
+    };
+    let owner_id = owner_id.trim();
+    if owner_id.is_empty() {
+        return Err(CliError::ValidationError(
+            "--owner-id must not be empty".to_string(),
+        ));
+    }
+    Ok(Some(owner_id.to_string()))
+}
+
+fn prevalidate_create_options(
+    args: &CreateArgs,
+    is_oauth: bool,
+    oauth_user_id: Option<&str>,
+) -> Result<(), CliError> {
+    match resolve_create_target(args)? {
+        ADriveCreateTarget::Instance { name } => {
+            build_create_instance_input(&name, args, is_oauth)?;
+        }
+        ADriveCreateTarget::Space { instance, name } => {
+            build_create_space_input(&instance, &name, args, is_oauth, oauth_user_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn create_oauth_user_id_if_needed(
+    args: &CreateArgs,
+    is_oauth: bool,
+    load_oauth_user_id: impl FnOnce() -> Result<Option<String>, CliError>,
+) -> Result<Option<String>, CliError> {
+    let needs_oauth_user_default = create_requires_oauth_user_id(args, is_oauth)?;
+    load_oauth_user_id_if_needed(needs_oauth_user_default, load_oauth_user_id)
+}
+
+fn load_oauth_user_id_if_needed(
+    needs_oauth_user_default: bool,
+    load_oauth_user_id: impl FnOnce() -> Result<Option<String>, CliError>,
+) -> Result<Option<String>, CliError> {
+    if !needs_oauth_user_default {
+        return Ok(None);
+    }
+    load_oauth_user_id()?
+        .ok_or_else(oauth_user_id_required_error)
+        .map(Some)
+}
+
+fn create_requires_oauth_user_id(args: &CreateArgs, is_oauth: bool) -> Result<bool, CliError> {
+    let target = resolve_create_target(args)?;
+    let (instance, name) = match target {
+        ADriveCreateTarget::Instance { name } => {
+            build_create_instance_input(&name, args, is_oauth)?;
+            return Ok(false);
+        }
+        ADriveCreateTarget::Space { instance, name } => (instance, name),
+    };
+    build_create_space_input(&instance, &name, args, is_oauth, Some("oauth-user-id"))?;
+    Ok(is_oauth && args.owner_id.is_none())
 }
 
 async fn execute_delete(
@@ -4382,18 +4684,20 @@ fn adrive_rm_should_delete_folder(args: &RmArgs, target: &ParsedADriveUri) -> bo
 
 async fn execute_rm(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &IdsClient,
     args: &RmArgs,
 ) -> Result<i32, CliError> {
     let resolved_args = resolve_rm_args_by_name(client, args).await?;
     let args = &resolved_args;
     let target = resolve_rm_target(args)?;
-    let progress_enabled = effective_progress_enabled(global, args.progress, args.no_progress)?;
+    let progress_enabled =
+        effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
     let list_echo_enabled = effective_list_echo_enabled(global, args.list_echo, args.no_list_echo);
     let (batch_concurrency, list_concurrency) = if args.recursive {
         (
-            effective_batch_concurrency(global, args.batch_concurrency)?,
-            effective_list_concurrency(global, args.list_concurrency)?,
+            effective_batch_concurrency(profile, args.batch_concurrency)?,
+            effective_list_concurrency(profile, args.list_concurrency)?,
         )
     } else {
         reject_single_transfer_artifacts(
@@ -4413,6 +4717,7 @@ async fn execute_rm(
             if args.recursive_delete_mode == RecursiveDeleteMode::BottomUp {
                 return execute_rm_bottom_up(
                     global,
+                    profile,
                     client,
                     args,
                     &target,
@@ -4471,7 +4776,7 @@ async fn execute_rm(
         direct_recursive_report.unwrap_or_else(|| BatchReport::new("ve-adrive rm"));
     if args.include_uploads {
         abort_checkpointed_multipart_uploads_for_rm(
-            global,
+            profile,
             client,
             &target,
             args.checkpoint_dir.as_deref(),
@@ -4483,7 +4788,7 @@ async fn execute_rm(
     let upload_failed = upload_report.failed;
     if is_direct_recursive_delete {
         let report_path =
-            effective_report_path(global, args.report_path.as_deref(), "ve-adrive rm")?;
+            effective_report_path(profile, args.report_path.as_deref(), "ve-adrive rm")?;
         write_batch_report(
             report_path.as_deref(),
             &upload_report,
@@ -4529,6 +4834,7 @@ async fn execute_rm(
 
 async fn execute_rm_bottom_up(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &IdsClient,
     args: &RmArgs,
     target: &ParsedADriveUri,
@@ -4540,6 +4846,7 @@ async fn execute_rm_bottom_up(
     if args.no_manifest {
         return execute_rm_bottom_up_streaming_no_manifest(
             global,
+            profile,
             client,
             args,
             target,
@@ -4560,9 +4867,9 @@ async fn execute_rm_bottom_up(
         args.include.as_deref(),
         args.exclude.as_deref(),
     );
-    let report_path = effective_report_path(global, args.report_path.as_deref(), "ve-adrive rm")?;
+    let report_path = effective_report_path(profile, args.report_path.as_deref(), "ve-adrive rm")?;
     let manifest_path = effective_optional_manifest_path(
-        global,
+        profile,
         args.manifest_path.as_deref(),
         args.no_manifest,
         "ve-adrive rm",
@@ -4584,7 +4891,7 @@ async fn execute_rm_bottom_up(
     finish_progress(progress);
     if args.include_uploads {
         abort_checkpointed_multipart_uploads_for_rm(
-            global,
+            profile,
             client,
             target,
             args.checkpoint_dir.as_deref(),
@@ -4633,6 +4940,7 @@ async fn execute_rm_bottom_up(
 
 async fn execute_rm_bottom_up_streaming_no_manifest(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &IdsClient,
     args: &RmArgs,
     target: &ParsedADriveUri,
@@ -4640,7 +4948,7 @@ async fn execute_rm_bottom_up_streaming_no_manifest(
     list_concurrency: usize,
     progress_enabled: bool,
 ) -> Result<i32, CliError> {
-    let report_path = effective_report_path(global, args.report_path.as_deref(), "ve-adrive rm")?;
+    let report_path = effective_report_path(profile, args.report_path.as_deref(), "ve-adrive rm")?;
     let progress = streaming_batch_progress(progress_enabled, "ve-adrive rm");
     let mut report = BatchReport::new("ve-adrive rm");
     let stream_result = stream_delete_adrive_bottom_up(
@@ -4657,7 +4965,7 @@ async fn execute_rm_bottom_up_streaming_no_manifest(
     finish_streaming_progress(progress, report.total as u64);
     if stream_result.is_ok() && args.include_uploads {
         abort_checkpointed_multipart_uploads_for_rm(
-            global,
+            profile,
             client,
             target,
             args.checkpoint_dir.as_deref(),
@@ -5024,10 +5332,32 @@ struct BoundedInstances {
     request_id: String,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum RootInstanceListing {
+    Collection,
+    Single(String),
+}
+
 struct BoundedSpaces {
     spaces: Vec<SpaceInfo>,
+    root_space: Option<SpaceInfo>,
     next_marker: Option<String>,
     is_truncated: bool,
+    request_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpaceListingKind {
+    All,
+    User,
+    Group,
+}
+
+struct SpacePage {
+    spaces: Vec<SpaceInfo>,
+    root_space: Option<SpaceInfo>,
+    next_marker: String,
+    has_more: bool,
     request_id: String,
 }
 
@@ -5082,34 +5412,82 @@ async fn list_instances_bounded(
     })
 }
 
+fn resolve_root_instance_listing(
+    scope: InstanceListingScope,
+    marker: Option<&str>,
+) -> Result<RootInstanceListing, CliError> {
+    match scope {
+        InstanceListingScope::All => Ok(RootInstanceListing::Collection),
+        InstanceListingScope::Bound(_) if marker.is_some_and(|value| !value.is_empty()) => {
+            Err(CliError::ValidationError(
+                "OAuth root ls does not support --marker".to_string(),
+            ))
+        }
+        InstanceListingScope::Bound(instance_id) => {
+            Ok(RootInstanceListing::Single(instance_id))
+        }
+        InstanceListingScope::UnknownOAuthBinding => Err(CliError::ConfigMissing(
+            "[oauth_instance_required] OAuth credentials do not identify the bound ADrive Instance; provide --instance or adrive://<instance-id>".to_string(),
+        )),
+    }
+}
+
+async fn list_root_instances_bounded(
+    client: &IdsClient,
+    max_keys: i32,
+    marker: Option<&str>,
+) -> Result<BoundedInstances, CliError> {
+    let scope = client.instance_listing_scope().map_err(map_ids_error)?;
+    match resolve_root_instance_listing(scope, marker)? {
+        RootInstanceListing::Collection => list_instances_bounded(client, max_keys, marker).await,
+        RootInstanceListing::Single(instance_id) => {
+            let output = client
+                .get_instance(&GetInstanceInput::new(instance_id))
+                .await
+                .map_err(map_ids_error)?;
+            let request_id = output.response_info.request_id().to_string();
+            Ok(BoundedInstances {
+                instances: vec![output.instance],
+                next_marker: None,
+                is_truncated: false,
+                request_id,
+            })
+        }
+    }
+}
+
 async fn list_spaces_bounded(
     client: &IdsClient,
     instance: &str,
     max_keys: i32,
     initial_marker: Option<&str>,
+    listing_kind: SpaceListingKind,
 ) -> Result<BoundedSpaces, CliError> {
     let mut spaces = Vec::new();
+    let mut root_space = None;
     let mut marker = initial_marker.map(ToString::to_string);
     let mut next_marker = None;
     let mut request_id = String::new();
 
     while (spaces.len() as i32) < max_keys {
         let page_limit = bounded_list_page_limit(spaces.len() as i32, max_keys);
-        let mut input = ListSpacesInput::new(instance).with_limit(page_limit);
-        input.marker = marker.take();
-        let out = client.list_spaces(&input).await.map_err(map_ids_error)?;
-        request_id = out.response_info.request_id().to_string();
-        for space in out.spaces {
+        let page =
+            fetch_space_page(client, instance, page_limit, marker.take(), listing_kind).await?;
+        request_id = page.request_id;
+        if root_space.is_none() {
+            root_space = page.root_space;
+        }
+        for space in page.spaces {
             if (spaces.len() as i32) >= max_keys {
                 break;
             }
             spaces.push(space);
         }
-        if !out.is_truncated || out.next_marker.is_empty() {
+        if !page.has_more {
             next_marker = None;
             break;
         }
-        next_marker = Some(out.next_marker);
+        next_marker = Some(page.next_marker);
         if (spaces.len() as i32) >= max_keys {
             break;
         }
@@ -5118,10 +5496,106 @@ async fn list_spaces_bounded(
 
     Ok(BoundedSpaces {
         spaces,
+        root_space,
         is_truncated: next_marker.is_some(),
         next_marker,
         request_id,
     })
+}
+
+async fn fetch_space_page(
+    client: &IdsClient,
+    instance: &str,
+    limit: i32,
+    marker: Option<String>,
+    listing_kind: SpaceListingKind,
+) -> Result<SpacePage, CliError> {
+    match listing_kind {
+        SpaceListingKind::All => {
+            let mut input = ListSpacesInput::new(instance).with_limit(limit);
+            input.marker = marker;
+            let output = client.list_spaces(&input).await.map_err(map_ids_error)?;
+            Ok(SpacePage {
+                has_more: space_page_has_more(
+                    listing_kind,
+                    output.is_truncated,
+                    &output.next_marker,
+                ),
+                spaces: output.spaces,
+                root_space: None,
+                next_marker: output.next_marker,
+                request_id: output.response_info.request_id().to_string(),
+            })
+        }
+        SpaceListingKind::User => fetch_my_spaces_page(client, instance, limit, marker).await,
+        SpaceListingKind::Group => {
+            fetch_my_group_spaces_page(client, instance, limit, marker).await
+        }
+    }
+}
+
+async fn fetch_my_spaces_page(
+    client: &IdsClient,
+    instance: &str,
+    limit: i32,
+    marker: Option<String>,
+) -> Result<SpacePage, CliError> {
+    let mut input = ListMySpacesInput::new(instance).with_limit(limit);
+    input.marker = marker;
+    let output = client.list_my_spaces(&input).await.map_err(map_ids_error)?;
+    Ok(SpacePage {
+        has_more: space_page_has_more(SpaceListingKind::User, false, &output.next_marker),
+        spaces: output.spaces,
+        root_space: None,
+        next_marker: output.next_marker,
+        request_id: output.response_info.request_id().to_string(),
+    })
+}
+
+async fn fetch_my_group_spaces_page(
+    client: &IdsClient,
+    instance: &str,
+    limit: i32,
+    marker: Option<String>,
+) -> Result<SpacePage, CliError> {
+    let mut input = ListMyGroupSpacesInput::new(instance).with_limit(limit);
+    input.marker = marker;
+    let output = client
+        .list_my_group_spaces(&input)
+        .await
+        .map_err(map_ids_error)?;
+    Ok(SpacePage {
+        has_more: space_page_has_more(SpaceListingKind::Group, false, &output.next_marker),
+        spaces: output.spaces,
+        root_space: output.root_space,
+        next_marker: output.next_marker,
+        request_id: output.response_info.request_id().to_string(),
+    })
+}
+
+fn resolve_space_listing_kind(
+    is_oauth: bool,
+    owner_type: Option<OwnerType>,
+) -> Result<SpaceListingKind, CliError> {
+    match (is_oauth, owner_type) {
+        (false, None) => Ok(SpaceListingKind::All),
+        (false, Some(_)) => Err(CliError::ValidationError(
+            "--owner-type is supported only in OAuth mode".to_string(),
+        )),
+        (true, None | Some(OwnerType::User)) => Ok(SpaceListingKind::User),
+        (true, Some(OwnerType::Group)) => Ok(SpaceListingKind::Group),
+    }
+}
+
+fn space_page_has_more(
+    listing_kind: SpaceListingKind,
+    service_is_truncated: bool,
+    next_marker: &str,
+) -> bool {
+    if next_marker.is_empty() {
+        return false;
+    }
+    listing_kind != SpaceListingKind::All || service_is_truncated
 }
 
 async fn list_files_bounded(
@@ -5295,6 +5769,7 @@ async fn execute_ls(
     client: &IdsClient,
     args: &LsArgs,
 ) -> Result<i32, CliError> {
+    let space_listing_kind = prevalidate_ls_space_listing_kind(client.uses_oauth(), args)?;
     let resolved_args = resolve_ls_args_by_name(client, args).await?;
     let args = &resolved_args;
     validate_adrive_ls_max_keys(args.max_keys)?;
@@ -5310,7 +5785,7 @@ async fn execute_ls(
     match target {
         ADriveTarget::Instances => {
             let listed =
-                list_instances_bounded(client, args.max_keys, args.marker.as_deref()).await?;
+                list_root_instances_bounded(client, args.max_keys, args.marker.as_deref()).await?;
             let mut instances = Vec::new();
             let mut manifest_items = Vec::new();
             for instance in listed.instances {
@@ -5358,9 +5833,30 @@ async fn execute_ls(
             )?;
         }
         ADriveTarget::Instance { instance } => {
-            let listed =
-                list_spaces_bounded(client, &instance, args.max_keys, args.marker.as_deref())
-                    .await?;
+            let listing_kind = space_listing_kind.ok_or_else(|| {
+                CliError::ValidationError(
+                    "internal Space listing selection did not match the target".to_string(),
+                )
+            })?;
+            let listed = list_spaces_bounded(
+                client,
+                &instance,
+                args.max_keys,
+                args.marker.as_deref(),
+                listing_kind,
+            )
+            .await?;
+            let root_space = listed.root_space.as_ref().map(|space| {
+                json!({
+                    "space_id": space.space_id,
+                    "name": space.name,
+                    "display_name": space.display_name,
+                    "owner_type": space.owner_type,
+                    "owner_id": space.owner_id,
+                    "created_at": space.created_at,
+                    "updated_at": space.updated_at,
+                })
+            });
             let mut spaces = Vec::new();
             let mut manifest_items = Vec::new();
             for space in listed.spaces {
@@ -5388,22 +5884,23 @@ async fn execute_ls(
                 .await?;
             let total = spaces.len() as u64;
             let next_marker = listed.next_marker.unwrap_or_default();
+            let mut response = json!({
+                "scope": "spaces",
+                "instance": instance,
+                "spaces": spaces,
+                "next_marker": next_marker,
+                "is_truncated": listed.is_truncated,
+                "request_id": listed.request_id,
+                "manifest_path": manifest_path,
+            });
+            if let Some(root_space) = root_space {
+                response["root_space"] = root_space;
+            }
             // [Review Fix #3] Space listing must honor --columns just like file listing.
             output_result_with_columns(
                 global,
-                &Envelope::success(
-                    "ve-adrive ls",
-                    json!({
-                        "scope": "spaces",
-                        "instance": instance,
-                        "spaces": spaces,
-                        "next_marker": next_marker,
-                        "is_truncated": listed.is_truncated,
-                        "request_id": listed.request_id,
-                        "manifest_path": manifest_path,
-                    }),
-                )
-                .with_pagination(adrive_marker_pagination(&next_marker, total)),
+                &Envelope::success("ve-adrive ls", response)
+                    .with_pagination(adrive_marker_pagination(&next_marker, total)),
                 Some(parse_columns(args.columns.as_deref()).unwrap_or(SPACE_TABLE_COLUMNS)),
             )?;
         }
@@ -5439,6 +5936,29 @@ async fn execute_ls(
         }
     }
     Ok(0)
+}
+
+fn prevalidate_ls_space_listing_kind(
+    is_oauth: bool,
+    args: &LsArgs,
+) -> Result<Option<SpaceListingKind>, CliError> {
+    let target = resolve_hierarchical_target(
+        args.path.as_deref(),
+        args.instance.as_deref(),
+        args.space.as_deref(),
+        args.folder.as_deref(),
+        None,
+        true,
+    )?;
+    if matches!(target, ADriveTarget::Instance { .. }) {
+        return resolve_space_listing_kind(is_oauth, args.owner_type).map(Some);
+    }
+    if args.owner_type.is_some() {
+        return Err(CliError::ValidationError(
+            "--owner-type is valid only when listing Spaces under one Instance".to_string(),
+        ));
+    }
+    Ok(None)
 }
 
 async fn execute_stat(
@@ -5527,6 +6047,7 @@ async fn execute_stat(
 
 async fn execute_du(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &IdsClient,
     args: &DuArgs,
 ) -> Result<i32, CliError> {
@@ -5542,7 +6063,7 @@ async fn execute_du(
     )?;
     let price_table = storage_price_table(&args.storage_price)?;
     let manifest_path = effective_explicit_manifest_path(args.manifest_path.as_deref());
-    let list_concurrency = effective_list_concurrency(global, args.list_concurrency)?;
+    let list_concurrency = effective_list_concurrency(profile, args.list_concurrency)?;
     let progress = traversal_progress(
         "ve-adrive du",
         &format_target(&target),
@@ -6274,6 +6795,7 @@ async fn execute_cat(
 
 async fn execute_put(
     global: &GlobalArgs,
+    profile: &Profile,
     client: &IdsClient,
     args: &PutArgs,
 ) -> Result<i32, CliError> {
@@ -6292,8 +6814,9 @@ async fn execute_put(
     }
 
     let part_size =
-        effective_stdin_multipart_threshold(global, args.multipart_threshold.as_deref())?;
-    let progress_enabled = effective_progress_enabled(global, args.progress, args.no_progress)?;
+        effective_stdin_multipart_threshold(profile, args.multipart_threshold.as_deref())?;
+    let progress_enabled =
+        effective_progress_enabled(global, profile, args.progress, args.no_progress)?;
     let mut stdin = tokio::io::stdin();
     let first_part = read_stream_part(&mut stdin, part_size).await?;
     if first_part.len() < part_size {
@@ -6532,14 +7055,14 @@ async fn abort_adrive_multipart_upload(
 }
 
 async fn abort_checkpointed_multipart_uploads_for_rm(
-    global: &GlobalArgs,
+    profile: &Profile,
     client: &IdsClient,
     target: &ParsedADriveUri,
     checkpoint_dir: Option<&str>,
     progress_enabled: bool,
     report: &mut BatchReport,
 ) -> Result<(), CliError> {
-    let uploads = list_checkpointed_uploads_for_rm(global, target, checkpoint_dir).await?;
+    let uploads = list_checkpointed_uploads_for_rm(profile, target, checkpoint_dir).await?;
     if uploads.is_empty() {
         return Ok(());
     }
@@ -6585,13 +7108,13 @@ async fn abort_checkpointed_multipart_uploads_for_rm(
 }
 
 async fn list_checkpointed_uploads_for_rm(
-    global: &GlobalArgs,
+    profile: &Profile,
     target: &ParsedADriveUri,
     checkpoint_dir: Option<&str>,
 ) -> Result<Vec<ADriveUploadCheckpointRef>, CliError> {
     let mut uploads = Vec::new();
     let mut seen = HashSet::new();
-    for directory in adrive_checkpoint_scan_dirs(global, checkpoint_dir)? {
+    for directory in adrive_checkpoint_scan_dirs(profile, checkpoint_dir)? {
         let mut entries = match tokio::fs::read_dir(&directory).await {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -6623,7 +7146,7 @@ async fn list_checkpointed_uploads_for_rm(
 }
 
 fn adrive_checkpoint_scan_dirs(
-    global: &GlobalArgs,
+    profile: &Profile,
     checkpoint_dir: Option<&str>,
 ) -> Result<Vec<PathBuf>, CliError> {
     let mut directories = vec![
@@ -6633,7 +7156,6 @@ fn adrive_checkpoint_scan_dirs(
     if let Some(directory) = checkpoint_dir {
         directories.push(expand_user_path(directory));
     }
-    let profile = build_profile(global)?;
     if let Some(directory) = profile.checkpoint_dir.as_deref() {
         directories.push(expand_user_path(directory));
     }
@@ -7625,16 +8147,16 @@ async fn write_batch_report(
 }
 
 fn effective_report_path(
-    global: &GlobalArgs,
+    profile: &Profile,
     explicit: Option<&str>,
     command: &str,
 ) -> Result<Option<String>, CliError> {
     if let Some(path) = explicit {
         return Ok(Some(expand_user_path(path).to_string_lossy().into_owned()));
     }
-    let profile = build_profile(global)?;
     let report_format = profile
         .batch_report_format
+        .clone()
         .unwrap_or_else(|| DEFAULT_TOS_BATCH_REPORT_FORMAT.to_string());
     if report_format != "csv" {
         return Err(CliError::ValidationError(format!(
@@ -7644,6 +8166,7 @@ fn effective_report_path(
     }
     let report_dir_raw = profile
         .batch_report_dir
+        .clone()
         .unwrap_or_else(|| ADRIVE_DEFAULT_BATCH_REPORT_DIR.to_string());
     let report_dir = writable_default_report_dir(report_dir_raw.trim_end_matches('/'))?;
     let file_name = format!(
@@ -7658,16 +8181,16 @@ fn effective_report_path(
 }
 
 fn effective_manifest_path(
-    global: &GlobalArgs,
+    profile: &Profile,
     explicit: Option<&str>,
     command: &str,
 ) -> Result<Option<String>, CliError> {
     if let Some(path) = explicit {
         return Ok(Some(expand_user_path(path).to_string_lossy().into_owned()));
     }
-    let profile = build_profile(global)?;
     let report_dir_raw = profile
         .batch_report_dir
+        .clone()
         .unwrap_or_else(|| ADRIVE_DEFAULT_BATCH_REPORT_DIR.to_string());
     let report_dir = writable_default_report_dir(report_dir_raw.trim_end_matches('/'))?;
     let file_name = format!(
@@ -7682,7 +8205,7 @@ fn effective_manifest_path(
 }
 
 fn effective_optional_manifest_path(
-    global: &GlobalArgs,
+    profile: &Profile,
     explicit: Option<&str>,
     no_manifest: bool,
     command: &str,
@@ -7690,7 +8213,7 @@ fn effective_optional_manifest_path(
     if no_manifest {
         return Ok(None);
     }
-    effective_manifest_path(global, explicit, command)
+    effective_manifest_path(profile, explicit, command)
 }
 
 fn effective_explicit_manifest_path(explicit: Option<&str>) -> Option<String> {
@@ -7905,29 +8428,51 @@ async fn local_file_crc64(path: &Path) -> Result<u64, CliError> {
     Ok(digest.sum64())
 }
 
-async fn write_download_stream(
+fn validate_adrive_download_length(
+    destination: &Path,
+    expected_size: u64,
+    actual_size: u64,
+) -> Result<(), CliError> {
+    // [Review Fix #7] A cleanly terminated body without Content-Length can
+    // still be incomplete, so validate against the metadata HEAD inside the
+    // attempt and let the complete-attempt retry policy replay the GET.
+    if actual_size != expected_size {
+        return Err(CliError::TransferFailed(format!(
+            "download length mismatch for '{}': expected={}, actual={}",
+            destination.display(),
+            expected_size,
+            actual_size
+        )));
+    }
+    Ok(())
+}
+
+async fn write_download_stream_retryable(
     mut output: GetFileOutput,
     destination: &Path,
     append: bool,
     rate_limiter: Option<Arc<RateLimiter>>,
-) -> Result<u64, CliError> {
+) -> Result<u64, IdsSdkError> {
     let mut file = if append {
         tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(destination)
-            .await?
+            .await
+            .map_err(CliError::Io)?
     } else {
-        tokio::fs::File::create(destination).await?
+        tokio::fs::File::create(destination)
+            .await
+            .map_err(CliError::Io)?
     };
     let mut written = 0_u64;
     while let Some(chunk) = output.next().await {
-        let chunk = chunk?;
+        let chunk = chunk.map_err(IdsSdkError::HttpBody)?;
         throttle_bytes(rate_limiter.as_deref(), chunk.len()).await;
-        file.write_all(&chunk).await?;
+        file.write_all(&chunk).await.map_err(CliError::Io)?;
         written = written.saturating_add(chunk.len() as u64);
     }
-    file.flush().await?;
+    file.flush().await.map_err(CliError::Io)?;
     Ok(written)
 }
 
@@ -7996,18 +8541,36 @@ async fn download_adrive_range_part(
     let mut input = GetFileInput::new(&source.instance, &source.space, &source.path)
         .with_range_raw(format!("bytes={offset}-{end}"));
     input.if_match = Some(source_etag.to_string());
-    let out = client.get_file(&input).await.map_err(map_ids_error)?;
-    let written = write_download_stream(out, &part_path, false, rate_limiter).await?;
-    if written != size {
+    let retry_part_path = part_path.clone();
+    let result = client
+        .get_file_with_consumer(&input, move |output| {
+            let attempt_part_path = retry_part_path.clone();
+            let attempt_rate_limiter = rate_limiter.clone();
+            Box::pin(async move {
+                let written = write_download_stream_retryable(
+                    output,
+                    &attempt_part_path,
+                    false,
+                    attempt_rate_limiter,
+                )
+                .await?;
+                if written != size {
+                    return Err(IdsSdkError::Cli(CliError::TransferFailed(format!(
+                        "range download length mismatch for '{}': expected={}, actual={}",
+                        attempt_part_path.display(),
+                        size,
+                        written
+                    ))));
+                }
+                Ok(written)
+            })
+        })
+        .await
+        .map_err(map_ids_error);
+    if result.is_err() {
         let _ = std::fs::remove_file(&part_path);
-        return Err(CliError::TransferFailed(format!(
-            "range download length mismatch for '{}': expected={}, actual={}",
-            part_path.display(),
-            size,
-            written
-        )));
     }
-    Ok(written)
+    result
 }
 
 fn adrive_range_base_path(destination: &Path, source_etag: &str, file_size: u64) -> PathBuf {
@@ -8166,10 +8729,9 @@ fn rate_limiter_from_limit(limit: Option<&str>) -> Result<Option<Arc<RateLimiter
 }
 
 fn effective_cp_runtime_config(
-    global: &GlobalArgs,
+    profile: &Profile,
     args: &CpArgs,
 ) -> Result<TransferRuntimeConfig, CliError> {
-    let profile = build_profile(global)?;
     Ok(TransferRuntimeConfig {
         checkpoint_threshold: effective_size_value(
             args.checkpoint_threshold.as_deref(),
@@ -8209,10 +8771,9 @@ fn effective_cp_runtime_config(
 }
 
 fn effective_stdin_multipart_threshold(
-    global: &GlobalArgs,
+    profile: &Profile,
     cli_value: Option<&str>,
 ) -> Result<usize, CliError> {
-    let profile = build_profile(global)?;
     let threshold = effective_size_value(
         cli_value,
         profile.checkpoint_threshold.as_deref(),
@@ -8228,10 +8789,9 @@ fn effective_stdin_multipart_threshold(
 }
 
 fn effective_batch_concurrency(
-    global: &GlobalArgs,
+    profile: &Profile,
     cli_value: Option<usize>,
 ) -> Result<usize, CliError> {
-    let profile = build_profile(global)?;
     positive_or_config(
         cli_value,
         profile.batch_concurrency,
@@ -8241,10 +8801,9 @@ fn effective_batch_concurrency(
 }
 
 fn effective_list_concurrency(
-    global: &GlobalArgs,
+    profile: &Profile,
     cli_value: Option<usize>,
 ) -> Result<usize, CliError> {
-    let profile = build_profile(global)?;
     positive_or_config(
         cli_value,
         profile.list_concurrency,
@@ -8550,10 +9109,17 @@ fn resolve_list_echo_plan(
 
 fn resolve_progress_plan(
     global: &GlobalArgs,
+    snapshot_profile: Option<&Profile>,
     progress: bool,
     no_progress: bool,
 ) -> Result<OutputRenderPlan, CliError> {
-    let profile = build_profile(global)?;
+    let legacy_profile;
+    let profile = if let Some(profile) = snapshot_profile {
+        profile
+    } else {
+        legacy_profile = build_profile(global)?;
+        &legacy_profile
+    };
     let config_progress = profile
         .progress_enabled
         .unwrap_or(DEFAULT_TOS_PROGRESS_ENABLED);
@@ -8578,10 +9144,11 @@ fn resolve_progress_plan(
 
 fn effective_progress_enabled(
     global: &GlobalArgs,
+    profile: &Profile,
     progress: bool,
     no_progress: bool,
 ) -> Result<bool, CliError> {
-    Ok(resolve_progress_plan(global, progress, no_progress)?.enabled)
+    Ok(resolve_progress_plan(global, Some(profile), progress, no_progress)?.enabled)
 }
 
 fn effective_list_echo_enabled(global: &GlobalArgs, list_echo: bool, no_list_echo: bool) -> bool {
@@ -9658,7 +10225,7 @@ pub fn describe_high_level_command_path(command: &str) -> Option<CommandDescript
         )),
         "ve-adrive ls" => Some(high_level_description(
             "ve-adrive ls",
-            "get_instance + get_space + list_instances + list_spaces + list_files",
+            "get_instance + get_space + list_instances + list_spaces + list_my_spaces + list_my_group_spaces + list_files",
             "List instances, spaces, or files by target depth",
             RiskLevel::Low,
             true,
@@ -9841,10 +10408,18 @@ fn high_level_scenario_routing(command: &str) -> HashMap<String, String> {
     );
     // [Review Fix #RebaseADriveDescribe] Rebase dropped ADrive/TOS describe
     // parity for composite high-level commands; restore explicit routing hints.
-    if command == "ve-adrive ls" {
+    if command == "ve-adrive crt" {
+        routing.insert(
+            "create_defaults".to_string(),
+            "Instance: AK/SK defaults --service-type to arkclaw and OAuth defaults it to paas. Space: OAuth user Space ownership defaults to the logged-in user_id; --owner-type group requires --owner-id."
+                .to_string(),
+        );
+    } else if command == "ve-adrive ls" {
+        // [Review Fix #1] Describe the auth-aware root and Space routes instead
+        // of implying every no-target invocation lists an Instance collection.
         routing.insert(
             "target_matrix".to_string(),
-            "no target -> list instances; instance target -> list spaces; instance/space[/folder] target -> list files"
+            "AK/SK no target -> list_instances collection; OAuth no target -> the credentials-bound single Instance, missing binding -> oauth_instance_required, and OAuth root rejects --marker; AK/SK instance target -> list_spaces; OAuth instance target -> list_my_spaces and --owner-type group -> list_my_group_spaces; instance/space[/folder] target -> list_files"
                 .to_string(),
         );
         routing.insert(
@@ -10006,6 +10581,8 @@ fn cp_checkpoint_scope(args: &CpArgs) -> &'static str {
 async fn compute_dry_run_impact(
     global: &GlobalArgs,
     auth: &ADriveAuthArgs,
+    resolved_mode: AuthMode,
+    unified_client: Option<&IdsClient>,
     command: &ADriveCommand,
     cmd_name: &str,
     destructive: bool,
@@ -10031,11 +10608,18 @@ async fn compute_dry_run_impact(
         _ => return None,
     };
 
-    // Build the IDS client; gracefully return None if credentials are absent.
-    let client = build_ids_client(global, auth.auth_mode).ok()?;
+    // Reuse the Unified client created from the plan's authentication
+    // snapshot. Legacy modes retain the previous best-effort construction.
+    let legacy_client;
+    let client = if resolved_mode == AuthMode::Unified {
+        unified_client?
+    } else {
+        legacy_client = build_ids_client(global, auth.auth_mode).ok()?;
+        &legacy_client
+    };
 
     let listed = match list_all_files_and_folders_hierarchical(
-        &client,
+        client,
         &instance,
         &space,
         &path,
@@ -10100,6 +10684,11 @@ async fn build_plan(
     auth: &ADriveAuthArgs,
     command: &ADriveCommand,
 ) -> Result<serde_json::Value, CliError> {
+    // Resolve authentication before command-specific planning so OAuth-only
+    // owner/listing rules are applied consistently in dry-run.
+    let runtime = build_adrive_dry_run_runtime(global, auth.auth_mode)?;
+    let resolved_mode = runtime.resolved_auth_mode.mode;
+    let is_oauth = dry_run_uses_oauth(resolved_mode)?;
     // [Review Fix #ADrive-CheckpointPlan] Dry-run must describe checkpoint and
     // progress behavior for the same flags that real execution consumes.
     let (
@@ -10132,7 +10721,12 @@ async fn build_plan(
                 args.checkpoint,
                 args.checkpoint_dir.as_deref(),
                 cp_checkpoint_scope(args),
-                resolve_progress_plan(global, args.progress, args.no_progress)?,
+                resolve_progress_plan(
+                    global,
+                    runtime.unified_profile.as_ref(),
+                    args.progress,
+                    args.no_progress,
+                )?,
                 resolve_list_echo_plan(global, args.list_echo, args.no_list_echo),
                 vec![
                     "put_file/get_file/copy_file",
@@ -10159,7 +10753,12 @@ async fn build_plan(
                 false,
                 args.checkpoint_dir.as_deref(),
                 "not_enabled_for_mv",
-                resolve_progress_plan(global, args.progress, args.no_progress)?,
+                resolve_progress_plan(
+                    global,
+                    runtime.unified_profile.as_ref(),
+                    args.progress,
+                    args.no_progress,
+                )?,
                 resolve_list_echo_plan(global, args.list_echo, args.no_list_echo),
                 vec![
                     "rename_file/rename_folder for same space",
@@ -10177,7 +10776,12 @@ async fn build_plan(
             false,
             args.checkpoint_dir.as_deref(),
             "not_enabled_for_sync",
-            resolve_progress_plan(global, args.progress, args.no_progress)?,
+            resolve_progress_plan(
+                global,
+                runtime.unified_profile.as_ref(),
+                args.progress,
+                args.no_progress,
+            )?,
             resolve_list_echo_plan(global, args.list_echo, args.no_list_echo),
             vec![
                 "list_files",
@@ -10186,6 +10790,19 @@ async fn build_plan(
             ],
         ),
         ADriveCommand::Crt(args) => {
+            // [Review Fix #2] Dry-run must reject the same authentication-aware
+            // create combinations as real execution.
+            let oauth_user_id = create_oauth_user_id_if_needed(args, is_oauth, || {
+                OAuthTokenManager::new(
+                    // [Review Fix #3] An explicit credentials override has the
+                    // same path-existence contract in dry-run and real mode.
+                    global.existing_runtime_credentials_path()?,
+                    global.profile.clone(),
+                    ClientOptions::default(),
+                )
+                .and_then(|manager| manager.bound_user_id())
+            })?;
+            prevalidate_create_options(args, is_oauth, oauth_user_id.as_deref())?;
             let target = resolve_create_target(args)?;
             let description = match target {
                 ADriveCreateTarget::Instance { name } => {
@@ -10259,13 +10876,21 @@ async fn build_plan(
                 } else {
                     "none"
                 },
-                resolve_progress_plan(global, args.progress, args.no_progress)?,
+                resolve_progress_plan(
+                    global,
+                    runtime.unified_profile.as_ref(),
+                    args.progress,
+                    args.no_progress,
+                )?,
                 resolve_list_echo_plan(global, args.list_echo, args.no_list_echo),
                 request_plan,
             )
         }
         ADriveCommand::Ls(args) => {
             validate_adrive_ls_max_keys(args.max_keys)?;
+            // [Review Fix #2] Keep dry-run target/owner validation aligned with
+            // the Resource request path selected during real execution.
+            prevalidate_ls_space_listing_kind(is_oauth, args)?;
             (
                 "ve-adrive ls",
                 "List instances, spaces, files, or folders".to_string(),
@@ -10278,7 +10903,9 @@ async fn build_plan(
                 "none",
                 output_not_applicable_plan(),
                 output_not_applicable_plan(),
-                vec!["get_instance/get_space/list_instances/list_spaces/list_files"],
+                vec![
+                    "get_instance/get_space/list_instances/list_spaces/list_my_spaces/list_my_group_spaces/list_files",
+                ],
             )
         }
         ADriveCommand::Stat(_) => (
@@ -10361,7 +10988,12 @@ async fn build_plan(
                 false,
                 None,
                 "none",
-                resolve_progress_plan(global, args.progress, args.no_progress)?,
+                resolve_progress_plan(
+                    global,
+                    runtime.unified_profile.as_ref(),
+                    args.progress,
+                    args.no_progress,
+                )?,
                 output_not_applicable_plan(),
                 vec![
                     "put_file when stdin is below --multipart-threshold",
@@ -10411,7 +11043,16 @@ async fn build_plan(
         ),
     };
 
-    let impact = compute_dry_run_impact(global, auth, command, cmd_name, destructive).await;
+    let impact = compute_dry_run_impact(
+        global,
+        auth,
+        resolved_mode,
+        runtime.unified_client.as_ref(),
+        command,
+        cmd_name,
+        destructive,
+    )
+    .await;
 
     let mut plan = json!({
         "command": cmd_name,
@@ -10464,6 +11105,13 @@ async fn build_plan(
     Ok(plan)
 }
 
+fn dry_run_uses_oauth(mode: AuthMode) -> Result<bool, CliError> {
+    match mode {
+        AuthMode::Aksk | AuthMode::Unified => Ok(false),
+        AuthMode::Oauth => Ok(true),
+    }
+}
+
 fn format_target(target: &ParsedADriveUri) -> String {
     if target.space.is_empty() {
         format!("adrive://{}", target.instance)
@@ -10479,7 +11127,822 @@ fn format_target(target: &ParsedADriveUri) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
     use super::*;
+
+    fn create_args() -> CreateArgs {
+        CreateArgs {
+            path: None,
+            by_name: false,
+            instance: None,
+            space: None,
+            display_name: None,
+            description: None,
+            index_enabled: false,
+            service_type: None,
+            owner_type: None,
+            owner_id: None,
+        }
+    }
+
+    fn ls_args(path: &str, owner_type: Option<OwnerType>) -> LsArgs {
+        LsArgs {
+            path: Some(path.to_string()),
+            by_name: false,
+            instance: None,
+            space: None,
+            folder: None,
+            max_keys: 1000,
+            marker: None,
+            owner_type,
+            human_readable: false,
+            sort: None,
+            columns: None,
+            manifest_path: None,
+        }
+    }
+
+    #[test]
+    fn adrive_download_length_validation_rejects_incomplete_attempt() {
+        let error = validate_adrive_download_length(Path::new("partial.bin"), 10, 7)
+            .expect_err("short response body must fail the attempt");
+
+        assert!(matches!(error, CliError::TransferFailed(_)));
+        assert!(error.to_string().contains("expected=10, actual=7"));
+        assert!(validate_adrive_download_length(Path::new("complete.bin"), 10, 10).is_ok());
+    }
+
+    #[test]
+    fn create_instance_defaults_service_type_by_auth_mode() {
+        let args = create_args();
+
+        let aksk = build_create_instance_input("instance", &args, false).unwrap();
+        let oauth = build_create_instance_input("instance", &args, true).unwrap();
+
+        assert_eq!(aksk.service_type.as_deref(), Some("arkclaw"));
+        assert_eq!(oauth.service_type.as_deref(), Some("paas"));
+    }
+
+    #[test]
+    fn create_instance_rejects_space_owner_options() {
+        let mut args = create_args();
+        args.owner_type = Some(crate::cli::high_level::OwnerType::User);
+
+        let error = build_create_instance_input("instance", &args, false).unwrap_err();
+
+        assert!(error.to_string().contains("--owner-type"));
+    }
+
+    #[test]
+    fn create_space_aksk_omits_unspecified_owner_fields() {
+        let args = create_args();
+
+        let input = build_create_space_input("instance", "space", &args, false, None).unwrap();
+
+        assert_eq!(input.owner_type, None);
+        assert_eq!(input.owner_id, None);
+    }
+
+    #[test]
+    fn create_space_aksk_preserves_explicit_owner_fields() {
+        // [Review Fix #1] Preserve the preexisting AK/SK request body contract.
+        let mut args = create_args();
+        args.owner_type = Some(crate::cli::high_level::OwnerType::Group);
+        args.owner_id = Some("group-1".to_string());
+
+        let input = build_create_space_input("instance", "space", &args, false, None).unwrap();
+
+        assert_eq!(input.owner_type.as_deref(), Some("group"));
+        assert_eq!(input.owner_id.as_deref(), Some("group-1"));
+    }
+
+    #[test]
+    fn oauth_user_metadata_loader_skips_nondefault_targets() {
+        // [Review Fix #2] Keep metadata reads out of paths with no OAuth user default.
+        let mut instance_args = create_args();
+        instance_args.instance = Some("instance".to_string());
+        assert_eq!(
+            assert_oauth_user_loader_skipped(&instance_args, true).unwrap(),
+            None
+        );
+
+        let mut aksk_args = create_args();
+        aksk_args.path = Some("adrive://instance/space".to_string());
+        assert_eq!(
+            assert_oauth_user_loader_skipped(&aksk_args, false).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn oauth_user_metadata_loader_validates_before_loading() {
+        // [Review Fix #2] Preserve option-validation precedence over metadata access.
+        let mut blank_owner_args = create_args();
+        blank_owner_args.path = Some("adrive://instance/space".to_string());
+        blank_owner_args.owner_id = Some("  ".to_string());
+        let error = assert_oauth_user_loader_skipped(&blank_owner_args, true).unwrap_err();
+        assert!(error.to_string().contains("must not be empty"));
+
+        let mut group_args = create_args();
+        group_args.path = Some("adrive://instance/space".to_string());
+        group_args.owner_type = Some(crate::cli::high_level::OwnerType::Group);
+        let error = assert_oauth_user_loader_skipped(&group_args, true).unwrap_err();
+        assert!(error.to_string().contains("group"));
+
+        let mut invalid_space_args = create_args();
+        invalid_space_args.path = Some("adrive://instance/space".to_string());
+        invalid_space_args.service_type = Some(crate::cli::high_level::ServiceType::Paas);
+        let error = assert_oauth_user_loader_skipped(&invalid_space_args, true).unwrap_err();
+        assert!(error.to_string().contains("--service-type"));
+    }
+
+    #[test]
+    fn oauth_user_metadata_loader_runs_once_for_defaulted_user_space() {
+        // [Review Fix #2] Defaulted OAuth users need exactly one local metadata read.
+        let mut default_user_args = create_args();
+        default_user_args.path = Some("adrive://instance/space".to_string());
+        let mut loader_calls = 0;
+        assert_eq!(
+            create_oauth_user_id_if_needed(&default_user_args, true, || {
+                loader_calls += 1;
+                Ok(Some("user-1".to_string()))
+            })
+            .unwrap()
+            .as_deref(),
+            Some("user-1")
+        );
+        assert_eq!(loader_calls, 1);
+    }
+
+    #[test]
+    fn oauth_user_metadata_loader_preserves_login_required_errors() {
+        // [Review Fix #2] A missing OAuth token remains an authentication failure.
+        let mut args = create_args();
+        args.path = Some("adrive://instance/space".to_string());
+
+        let error = create_oauth_user_id_if_needed(&args, true, || {
+            Err(CliError::AuthFailed(
+                "[login_required] environment Access Token is missing; run ve-adrive auth login"
+                    .to_string(),
+            ))
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, CliError::AuthFailed(_)));
+        assert_eq!(
+            error.exit_code(),
+            tos_core::agent::error::ExitCode::AuthFailed
+        );
+        assert!(error.to_string().contains("login_required"));
+    }
+
+    fn assert_oauth_user_loader_skipped(
+        args: &CreateArgs,
+        is_oauth: bool,
+    ) -> Result<Option<String>, CliError> {
+        let mut loader_calls = 0;
+        let result = create_oauth_user_id_if_needed(args, is_oauth, || {
+            loader_calls += 1;
+            panic!("OAuth user metadata must not be loaded")
+        });
+        assert_eq!(loader_calls, 0);
+        result
+    }
+
+    #[test]
+    fn create_space_oauth_defaults_user_owner_from_selected_credentials() {
+        let args = create_args();
+        let input =
+            build_create_space_input("instance", "space", &args, true, Some(" user-1 ")).unwrap();
+
+        assert_eq!(input.owner_type.as_deref(), Some("user"));
+        assert_eq!(input.owner_id.as_deref(), Some("user-1"));
+    }
+
+    #[test]
+    fn create_space_oauth_explicit_user_uses_selected_credentials() {
+        let mut args = create_args();
+        args.owner_type = Some(crate::cli::high_level::OwnerType::User);
+
+        let input =
+            build_create_space_input("instance", "space", &args, true, Some("user-1")).unwrap();
+
+        assert_eq!(input.owner_type.as_deref(), Some("user"));
+        assert_eq!(input.owner_id.as_deref(), Some("user-1"));
+    }
+
+    #[test]
+    fn create_space_oauth_explicit_owner_overrides_selected_credentials() {
+        let mut args = create_args();
+        args.owner_id = Some("explicit-user".to_string());
+
+        let input = build_create_space_input("instance", "space", &args, true, Some("stored-user"))
+            .unwrap();
+
+        assert_eq!(input.owner_type.as_deref(), Some("user"));
+        assert_eq!(input.owner_id.as_deref(), Some("explicit-user"));
+    }
+
+    #[test]
+    fn create_space_oauth_group_requires_explicit_owner_id() {
+        let mut args = create_args();
+        args.owner_type = Some(crate::cli::high_level::OwnerType::Group);
+
+        let error = build_create_space_input("instance", "space", &args, true, Some("stored-user"))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("group"));
+        assert!(error.to_string().contains("--owner-id"));
+    }
+
+    #[test]
+    fn create_space_oauth_group_uses_explicit_owner_and_ignores_selected_credentials() {
+        let mut args = create_args();
+        args.owner_type = Some(crate::cli::high_level::OwnerType::Group);
+        args.owner_id = Some("group-1".to_string());
+
+        let input = build_create_space_input("instance", "space", &args, true, Some("stored-user"))
+            .unwrap();
+
+        assert_eq!(input.owner_type.as_deref(), Some("group"));
+        assert_eq!(input.owner_id.as_deref(), Some("group-1"));
+    }
+
+    #[test]
+    fn create_space_oauth_user_without_owner_source_recommends_id_or_login() {
+        // [Review Fix #2] The remediation must include auth login's required Instance.
+        let args = create_args();
+
+        let error = build_create_space_input("instance", "space", &args, true, None).unwrap_err();
+
+        assert!(error.to_string().contains("--owner-id"));
+        assert!(error
+            .to_string()
+            .contains("ve-adrive auth login --instance <instance_id>"));
+    }
+
+    #[test]
+    fn create_space_rejects_blank_explicit_owner_id() {
+        let mut args = create_args();
+        args.owner_id = Some("  ".to_string());
+
+        let error = build_create_space_input("instance", "space", &args, true, Some("stored-user"))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn create_space_rejects_instance_service_type() {
+        let mut args = create_args();
+        args.service_type = Some(crate::cli::high_level::ServiceType::Paas);
+
+        let error = build_create_space_input("instance", "space", &args, false, None).unwrap_err();
+
+        assert!(error.to_string().contains("--service-type"));
+    }
+
+    #[test]
+    fn create_options_are_prevalidated_without_name_resolution() {
+        let mut args = create_args();
+        args.path = Some("adrive://instance/space".to_string());
+        args.by_name = true;
+        args.service_type = Some(crate::cli::high_level::ServiceType::Paas);
+
+        let error = prevalidate_create_options(&args, false, None).unwrap_err();
+
+        assert!(error.to_string().contains("--service-type"));
+    }
+
+    #[tokio::test]
+    async fn oauth_dry_run_space_create_uses_file_user_id() {
+        let directory = std::env::temp_dir().join(format!(
+            "adrive-oauth-space-owner-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let credentials_path = directory.join("credentials.toml");
+        let mut credentials = tos_core::infra::credentials::CredentialsFile::default();
+        credentials
+            .set_adrive_oauth(
+                "default",
+                tos_core::infra::credentials::StoredOAuthCredentials {
+                    access_token: Some("access".to_string()),
+                    user_id: Some("user-1".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        credentials.save_to_path(&credentials_path).unwrap();
+
+        let mut args = create_args();
+        args.path = Some("adrive://instance/space".to_string());
+        let command = ADriveCommand::Crt(args);
+        let auth = ADriveAuthArgs {
+            auth_mode: Some(crate::domain::auth::AuthMode::Oauth),
+        };
+        let global = GlobalArgs {
+            credentials_path: Some(credentials_path.clone()),
+            ..Default::default()
+        };
+
+        let result = build_plan(&global, &auth, &command).await;
+
+        assert!(result.is_ok());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn oauth_dry_run_group_and_missing_user_fail_without_resource_requests() {
+        let auth = ADriveAuthArgs {
+            auth_mode: Some(crate::domain::auth::AuthMode::Oauth),
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "adrive-oauth-space-owner-missing-user-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut group_args = create_args();
+        group_args.path = Some("adrive://instance/space".to_string());
+        group_args.owner_type = Some(crate::cli::high_level::OwnerType::Group);
+        let unavailable_credentials = GlobalArgs {
+            credentials_path: Some(directory.clone()),
+            ..Default::default()
+        };
+        let group_error = build_plan(
+            &unavailable_credentials,
+            &auth,
+            &ADriveCommand::Crt(group_args),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(group_error.to_string().contains("group"));
+        assert!(group_error.to_string().contains("--owner-id"));
+
+        let credentials_path = directory.join("credentials.toml");
+        let mut credentials = tos_core::infra::credentials::CredentialsFile::default();
+        credentials
+            .set_adrive_oauth(
+                "default",
+                tos_core::infra::credentials::StoredOAuthCredentials {
+                    access_token: Some("access".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        credentials.save_to_path(&credentials_path).unwrap();
+        let mut user_args = create_args();
+        user_args.path = Some("adrive://instance/space".to_string());
+        let global = GlobalArgs {
+            credentials_path: Some(credentials_path),
+            ..Default::default()
+        };
+        let user_error = build_plan(&global, &auth, &ADriveCommand::Crt(user_args))
+            .await
+            .unwrap_err();
+
+        assert!(user_error.to_string().contains("--owner-id"));
+        // [Review Fix #2] Dry-run returns the same executable remediation as real execution.
+        assert!(user_error
+            .to_string()
+            .contains("ve-adrive auth login --instance <instance_id>"));
+        assert!(user_error.to_string().contains("[oauth_user_id_required]"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn oauth_dry_run_explicit_owner_does_not_require_credentials() {
+        let directory = std::env::temp_dir().join(format!(
+            "adrive-oauth-space-owner-explicit-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut args = create_args();
+        args.path = Some("adrive://instance/space".to_string());
+        args.owner_id = Some("user-1".to_string());
+        let command = ADriveCommand::Crt(args);
+        let auth = ADriveAuthArgs {
+            auth_mode: Some(crate::domain::auth::AuthMode::Oauth),
+        };
+        let global = GlobalArgs {
+            credentials_path: Some(directory.clone()),
+            ..Default::default()
+        };
+
+        assert!(build_plan(&global, &auth, &command).await.is_ok());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn injected_missing_oauth_credentials_keep_login_required_priority() {
+        // [Review Fix #4] Inject an empty environment instead of mutating the
+        // process-wide environment while tests may run concurrently.
+        let directory = std::env::temp_dir().join(format!(
+            "adrive-oauth-space-owner-no-credentials-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let credentials_path = directory.join("credentials.toml");
+        tos_core::infra::credentials::CredentialsFile::default()
+            .save_to_path(&credentials_path)
+            .unwrap();
+        let mut args = create_args();
+        args.path = Some("adrive://instance/space".to_string());
+        let manager = OAuthTokenManager::new_with_environment(
+            credentials_path,
+            "default".to_string(),
+            ClientOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let dry_run_error =
+            create_oauth_user_id_if_needed(&args, true, || manager.bound_user_id()).unwrap_err();
+        assert!(matches!(dry_run_error, CliError::AuthFailed(_)));
+        assert_eq!(
+            dry_run_error.exit_code(),
+            tos_core::agent::error::ExitCode::AuthFailed
+        );
+
+        let client = IdsClient::new_oauth(
+            manager,
+            Some("https://resource.example.com".to_string()),
+            Some("test-region".to_string()),
+            ClientOptions::default(),
+        )
+        .unwrap();
+        let real_error = execute_create(&GlobalArgs::default(), &client, &args)
+            .await
+            .unwrap_err();
+        assert!(matches!(real_error, CliError::AuthFailed(_)));
+        assert_eq!(
+            real_error.exit_code(),
+            tos_core::agent::error::ExitCode::AuthFailed
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn explicit_missing_oauth_credentials_path_has_matching_real_and_dry_run_errors() {
+        // [Review Fix #3] Explicit credential overrides must fail consistently before planning.
+        let directory = std::env::temp_dir().join(format!(
+            "adrive-oauth-space-owner-missing-override-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut args = create_args();
+        args.path = Some("adrive://instance/space".to_string());
+        let command = ADriveCommand::Crt(args);
+        let auth = ADriveAuthArgs {
+            auth_mode: Some(crate::domain::auth::AuthMode::Oauth),
+        };
+        let real_global = GlobalArgs {
+            credentials_path: Some(directory.join("missing-credentials.toml")),
+            ..Default::default()
+        };
+        let dry_global = GlobalArgs {
+            dry_run: true,
+            ..real_global.clone()
+        };
+
+        let real_error = handle_high_level_command(&real_global, &auth, &command)
+            .await
+            .unwrap_err();
+        let dry_error = handle_high_level_command(&dry_global, &auth, &command)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(real_error, CliError::ConfigMissing(_)));
+        assert!(matches!(dry_error, CliError::ConfigMissing(_)));
+        assert_eq!(real_error.exit_code(), dry_error.exit_code());
+        let real_guidance = crate::handler::common::adrive_error_guidance(
+            &real_global,
+            auth.auth_mode,
+            &real_error,
+            "ve-adrive crt",
+        );
+        let dry_guidance = crate::handler::common::adrive_error_guidance(
+            &dry_global,
+            auth.auth_mode,
+            &dry_error,
+            "ve-adrive crt",
+        );
+        assert_eq!(real_guidance.fix_command, dry_guidance.fix_command);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn execute_create_by_name_reuses_stored_oauth_user_id_in_create_request() {
+        // [Review Fix #1] Exercise realistic Instance-bound OAuth credentials:
+        // name lookup must resolve to the bound ID before Space creation.
+        let (endpoint, requests, server) = serve_create_space_by_name_responses();
+        let (directory, client) = oauth_by_name_test_client(endpoint);
+        let mut args = create_args();
+        args.path = Some("adrive://instance-name/space-name".to_string());
+        args.by_name = true;
+
+        assert_eq!(
+            execute_create(&GlobalArgs::default(), &client, &args)
+                .await
+                .unwrap(),
+            0
+        );
+        server.join().unwrap();
+        assert_oauth_create_by_name_requests(requests.try_iter().collect());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    fn oauth_by_name_test_client(endpoint: String) -> (PathBuf, IdsClient) {
+        let directory = std::env::temp_dir().join(format!(
+            "adrive-oauth-space-owner-by-name-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let credentials_path = directory.join("credentials.toml");
+        let mut credentials = tos_core::infra::credentials::CredentialsFile::default();
+        credentials
+            .set_adrive_oauth(
+                "default",
+                tos_core::infra::credentials::StoredOAuthCredentials {
+                    access_token: Some("access".to_string()),
+                    instance_id: Some("instance-id".to_string()),
+                    user_id: Some("stored-user".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        credentials.save_to_path(&credentials_path).unwrap();
+        let manager = OAuthTokenManager::new(
+            credentials_path,
+            "default".to_string(),
+            ClientOptions::default(),
+        )
+        .unwrap();
+        let client = IdsClient::new_oauth(
+            manager,
+            Some(endpoint),
+            Some("test-region".to_string()),
+            ClientOptions::default(),
+        )
+        .unwrap();
+        (directory, client)
+    }
+
+    fn assert_oauth_create_by_name_requests(requests: Vec<String>) {
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].starts_with("GET /v1/instances%3AgetByName?name=instance-name HTTP/1.1"),
+            "request={}",
+            requests[0]
+        );
+        assert!(requests[0].contains("authorization: Bearer access"));
+        assert!(requests[1].starts_with("POST /v1/instances/instance-id/spaces HTTP/1.1"));
+        assert!(requests[1].contains("authorization: Bearer access"));
+        let body = requests[1].split("\r\n\r\n").nth(1).unwrap();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["OwnerType"], "user");
+        assert_eq!(body["OwnerId"], "stored-user");
+    }
+
+    #[tokio::test]
+    async fn execute_create_by_name_keeps_aksk_name_resolution() {
+        // [Review Fix #1] The shared name endpoint must preserve AK/SK signing and routing.
+        let (endpoint, requests, server) = serve_create_space_by_name_responses();
+        let client = IdsClient::new(
+            "access-key".to_string(),
+            "secret-key".to_string(),
+            None,
+            Some(endpoint),
+            Some("test-region".to_string()),
+            ClientOptions::default(),
+        )
+        .unwrap();
+        let mut args = create_args();
+        args.path = Some("adrive://instance-name/space-name".to_string());
+        args.by_name = true;
+
+        assert_eq!(
+            execute_create(&GlobalArgs::default(), &client, &args)
+                .await
+                .unwrap(),
+            0
+        );
+        server.join().unwrap();
+        let requests = requests.try_iter().collect::<Vec<_>>();
+
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].starts_with("GET /v1/instances%3AgetByName?name=instance-name HTTP/1.1")
+        );
+        assert!(requests[0].contains("authorization: HMAC-SHA256"));
+        assert!(requests[1].starts_with("POST /v1/instances/instance-id/spaces HTTP/1.1"));
+        assert!(requests[1].contains("authorization: HMAC-SHA256"));
+    }
+
+    fn serve_create_space_by_name_responses(
+    ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            for body in [
+                r#"{"Instance":{"InstanceID":"instance-id","Name":"instance-name"}}"#,
+                r#"{"Space":{"SpaceID":"space-id","Name":"space-name"}}"#,
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                sender.send(read_request(&mut stream)).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        (format!("http://{address}"), receiver, server)
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer).unwrap();
+            assert!(count > 0);
+            bytes.extend_from_slice(&buffer[..count]);
+            let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let content_length = String::from_utf8_lossy(&bytes[..header_end + 4])
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if bytes.len() >= header_end + 4 + content_length {
+                return String::from_utf8_lossy(&bytes).to_string();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_space_listing_reuses_real_owner_validation() {
+        let global = GlobalArgs::default();
+        let aksk_auth = ADriveAuthArgs {
+            auth_mode: Some(crate::domain::auth::AuthMode::Aksk),
+        };
+        let aksk_command = ADriveCommand::Ls(ls_args(
+            "adrive://instance",
+            Some(crate::cli::high_level::OwnerType::User),
+        ));
+        let error = build_plan(&global, &aksk_auth, &aksk_command)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("only in OAuth mode"));
+
+        let oauth_auth = ADriveAuthArgs {
+            auth_mode: Some(crate::domain::auth::AuthMode::Oauth),
+        };
+        let oauth_command = ADriveCommand::Ls(ls_args(
+            "adrive://instance/space",
+            Some(crate::cli::high_level::OwnerType::Group),
+        ));
+        let error = build_plan(&global, &oauth_auth, &oauth_command)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("only when listing Spaces"));
+    }
+
+    #[tokio::test]
+    async fn unified_dry_run_create_uses_aksk_business_semantics() {
+        let global = GlobalArgs::default();
+        let auth = ADriveAuthArgs {
+            auth_mode: Some(crate::domain::auth::AuthMode::Unified),
+        };
+        let mut args = create_args();
+        args.path = Some("adrive://instance".to_string());
+
+        let plan = build_plan(&global, &auth, &ADriveCommand::Crt(args))
+            .await
+            .unwrap();
+
+        assert_eq!(plan["execution_status"], "planned_not_executed");
+        assert_eq!(plan["command"], "ve-adrive crt");
+    }
+
+    #[tokio::test]
+    async fn unified_dry_run_list_uses_all_instance_scope() {
+        let global = GlobalArgs::default();
+        let auth = ADriveAuthArgs {
+            auth_mode: Some(crate::domain::auth::AuthMode::Unified),
+        };
+        let command = ADriveCommand::Ls(ls_args("adrive://instance", None));
+
+        let plan = build_plan(&global, &auth, &command).await.unwrap();
+
+        assert_eq!(plan["execution_status"], "planned_not_executed");
+        assert_eq!(plan["command"], "ve-adrive ls");
+    }
+
+    #[tokio::test]
+    async fn unified_dry_run_stat_no_longer_returns_pending() {
+        let global = GlobalArgs::default();
+        let auth = ADriveAuthArgs {
+            auth_mode: Some(crate::domain::auth::AuthMode::Unified),
+        };
+        let command = ADriveCommand::Stat(stat_args(Some("adrive://instance"), None, None));
+
+        let plan = build_plan(&global, &auth, &command).await.unwrap();
+
+        assert_eq!(plan["execution_status"], "planned_not_executed");
+        assert_eq!(plan["command"], "ve-adrive stat");
+    }
+
+    #[test]
+    fn space_listing_kind_is_selected_by_auth_mode_and_owner_type() {
+        assert_eq!(
+            resolve_space_listing_kind(false, None).unwrap(),
+            SpaceListingKind::All
+        );
+        assert_eq!(
+            resolve_space_listing_kind(true, None).unwrap(),
+            SpaceListingKind::User
+        );
+        assert_eq!(
+            resolve_space_listing_kind(true, Some(crate::cli::high_level::OwnerType::Group),)
+                .unwrap(),
+            SpaceListingKind::Group
+        );
+        assert!(
+            resolve_space_listing_kind(false, Some(crate::cli::high_level::OwnerType::User),)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn space_listing_pagination_uses_the_selected_api_contract() {
+        assert!(!space_page_has_more(SpaceListingKind::All, false, "next"));
+        assert!(space_page_has_more(SpaceListingKind::All, true, "next"));
+        assert!(space_page_has_more(SpaceListingKind::User, false, "next"));
+        assert!(space_page_has_more(SpaceListingKind::Group, false, "next"));
+        assert!(!space_page_has_more(SpaceListingKind::Group, true, ""));
+    }
+
+    #[test]
+    fn oauth_bound_root_listing_selects_single_instance() {
+        assert_eq!(
+            resolve_root_instance_listing(
+                crate::domain::client::InstanceListingScope::Bound("inst-1".to_string()),
+                None,
+            )
+            .unwrap(),
+            RootInstanceListing::Single("inst-1".to_string())
+        );
+    }
+
+    #[test]
+    fn aksk_root_listing_keeps_collection_behavior() {
+        assert_eq!(
+            resolve_root_instance_listing(crate::domain::client::InstanceListingScope::All, None,)
+                .unwrap(),
+            RootInstanceListing::Collection
+        );
+    }
+
+    #[test]
+    fn oauth_unknown_root_binding_fails_before_request() {
+        let error = resolve_root_instance_listing(
+            crate::domain::client::InstanceListingScope::UnknownOAuthBinding,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("oauth_instance_required"));
+    }
+
+    #[test]
+    fn oauth_bound_root_listing_rejects_nonempty_marker() {
+        let error = resolve_root_instance_listing(
+            crate::domain::client::InstanceListingScope::Bound("inst-1".to_string()),
+            Some("next"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("does not support --marker"));
+    }
 
     fn test_file_info(path: &str, file_type: &str) -> FileInfo {
         FileInfo {

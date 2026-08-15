@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::cli::low_level::*;
 use crate::domain::core;
 use crate::handler::common::{
-    build_profile, classify_body_input, output_result, parse_object_target, BodyInput,
+    build_runtime, classify_body_input, output_result, parse_object_target, BodyInput,
 };
 use reqwest::Method;
 use tos_core::agent::describe::{
@@ -56,8 +56,8 @@ pub async fn handle_turbo_command(
         return Ok(0);
     }
 
-    let profile = build_profile(global)?;
-    let client = TosClient::new(&profile, "tos")?;
+    let runtime = build_runtime(global)?;
+    let client = runtime.client(global, "tos")?;
 
     match action {
         TurboAction::Open(args) => handle_open(global, &client, args).await,

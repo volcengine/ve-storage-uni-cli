@@ -169,6 +169,8 @@ pub struct CreateInstanceInput {
     pub description: String,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub meta: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +348,10 @@ pub struct CreateSpaceInput {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "OwnerId")]
+    pub owner_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,6 +402,96 @@ pub struct ListSpacesOutput {
     pub next_marker: String,
     #[serde(default)]
     pub is_truncated: bool,
+}
+
+/// Pagination request for Spaces owned by the current OAuth user.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ListMySpacesInput {
+    #[serde(skip_serializing)]
+    pub instance_id: String,
+    #[serde(skip_serializing)]
+    pub limit: Option<i32>,
+    #[serde(skip_serializing)]
+    pub marker: Option<String>,
+}
+
+impl ListMySpacesInput {
+    /// Create a request scoped to one Instance.
+    pub fn new(instance_id: impl Into<String>) -> Self {
+        Self {
+            instance_id: instance_id.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Limit the number of Spaces returned by one request.
+    pub fn with_limit(mut self, limit: i32) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Convert pagination fields to IDS query parameters.
+    pub fn to_query_pairs(&self) -> Vec<(String, String)> {
+        pagination_query(self.limit, self.marker.as_deref())
+    }
+}
+
+/// IDS response containing Spaces owned by the current OAuth user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ListMySpacesOutput {
+    #[serde(skip)]
+    pub response_info: ResponseInfo,
+    #[serde(default)]
+    pub spaces: Vec<SpaceInfo>,
+    #[serde(default)]
+    pub next_marker: String,
+}
+
+/// Pagination request for Spaces owned by the current OAuth user's group.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ListMyGroupSpacesInput {
+    #[serde(skip_serializing)]
+    pub instance_id: String,
+    #[serde(skip_serializing)]
+    pub limit: Option<i32>,
+    #[serde(skip_serializing)]
+    pub marker: Option<String>,
+}
+
+impl ListMyGroupSpacesInput {
+    /// Create a request scoped to one Instance.
+    pub fn new(instance_id: impl Into<String>) -> Self {
+        Self {
+            instance_id: instance_id.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Limit the number of Spaces returned by one request.
+    pub fn with_limit(mut self, limit: i32) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Convert pagination fields to IDS query parameters.
+    pub fn to_query_pairs(&self) -> Vec<(String, String)> {
+        pagination_query(self.limit, self.marker.as_deref())
+    }
+}
+
+/// IDS response containing Spaces owned by the current OAuth user's group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ListMyGroupSpacesOutput {
+    #[serde(skip)]
+    pub response_info: ResponseInfo,
+    #[serde(default)]
+    pub spaces: Vec<SpaceInfo>,
+    #[serde(default)]
+    pub root_space: Option<SpaceInfo>,
+    #[serde(default)]
+    pub next_marker: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1292,6 +1388,46 @@ mod tests {
                 ("instanceName".to_string(), "inst-name".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn create_instance_serializes_service_type_with_sdk_field_name() {
+        let payload = serde_json::to_value(CreateInstanceInput {
+            name: "instance".to_string(),
+            service_type: Some("paas".to_string()),
+            ..Default::default()
+        })
+        .expect("serialize create instance input");
+
+        assert_eq!(payload["ServiceType"], "paas");
+    }
+
+    #[test]
+    fn create_space_serializes_lowercase_owner_fields_with_sdk_names() {
+        let payload = serde_json::to_value(CreateSpaceInput {
+            instance_id: "instance".to_string(),
+            space_name: "space".to_string(),
+            owner_type: Some("group".to_string()),
+            owner_id: Some("owner".to_string()),
+            ..Default::default()
+        })
+        .expect("serialize create space input");
+
+        assert_eq!(payload["OwnerType"], "group");
+        assert_eq!(payload["OwnerId"], "owner");
+    }
+
+    #[test]
+    fn omitted_create_space_owner_fields_are_not_serialized() {
+        let payload = serde_json::to_value(CreateSpaceInput {
+            instance_id: "instance".to_string(),
+            space_name: "space".to_string(),
+            ..Default::default()
+        })
+        .expect("serialize create space input");
+
+        assert!(payload.get("OwnerType").is_none());
+        assert!(payload.get("OwnerId").is_none());
     }
 
     #[tokio::test]

@@ -14,12 +14,15 @@
  * limitations under the License.
  */
 
+pub mod auth;
 pub mod high_level;
 pub mod low_level;
 pub mod meta;
 
 use clap::Subcommand;
 use tos_core::agent::global_args::GROUPED_HELP_GLOBAL_OPTIONS;
+
+pub use auth::VeTosAuthArgs;
 
 #[derive(Debug, Subcommand)]
 pub enum TosCommand {
@@ -169,6 +172,11 @@ pub enum TosCommand {
     /// Generate shell completion
     Completion(meta::CompletionArgs),
     /// Start MCP server
+    ///
+    /// SSE is same-host only. After binding, it prints a fresh Bearer token once to stderr.
+    /// Every HTTP request must send it in the Authorization header. The Host header must be
+    /// exact loopback plus the configured port. Native clients may omit the Origin header;
+    /// when present, the Origin header must be the matching HTTP loopback origin and port.
     Serve(meta::ServeArgs),
     /// Manage/export skill metadata
     Skill(meta::SkillCommand),

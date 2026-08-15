@@ -16,9 +16,11 @@
 
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
+    net::TcpListener,
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
+    thread::{self, JoinHandle},
 };
 
 fn isolated_home(test_name: &str) -> PathBuf {
@@ -40,6 +42,542 @@ fn cli_with_empty_home(test_name: &str, args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .expect("Failed to execute")
+}
+
+fn successful_cli_stdout(args: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
+        .args(args)
+        .output()
+        .expect("execute CLI");
+    assert!(
+        output.status.success(),
+        "args={args:?}, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("CLI stdout must be UTF-8")
+}
+
+fn successful_cli_json(args: &[&str]) -> serde_json::Value {
+    let stdout = successful_cli_stdout(args);
+    serde_json::from_str(&stdout).expect("CLI stdout must be JSON")
+}
+
+fn assert_contains_all(rendered: &str, expected_values: &[&str], context: &str) {
+    for expected in expected_values {
+        assert!(
+            rendered.contains(expected),
+            "{context} missing {expected}: {rendered}"
+        );
+    }
+}
+
+fn describe_machine_projection(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| {
+                    let projected = if is_describe_human_field(key) {
+                        project_human_shape(value)
+                    } else {
+                        describe_machine_projection(value)
+                    };
+                    (key.clone(), projected)
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(describe_machine_projection).collect())
+        }
+        scalar => scalar.clone(),
+    }
+}
+
+fn project_human_shape(value: &serde_json::Value) -> serde_json::Value {
+    // [Review Fix #GlobalZh11] Erase prose while retaining its container shape,
+    // so localization cannot silently change array/object structure.
+    match value {
+        serde_json::Value::String(_) => serde_json::json!("<human-prose>"),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(project_human_shape).collect())
+        }
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(key, child)| (key.clone(), project_human_shape(child)))
+                .collect(),
+        ),
+        scalar => scalar.clone(),
+    }
+}
+
+fn is_describe_human_field(key: &str) -> bool {
+    matches!(key, "description" | "body_contract" | "consistency_guards")
+}
+
+fn assert_selected_human_fields_are_chinese(value: &serde_json::Value, path: &str) {
+    let serde_json::Value::Object(fields) = value else {
+        if let serde_json::Value::Array(items) = value {
+            for (index, item) in items.iter().enumerate() {
+                assert_selected_human_fields_are_chinese(item, &format!("{path}[{index}]"));
+            }
+        }
+        return;
+    };
+    for (key, child) in fields {
+        if is_describe_human_field(key) {
+            assert_human_value_is_chinese(child, &format!("{path}.{key}"));
+        } else {
+            assert_selected_human_fields_are_chinese(child, &format!("{path}.{key}"));
+        }
+    }
+}
+
+fn assert_human_value_is_chinese(value: &serde_json::Value, path: &str) {
+    match value {
+        serde_json::Value::String(text) if !text.is_empty() => assert!(
+            text.chars()
+                .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character)),
+            "human prose remains non-Chinese at {path}: {text}"
+        ),
+        serde_json::Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                assert_human_value_is_chinese(item, &format!("{path}[{index}]"));
+            }
+        }
+        serde_json::Value::Null => {}
+        _ => panic!("unexpected human prose shape at {path}: {value}"),
+    }
+}
+
+fn assert_describe_machine_payload_matches(
+    localized: &serde_json::Value,
+    canonical: &serde_json::Value,
+) {
+    // [Review Fix #GlobalZh1] This test-owned prose contract is deliberately
+    // independent from every production localizer, preventing self-auditing.
+    assert_eq!(
+        describe_machine_projection(&localized["data"]),
+        describe_machine_projection(&canonical["data"])
+    );
+}
+
+fn adrive_auth_describe(language: &str) -> serde_json::Value {
+    successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-adrive",
+        "auth",
+        "--describe",
+        "--language",
+        language,
+    ])
+}
+
+fn ve_tos_config_set_describe(language: &str) -> serde_json::Value {
+    successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-tos",
+        "config",
+        "set",
+        "--describe",
+        "--language",
+        language,
+    ])
+}
+
+fn export_skill_markdown(surface: &str, skill_name: &str, domain: &str, test_name: &str) -> String {
+    let export_dir = isolated_home(test_name).join("skills");
+    let export_path = export_dir.to_string_lossy().to_string();
+    let output = successful_cli_json(&[
+        "--output",
+        "json",
+        surface,
+        "skill",
+        "export",
+        "--name",
+        skill_name,
+        "--dir",
+        &export_path,
+        "--language",
+        "zh",
+    ]);
+    assert_eq!(output["data"]["language"], "zh");
+    let markdown = fs::read_to_string(export_dir.join(domain).join(skill_name).join("SKILL.md"))
+        .expect("read exported Chinese Skill");
+    fs::remove_dir_all(&export_dir).expect("remove exported Chinese Skill");
+    markdown
+}
+
+struct MockHttpResponse {
+    request_id_headers: &'static str,
+    body: &'static str,
+}
+
+fn serve_cli_responses(responses: Vec<MockHttpResponse>) -> (String, JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind CLI mock server");
+    let endpoint = format!("http://{}", listener.local_addr().expect("mock address"));
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for response in responses {
+            let (mut stream, _) = listener.accept().expect("accept CLI request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).expect("read CLI request");
+                assert!(count > 0, "request ended before headers");
+                request.extend_from_slice(&buffer[..count]);
+            }
+            requests.push(String::from_utf8_lossy(&request).to_string());
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.request_id_headers,
+                response.body.len(),
+                response.body
+            )
+            .expect("write CLI response");
+        }
+        requests
+    });
+    (endpoint, server)
+}
+
+#[test]
+fn test_tos_ls_uses_last_service_request_id_and_emits_trace() {
+    let (endpoint, server) = serve_cli_responses(vec![
+        MockHttpResponse {
+            request_id_headers: "x-tos-request-id: tos-page-1\r\n",
+            body: r#"{"Contents":[{"Key":"a.txt","Size":1}],"CommonPrefixes":[],"IsTruncated":true,"NextContinuationToken":"page-2"}"#,
+        },
+        MockHttpResponse {
+            request_id_headers: "x-tos-request-id: tos-page-2\r\n",
+            body: r#"{"Contents":[{"Key":"b.txt","Size":2}],"CommonPrefixes":[],"IsTruncated":false}"#,
+        },
+    ]);
+    let home = isolated_home("tos-ls-service-request-id");
+    let output = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
+        .env("HOME", home)
+        .env("BYTE_TOS_ACCESS_KEY", "test-ak")
+        .env("BYTE_TOS_SECRET_KEY", "test-sk")
+        .env_remove("TOS_CONFIG_PATH")
+        .env_remove("TOS_CREDENTIALS_PATH")
+        .args([
+            "--output",
+            "json",
+            "--quiet",
+            "--endpoint",
+            &endpoint,
+            "--region",
+            "test-region",
+            "tos",
+            "ls",
+            "tos://bucket/",
+            "--max-keys",
+            "10",
+        ])
+        .output()
+        .expect("execute tos ls");
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON output");
+    assert_eq!(envelope["request_id"], "tos-page-2");
+    assert_eq!(
+        envelope["data"]["service_request_ids"],
+        serde_json::json!(["tos-page-1", "tos-page-2"])
+    );
+    assert_eq!(envelope["data"]["service_request_ids_omitted"], 0);
+    assert_eq!(server.join().expect("mock server").len(), 2);
+}
+
+#[test]
+fn test_tos_success_rejects_oversized_service_request_id() {
+    let oversized_headers: &'static str =
+        Box::leak(format!("x-tos-request-id: {}\r\n", "x".repeat(257)).into_boxed_str());
+    let (endpoint, server) = serve_cli_responses(vec![MockHttpResponse {
+        request_id_headers: oversized_headers,
+        body: r#"{"Contents":[],"CommonPrefixes":[],"IsTruncated":false}"#,
+    }]);
+    let output = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
+        .env("HOME", isolated_home("tos-unsafe-service-request-id"))
+        .env("BYTE_TOS_ACCESS_KEY", "test-ak")
+        .env("BYTE_TOS_SECRET_KEY", "test-sk")
+        .env_remove("TOS_CONFIG_PATH")
+        .env_remove("TOS_CREDENTIALS_PATH")
+        .args([
+            "--output",
+            "json",
+            "--quiet",
+            "--endpoint",
+            &endpoint,
+            "--region",
+            "test-region",
+            "tos",
+            "ls",
+            "tos://bucket/",
+        ])
+        .output()
+        .expect("execute tos ls");
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON output");
+    let request_id = envelope["request_id"].as_str().expect("request id");
+    assert_eq!(request_id.len(), 26);
+    assert_ne!(request_id, "x".repeat(257));
+    assert_eq!(server.join().expect("mock server").len(), 1);
+}
+
+#[test]
+fn test_ve_tos_remote_dry_run_keeps_local_request_id() {
+    let (endpoint, server) = serve_cli_responses(vec![MockHttpResponse {
+        request_id_headers: "x-tos-request-id: preview-request-id\r\n",
+        body: r#"{"Contents":[],"CommonPrefixes":[],"IsTruncated":false}"#,
+    }]);
+    let output = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
+        .env("HOME", isolated_home("ve-tos-remote-dry-run-request-id"))
+        .env("TOS_ACCESS_KEY", "test-ak")
+        .env("TOS_SECRET_KEY", "test-sk")
+        .env_remove("TOS_CONFIG_PATH")
+        .env_remove("TOS_CREDENTIALS_PATH")
+        .args([
+            "--dry-run",
+            "--output",
+            "json",
+            "--quiet",
+            "--endpoint",
+            &endpoint,
+            "--region",
+            "test-region",
+            "ve-tos",
+            "rm",
+            "tos://bucket/prefix/",
+            "--recursive",
+        ])
+        .output()
+        .expect("execute ve-tos rm dry-run");
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON output");
+    let request_id = envelope["request_id"].as_str().expect("request id");
+    assert_eq!(request_id.len(), 26);
+    assert_ne!(request_id, "preview-request-id");
+    assert!(envelope["data"].get("service_request_ids").is_none());
+    assert_eq!(server.join().expect("mock server").len(), 1);
+}
+
+fn run_adrive_ls_request_id_case(
+    test_name: &str,
+    target_args: &[&str],
+    response_body: &'static str,
+) -> serde_json::Value {
+    let (endpoint, server) = serve_cli_responses(vec![MockHttpResponse {
+        request_id_headers:
+            "x-request-id: generic-request-id\r\nx-ids-request-id: ids-request-id\r\n",
+        body: response_body,
+    }]);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"));
+    command
+        .env("HOME", isolated_home(test_name))
+        .env("ADRIVE_AUTH_MODE", "aksk")
+        .env("ADRIVE_ACCESS_KEY", "test-ak")
+        .env("ADRIVE_SECRET_KEY", "test-sk")
+        .env_remove("TOS_CONFIG_PATH")
+        .env_remove("TOS_CREDENTIALS_PATH")
+        .args([
+            "--output",
+            "json",
+            "--quiet",
+            "--endpoint",
+            &endpoint,
+            "--region",
+            "test-region",
+            "ve-adrive",
+            "ls",
+        ])
+        .args(target_args);
+    let output = command.output().expect("execute ve-adrive ls");
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON output");
+    assert_eq!(server.join().expect("mock server").len(), 1);
+    envelope
+}
+
+#[test]
+fn test_adrive_ls_all_scopes_prefer_ids_service_header_at_top_level() {
+    let cases = [
+        (
+            "instances",
+            Vec::new(),
+            r#"{"Instances":[],"NextMarker":"","IsTruncated":false}"#,
+        ),
+        (
+            "spaces",
+            vec!["adrive://inst"],
+            r#"{"Spaces":[],"NextMarker":"","IsTruncated":false}"#,
+        ),
+        (
+            "files",
+            vec!["adrive://inst/space"],
+            r#"{"Files":[],"Folders":[],"NextMarker":"","IsTruncated":false}"#,
+        ),
+    ];
+    for (scope, target_args, response_body) in cases {
+        let envelope = run_adrive_ls_request_id_case(scope, &target_args, response_body);
+        assert_eq!(envelope["request_id"], "ids-request-id");
+        assert_eq!(envelope["data"]["scope"], scope);
+        assert_eq!(envelope["data"]["request_id"], "ids-request-id");
+        assert!(envelope["data"].get("service_request_ids").is_none());
+    }
+}
+
+#[test]
+fn test_adrive_malformed_success_body_keeps_response_request_id_on_error() {
+    let (endpoint, server) = serve_cli_responses(vec![MockHttpResponse {
+        request_id_headers: "x-ids-request-id: malformed-body-request-id\r\n",
+        body: "not-json",
+    }]);
+    let output = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
+        .env("HOME", isolated_home("adrive-malformed-body-request-id"))
+        .env("ADRIVE_AUTH_MODE", "aksk")
+        .env("ADRIVE_ACCESS_KEY", "test-ak")
+        .env("ADRIVE_SECRET_KEY", "test-sk")
+        .env("ADRIVE_MAX_RETRY_COUNT", "0")
+        .env_remove("TOS_CONFIG_PATH")
+        .env_remove("TOS_CREDENTIALS_PATH")
+        .args([
+            "--output",
+            "json",
+            "--quiet",
+            "--endpoint",
+            &endpoint,
+            "--region",
+            "test-region",
+            "ve-adrive",
+            "ls",
+        ])
+        .output()
+        .expect("execute ve-adrive ls");
+
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stderr).expect("JSON error");
+    assert_eq!(envelope["request_id"], "malformed-body-request-id");
+    assert_eq!(server.join().expect("mock server").len(), 1);
+}
+
+fn assert_sse_security_contract(output: &std::process::Output, port: u16) -> serde_json::Value {
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("Authorization: Bearer "));
+    assert!(!stderr.contains("Authorization: Bearer "));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid serve json");
+    assert_eq!(parsed["data"]["authentication"], "ephemeral_bearer");
+    assert_eq!(parsed["data"]["token_output"], "stderr_once_after_bind");
+    assert_eq!(parsed["data"]["authorization_header_required"], true);
+    assert_eq!(
+        parsed["data"]["allowed_hosts"],
+        serde_json::json!([format!("127.0.0.1:{port}"), format!("localhost:{port}")])
+    );
+    assert_eq!(
+        parsed["data"]["origin_policy"],
+        "missing_or_exact_http_loopback_origin_same_port"
+    );
+    parsed
+}
+
+fn adrive_dry_run_with_home(home: &PathBuf, args: &[&str]) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"));
+    command.env("HOME", home);
+    for key in [
+        "TOS_CONFIG_PATH",
+        "TOS_CREDENTIALS_PATH",
+        "TOS_ACCESS_KEY",
+        "TOS_SECRET_KEY",
+        "TOS_SECURITY_TOKEN",
+        "BYTE_TOS_ACCESS_KEY",
+        "BYTE_TOS_SECRET_KEY",
+        "BYTE_TOS_SECURITY_TOKEN",
+        "ADRIVE_ACCESS_KEY",
+        "ADRIVE_SECRET_KEY",
+        "ADRIVE_SECURITY_TOKEN",
+        "ADRIVE_ACCESS_TOKEN",
+        "ADRIVE_REFRESH_TOKEN",
+        "ADRIVE_AUTH_MODE",
+        "ADRIVE_PROFILE",
+        "TOS_PROFILE",
+    ] {
+        command.env_remove(key);
+    }
+    command
+        .args(["--dry-run", "--output", "json", "ve-adrive"])
+        .args(args)
+        .output()
+        .expect("execute ve-adrive skill example")
+}
+
+fn write_adrive_skill_oauth_credentials(home: &PathBuf) {
+    let config_dir = home.join(".tos");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("credentials.toml"),
+        "schema_version = 1\n[default.adrive.oauth]\naccess_token = \"skill-access\"\ninstance_id = \"instance-id\"\nuser_id = \"skill-user\"\n",
+    )
+    .unwrap();
+}
+
+fn oauth_skill_examples() -> Vec<Vec<&'static str>> {
+    [
+        "--auth-mode oauth auth login --instance instance-id --auth-endpoint https://auth.example.com",
+        "--auth-mode aksk crt adrive://inst-name",
+        "--auth-mode oauth crt adrive://inst-name --service-type paas",
+        "--auth-mode oauth crt adrive://instance-id/personal --owner-type user",
+        "--auth-mode oauth crt adrive://instance-id/team --owner-type group --owner-id group-id",
+        "--auth-mode oauth ls adrive://instance-id",
+        "--auth-mode oauth ls adrive://instance-id --owner-type group",
+    ]
+    .into_iter()
+    .map(|example| example.split_whitespace().collect())
+    .collect()
+}
+
+#[test]
+fn test_adrive_skill_oauth_examples_parse_and_dry_run_without_network() {
+    // [Review Fix #2] Keep every OAuth ownership example synchronized with clap.
+    let home = isolated_home("adrive-skill-oauth-examples");
+    write_adrive_skill_oauth_credentials(&home);
+
+    for args in oauth_skill_examples() {
+        let output = adrive_dry_run_with_home(&home, &args);
+        assert!(
+            output.status.success(),
+            "args={args:?}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    }
 }
 
 fn assert_parameter_schema_contract(parameters: &[serde_json::Value], context: &str) {
@@ -701,6 +1239,52 @@ fn test_byted_tos_high_level_dry_run_uses_tos_command_names() {
 }
 
 #[test]
+fn test_byted_tos_recursive_cp_persists_public_command_and_operation() {
+    let home = isolated_home("tos-recursive-cp-report-command");
+    let source = home.join("source");
+    let destination = home.join("destination");
+    let report_path = home.join("report.csv");
+    let manifest_path = home.join("manifest.csv");
+    fs::create_dir_all(&source).expect("create source directory");
+    fs::write(source.join("file.txt"), "content").expect("write source file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
+        .env("HOME", &home)
+        .args(["--output", "json", "tos", "cp"])
+        .arg(&source)
+        .arg(&destination)
+        .args(["--recursive", "--no-progress", "--report-path"])
+        .arg(&report_path)
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .output()
+        .expect("run recursive tos cp");
+
+    assert!(
+        output.status.success(),
+        "stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = fs::read_to_string(&report_path).expect("read report");
+    let manifest = fs::read_to_string(&manifest_path).expect("read manifest");
+    assert!(
+        report
+            .lines()
+            .nth(1)
+            .is_some_and(|row| row.starts_with("tos cp,local-copy,")),
+        "report={report}"
+    );
+    assert!(
+        manifest
+            .lines()
+            .nth(1)
+            .is_some_and(|row| row.starts_with("tos cp,local-copy,")),
+        "manifest={manifest}"
+    );
+}
+
+#[test]
 fn test_byted_tos_config_set_uses_tos_command_name() {
     let output = cli_with_empty_home(
         "tos-config-set-public-command",
@@ -990,37 +1574,24 @@ fn test_byted_tos_rejects_unsupported_recursive_modes_before_network() {
     assert!(!dry_run_stdout.contains("direct recursion"));
 }
 
-#[test]
-fn test_byted_tos_serve_and_skill_schema_are_registry_backed() {
-    let serve = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args(["--dry-run", "--output", "json", "tos", "serve", "--mcp"])
-        .output()
-        .expect("Failed to execute");
-    assert!(
-        serve.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&serve.stderr)
-    );
-    let serve_json: serde_json::Value =
-        serde_json::from_slice(&serve.stdout).expect("valid serve dry-run json");
+fn assert_tos_serve_registry_metadata() {
+    let serve_json =
+        successful_cli_json(&["--dry-run", "--output", "json", "tos", "serve", "--mcp"]);
     assert_eq!(serve_json["data"]["status"], "planned_not_started");
     assert_eq!(serve_json["data"]["mode"], "mcp");
+    assert_eq!(serve_json["data"]["authentication"], "process_stdio");
+    assert_eq!(serve_json["data"]["token_output"], serde_json::Value::Null);
+    assert_eq!(serve_json["data"]["authorization_header_required"], false);
+    assert_eq!(serve_json["data"]["allowed_hosts"], serde_json::json!([]));
+    assert_eq!(serve_json["data"]["origin_policy"], serde_json::Value::Null);
     assert!(serve_json["data"]["call_semantics"]
         .as_str()
         .unwrap_or_default()
         .contains("execute=true"));
+}
 
-    let skill = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args(["--output", "json", "tos", "skill", "list"])
-        .output()
-        .expect("Failed to execute");
-    assert!(
-        skill.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&skill.stderr)
-    );
-    let skill_json: serde_json::Value =
-        serde_json::from_slice(&skill.stdout).expect("valid skill list json");
+fn assert_tos_skill_registry_metadata() {
+    let skill_json = successful_cli_json(&["--output", "json", "tos", "skill", "list"]);
     let skills = skill_json["data"]["skills"].as_array().expect("skills");
     let cp_skill = skills
         .iter()
@@ -1028,55 +1599,34 @@ fn test_byted_tos_serve_and_skill_schema_are_registry_backed() {
         .expect("tos_cp skill");
     assert!(cp_skill["input_schema"]["properties"]["source"].is_object());
     assert!(cp_skill["input_schema"]["properties"]["destination"].is_object());
-
-    let zh_skill = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args([
-            "--output",
-            "json",
-            "tos",
-            "skill",
-            "list",
-            "--language",
-            "zh",
-        ])
-        .output()
-        .expect("Failed to execute");
-    assert!(
-        zh_skill.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&zh_skill.stderr)
-    );
-    let zh_skill_json: serde_json::Value =
-        serde_json::from_slice(&zh_skill.stdout).expect("valid zh skill list json");
+    let zh_skill_json = successful_cli_json(&[
+        "--output",
+        "json",
+        "tos",
+        "skill",
+        "list",
+        "--language",
+        "zh",
+    ]);
     assert_eq!(zh_skill_json["data"]["language"], "zh");
-    assert!(zh_skill_json["data"]["skills"]
-        .to_string()
-        .contains("原始英文说明"));
+    let zh_skills = zh_skill_json["data"]["skills"].to_string();
+    assert!(zh_skills.contains("列出 Bucket 内的对象前缀或对象"));
+    assert!(!zh_skills.contains("原始英文说明"));
+}
 
-    let export_dir = isolated_home("tos-skill-export-md").join("skills");
-    let export_dir_arg = export_dir.to_string_lossy().to_string();
-    let dry_run = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args([
-            "--dry-run",
-            "--output",
-            "json",
-            "tos",
-            "skill",
-            "export",
-            "--name",
-            "tos_ls",
-            "--dir",
-            &export_dir_arg,
-        ])
-        .output()
-        .expect("Failed to execute");
-    assert!(
-        dry_run.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&dry_run.stderr)
-    );
-    let dry_run_json: serde_json::Value =
-        serde_json::from_slice(&dry_run.stdout).expect("valid skill export dry-run json");
+fn assert_tos_skill_export_dry_run(export_dir_arg: &str) {
+    let dry_run_json = successful_cli_json(&[
+        "--dry-run",
+        "--output",
+        "json",
+        "tos",
+        "skill",
+        "export",
+        "--name",
+        "tos_ls",
+        "--dir",
+        export_dir_arg,
+    ]);
     assert_eq!(dry_run_json["data"]["format"], "markdown_skill");
     let dry_run_paths = dry_run_json["data"]["paths"].as_array().expect("paths");
     assert!(dry_run_paths
@@ -1086,26 +1636,20 @@ fn test_byted_tos_serve_and_skill_schema_are_registry_backed() {
         .as_str()
         .unwrap_or_default()
         .ends_with("tos-transfer/tos_ls/SKILL.md")));
+}
 
-    let export = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args([
-            "--output",
-            "json",
-            "tos",
-            "skill",
-            "export",
-            "--name",
-            "tos_ls",
-            "--dir",
-            &export_dir_arg,
-        ])
-        .output()
-        .expect("Failed to execute");
-    assert!(
-        export.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&export.stderr)
-    );
+fn assert_english_tos_skill_export(export_dir: &std::path::Path, export_dir_arg: &str) {
+    successful_cli_json(&[
+        "--output",
+        "json",
+        "tos",
+        "skill",
+        "export",
+        "--name",
+        "tos_ls",
+        "--dir",
+        export_dir_arg,
+    ]);
     assert!(export_dir.join("SKILL.md").exists());
     let skill_path = export_dir
         .join("tos-transfer")
@@ -1118,32 +1662,24 @@ fn test_byted_tos_serve_and_skill_schema_are_registry_backed() {
         "markdown={markdown}"
     );
     assert!(markdown.contains("```json"), "markdown={markdown}");
+}
 
+fn assert_chinese_tos_skill_export() {
     let zh_export_dir = isolated_home("tos-skill-export-md-zh").join("skills");
     let zh_export_dir_arg = zh_export_dir.to_string_lossy().to_string();
-    let zh_export = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
-        .args([
-            "--output",
-            "json",
-            "tos",
-            "skill",
-            "export",
-            "--name",
-            "tos_ls",
-            "--dir",
-            &zh_export_dir_arg,
-            "--language",
-            "zh",
-        ])
-        .output()
-        .expect("Failed to execute");
-    assert!(
-        zh_export.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&zh_export.stderr)
-    );
-    let zh_export_json: serde_json::Value =
-        serde_json::from_slice(&zh_export.stdout).expect("valid zh skill export json");
+    let zh_export_json = successful_cli_json(&[
+        "--output",
+        "json",
+        "tos",
+        "skill",
+        "export",
+        "--name",
+        "tos_ls",
+        "--dir",
+        &zh_export_dir_arg,
+        "--language",
+        "zh",
+    ]);
     assert_eq!(zh_export_json["data"]["language"], "zh");
     let zh_markdown = fs::read_to_string(
         zh_export_dir
@@ -1154,7 +1690,49 @@ fn test_byted_tos_serve_and_skill_schema_are_registry_backed() {
     .expect("read zh exported skill");
     assert!(zh_markdown.contains("## 说明"), "markdown={zh_markdown}");
     assert!(zh_markdown.contains("执行建议"), "markdown={zh_markdown}");
-    assert!(zh_markdown.contains("参数说明"), "markdown={zh_markdown}");
+    assert!(
+        zh_markdown.contains("可选的 tos://bucket/key 或 tos://bucket/prefix 目标"),
+        "markdown={zh_markdown}"
+    );
+    assert!(
+        !zh_markdown.contains("参数说明："),
+        "markdown={zh_markdown}"
+    );
+}
+
+// [Review Fix #TosZh5] Split the legacy end-to-end regression so each helper
+// verifies one behavior and stays within the repository function-size limit.
+#[test]
+fn test_byted_tos_serve_and_skill_schema_are_registry_backed() {
+    assert_tos_serve_registry_metadata();
+    assert_tos_skill_registry_metadata();
+    let export_dir = isolated_home("tos-skill-export-md").join("skills");
+    let export_dir_arg = export_dir.to_string_lossy().to_string();
+    assert_tos_skill_export_dry_run(&export_dir_arg);
+    assert_english_tos_skill_export(&export_dir, &export_dir_arg);
+    assert_chinese_tos_skill_export();
+}
+
+#[test]
+fn test_byted_tos_serve_sse_describes_http_security_contract() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
+        .args([
+            "--output",
+            "json",
+            "--describe",
+            "tos",
+            "serve",
+            "--mcp",
+            "--transport",
+            "sse",
+            "--port",
+            "19092",
+        ])
+        .output()
+        .expect("Failed to execute");
+
+    let parsed = assert_sse_security_contract(&output, 19092);
+    assert_eq!(parsed["data"]["bind"], "127.0.0.1:19092");
 }
 
 #[test]
@@ -1328,6 +1906,119 @@ fn test_chinese_root_help_translates_command_descriptions() {
         adrive_stdout.contains("发现 CLI 能力"),
         "stdout={adrive_stdout}"
     );
+}
+
+#[test]
+fn test_chinese_unified_root_help_has_no_aligned_english_descriptions() {
+    let chinese = successful_cli_stdout(&["--help", "--language", "zh"]);
+    assert_contains_all(
+        &chinese,
+        &[
+            "ByteCloud TOS 高阶对象存储命令",
+            "火山引擎 TOS 高阶、低阶与工具命令",
+            "ADrive 文件管理与工具命令",
+        ],
+        "unified root Chinese help",
+    );
+    for source in [
+        "ByteCloud TOS Object Storage",
+        "TOS Object Storage",
+        "A-Drive\n",
+    ] {
+        assert!(!chinese.contains(source), "source={source:?}: {chinese}");
+    }
+
+    let english = successful_cli_stdout(&["--help"]);
+    assert_contains_all(
+        &english,
+        &[
+            "ByteCloud TOS Object Storage",
+            "TOS Object Storage",
+            "A-Drive",
+        ],
+        "unified root English help",
+    );
+}
+
+const COMMON_GROUPED_HELP_ENGLISH: &[&str] = &[
+    "Agent-Native",
+    "Move files or folders",
+    "execution is unimplemented",
+    "Manage ADrive CLI configuration",
+    "scripts and installation snippets",
+    "Start registry-backed MCP server",
+    "external Agents and adapters",
+];
+
+fn assert_chinese_grouped_help(surface: &str, expected: &[&str], forbidden: &[&str]) {
+    let help = successful_cli_stdout(&[surface, "--help", "--language", "zh"]);
+    assert_contains_all(&help, expected, surface);
+    for source in forbidden.iter().chain(COMMON_GROUPED_HELP_ENGLISH) {
+        assert!(
+            !help.contains(source),
+            "surface={surface}, source={source:?}: {help}"
+        );
+    }
+}
+
+#[test]
+fn test_chinese_grouped_help_has_no_known_english_prose() {
+    assert_chinese_grouped_help(
+        "ve-adrive",
+        &[
+            "ADrive CLI - 面向 Agent",
+            "通过同空间重命名，或复制后删除源文件/文件夹来移动",
+            "删除文件、文件夹，或递归清空空间",
+            "按目标层级列出实例、空间或文件",
+            "查看文件或文件夹元数据",
+            "查看 API 元数据；暂不支持执行",
+            "管理 ADrive CLI 配置",
+            "通过 stdio 或本地 HTTP/SSE 启动由 registry 支持的 MCP 服务",
+            "列出 ADrive Skill 元数据，或为外部 Agent 和适配器导出 Markdown SKILL.md 文件",
+        ],
+        &["Move files or folders", "execution is unimplemented"],
+    );
+    assert_chinese_grouped_help(
+        "ve-tos",
+        &[
+            "TOS 对象存储 CLI - 面向 Agent",
+            "多地域接入点 API",
+            "融合接入点 API",
+        ],
+        &[
+            "Multi-region access point APIs",
+            "Converged access point APIs",
+        ],
+    );
+    assert_chinese_grouped_help(
+        "tos",
+        &[
+            "TOS CLI - 面向 Agent",
+            "带保护的 API 元数据与 dry-run 计划工具",
+        ],
+        &["Guarded API metadata and dry-run planning utility"],
+    );
+}
+
+#[test]
+fn test_chinese_adrive_create_help_translates_example_comments() {
+    let help = successful_cli_stdout(&["ve-adrive", "crt", "--help", "--language", "zh"]);
+    assert_contains_all(
+        &help,
+        &[
+            "# AK/SK Instance 默认值：arkclaw",
+            "# OAuth Instance 默认值：paas",
+            "# OAuth 用户 Space 默认值：已登录 user_id",
+        ],
+        "ve-adrive crt Chinese help",
+    );
+    for source in [
+        "AK/SK Instance default: arkclaw",
+        "OAuth Instance default: paas",
+        "OAuth user Space default: logged-in user_id",
+    ] {
+        assert!(!help.contains(source), "source={source:?}: {help}");
+    }
 }
 
 #[test]
@@ -1587,6 +2278,1020 @@ fn test_leaf_help_documents_help_language_option() {
         chinese_stdout.contains("--help --language zh"),
         "stdout={chinese_stdout}"
     );
+}
+
+#[test]
+fn test_chinese_auth_help_localizes_new_authentication_contract() {
+    let grouped_help = successful_cli_stdout(&["ve-adrive", "--help", "--language", "zh"]);
+    assert!(grouped_help.contains("查看鉴权状态或管理 OAuth"));
+    assert!(!grouped_help.contains("Inspect authentication status or manage OAuth"));
+
+    let auth_help = successful_cli_stdout(&["ve-adrive", "auth", "--help", "--language", "zh"]);
+    for expected in [
+        "查看或管理 ADrive 鉴权",
+        "显示生效的鉴权模式和凭证可用性，不暴露敏感信息",
+        "启动 OAuth 设备授权登录",
+        "清除当前 profile 本地保存的 OAuth 状态",
+        "本次调用的鉴权模式：aksk、oauth 或 unified",
+        "使用统一登录集成管理的凭证",
+    ] {
+        assert!(
+            auth_help.contains(expected),
+            "help missing {expected}:\n{auth_help}"
+        );
+    }
+    assert!(!auth_help.contains("Authentication mode for this invocation"));
+
+    let login_help =
+        successful_cli_stdout(&["ve-adrive", "auth", "login", "--help", "--language", "zh"]);
+    for expected in [
+        "要授权的 ADrive Instance ID",
+        "OAuth 授权服务器基础 URL",
+        "授权期间显示的人类可读设备名称",
+    ] {
+        assert!(
+            login_help.contains(expected),
+            "help missing {expected}:\n{login_help}"
+        );
+    }
+
+    let ve_tos_help = successful_cli_stdout(&["ve-tos", "ls", "--help", "--language", "zh"]);
+    assert!(ve_tos_help.contains("本次调用的鉴权模式：aksk 或 unified"));
+    assert!(ve_tos_help.contains("使用统一登录集成管理的凭证"));
+    assert!(!ve_tos_help.contains("Authentication mode for this invocation"));
+}
+
+#[test]
+fn test_chinese_auth_describe_localizes_only_human_prose() {
+    let chinese = adrive_auth_describe("zh");
+    let rendered = chinese["data"].to_string();
+    assert_contains_all(
+        &rendered,
+        &[
+            "查看鉴权状态或管理 OAuth",
+            "单次调用覆盖",
+            "鉴权操作：status（默认）、login 或 logout",
+            "Unified 使用同名外部 profile",
+        ],
+        "describe",
+    );
+    assert_contains_all(
+        &rendered,
+        &[
+            "auth-mode",
+            "ADRIVE_AUTH_MODE",
+            "aksk",
+            "oauth",
+            "unified",
+            "ve login",
+            "ve logout",
+        ],
+        "describe stable identifier",
+    );
+    assert!(!rendered.contains("Inspect authentication status or manage OAuth"));
+
+    let ve_tos = ve_tos_config_set_describe("zh");
+    let auth_mode = &ve_tos["data"]["parameters"][2];
+    assert_eq!(auth_mode["name"], "auth-mode");
+    assert!(auth_mode["description"]
+        .as_str()
+        .unwrap()
+        .contains("单次调用的 VeTos 鉴权覆盖"));
+
+    let english = adrive_auth_describe("en");
+    assert!(english["data"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("Inspect authentication status"));
+}
+
+#[test]
+fn test_chinese_auth_skill_localizes_generated_metadata() {
+    let adrive = export_skill_markdown(
+        "ve-adrive",
+        "ve_adrive_auth",
+        "adrive-shared",
+        "adrive-auth-skill-zh",
+    );
+    for expected in [
+        "查看鉴权状态或管理 OAuth",
+        "鉴权操作：status（默认）、login 或 logout",
+        "单次调用覆盖",
+    ] {
+        assert!(
+            adrive.contains(expected),
+            "Skill missing {expected}:\n{adrive}"
+        );
+    }
+    assert!(!adrive.contains("原始英文说明"));
+    assert!(!adrive.contains("原始英文说明：Inspect authentication status"));
+    assert!(!adrive.contains("Authentication action: status"));
+
+    let ve_tos = export_skill_markdown(
+        "ve-tos",
+        "ve_tos_config_set",
+        "tos-shared",
+        "ve-tos-auth-skill-zh",
+    );
+    assert!(ve_tos.contains("单次调用的 VeTos 鉴权覆盖"));
+    assert!(!ve_tos.contains("Per-invocation VeTos authentication override"));
+
+    let english = successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-adrive",
+        "skill",
+        "list",
+        "--language",
+        "en",
+    ]);
+    let auth = english["data"]["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|skill| skill["name"] == "ve_adrive_auth")
+        .unwrap();
+    assert!(auth["description"]
+        .as_str()
+        .unwrap()
+        .contains("Inspect authentication status"));
+}
+
+fn assert_chinese_ve_tos_describe(
+    args: &[&str],
+    expected: &[&str],
+    forbidden: &[&str],
+    identifiers: &[&str],
+) -> serde_json::Value {
+    let document = successful_cli_json(args);
+    let rendered = document["data"].to_string();
+    assert_contains_all(&rendered, expected, &format!("args={args:?}"));
+    assert_contains_all(&rendered, identifiers, &format!("args={args:?}"));
+    for source in forbidden {
+        assert!(
+            !rendered.contains(source),
+            "args={args:?}, source={source:?}: {rendered}"
+        );
+    }
+    document
+}
+
+#[test]
+fn test_chinese_ve_tos_root_describe_is_localized() {
+    let root = assert_chinese_ve_tos_describe(
+        &[
+            "--output",
+            "json",
+            "ve-tos",
+            "--describe",
+            "--language",
+            "zh",
+        ],
+        &["TOS 对象存储 CLI", "复制本地文件、TOS 对象或前缀"],
+        &[
+            "TOS Object Storage CLI",
+            "Copy local files, TOS objects, or prefixes",
+        ],
+        &["ve-tos", "high_level", "cp"],
+    );
+    assert_eq!(root["data"]["kind"], "tool");
+
+    let english = successful_cli_json(&["--output", "json", "ve-tos", "--describe"]);
+    assert_eq!(english["data"]["kind"], "tool");
+    assert_eq!(english["data"]["description"], "TOS Object Storage CLI");
+    let cp = english["data"]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|group| group["command"] == "ve-tos cp")
+        .expect("root English Describe includes ve-tos cp");
+    assert_eq!(
+        cp["description"],
+        "Copy local files, TOS objects, or prefixes"
+    );
+}
+
+#[test]
+fn test_chinese_ve_tos_group_describe_is_localized() {
+    let chinese = assert_chinese_ve_tos_describe(
+        &[
+            "--output",
+            "json",
+            "ve-tos",
+            "bucket",
+            "--describe",
+            "--language",
+            "zh",
+        ],
+        &["Bucket 核心 API"],
+        &["Bucket Core APIs", "Get bucket metadata"],
+        &["ve-tos bucket", "low_level", "CreateBucket"],
+    );
+    let english = successful_cli_json(&["--output", "json", "ve-tos", "bucket", "--describe"]);
+    assert_describe_machine_payload_matches(&chinese, &english);
+}
+
+#[test]
+fn test_chinese_ve_tos_all_canonical_groups_are_parseable_and_localized() {
+    let root = successful_cli_json(&["--output", "json", "ve-tos", "--describe"]);
+    let commands = root["data"]["groups"]
+        .as_array()
+        .expect("ve-tos root Describe groups");
+    for command in commands {
+        let Some(command) = command["command"].as_str() else {
+            continue;
+        };
+        let Some(group) = command.strip_prefix("ve-tos ") else {
+            continue;
+        };
+        if group.split_whitespace().count() != 1 || group == "skill" {
+            continue;
+        }
+        let canonical = successful_cli_json(&["--output", "json", "ve-tos", group, "--describe"]);
+        if !canonical["data"].get("subcommands").is_some() {
+            continue;
+        }
+        let localized = successful_cli_json(&[
+            "--output",
+            "json",
+            "ve-tos",
+            group,
+            "--describe",
+            "--language",
+            "zh",
+        ]);
+        assert_describe_machine_payload_matches(&localized, &canonical);
+        assert_selected_human_fields_are_chinese(&localized["data"], group);
+    }
+}
+
+#[test]
+fn test_chinese_ve_tos_all_registered_api_prose_is_localized() {
+    let registry = successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-tos",
+        "capabilities",
+        "--view",
+        "full",
+    ]);
+    let capabilities = registry["data"]["capabilities"]
+        .as_array()
+        .expect("ve-tos full capabilities");
+    for capability in capabilities {
+        let command = capability["command"].as_str().expect("capability command");
+        let parts = command.split_whitespace().collect::<Vec<_>>();
+        if parts.len() < 3 {
+            continue;
+        }
+        let localized = successful_cli_json(&[
+            "--output",
+            "json",
+            "ve-tos",
+            "api",
+            parts[1],
+            parts[2],
+            "--describe",
+            "--language",
+            "zh",
+        ]);
+        assert_selected_human_fields_are_chinese(&localized["data"], command);
+    }
+}
+
+#[test]
+fn test_chinese_ve_tos_parameterized_api_preserves_canonical_payload() {
+    let chinese = assert_chinese_ve_tos_describe(
+        &[
+            "--output",
+            "json",
+            "ve-tos",
+            "api",
+            "object",
+            "list",
+            "--describe",
+            "--language",
+            "zh",
+        ],
+        &["列出对象（ListObjectsV2）", "对象列举 URI"],
+        &["List objects (ListObjectsV2)", "Object list URI"],
+        &["ve-tos object list", "capability_row", "command_metadata"],
+    );
+    let canonical = successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-tos",
+        "api",
+        "object",
+        "list",
+        "--describe",
+    ]);
+    let english = successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-tos",
+        "api",
+        "object",
+        "list",
+        "--describe",
+        "--language",
+        "en",
+    ]);
+    assert_describe_machine_payload_matches(&chinese, &canonical);
+    assert_selected_human_fields_are_chinese(&chinese["data"], "ve-tos api object list");
+    assert_eq!(english["data"], canonical["data"]);
+}
+
+#[test]
+fn test_chinese_ve_tos_high_level_describe_is_localized() {
+    assert_chinese_ve_tos_describe(
+        &[
+            "--output",
+            "json",
+            "ve-tos",
+            "cp",
+            "--describe",
+            "--language",
+            "zh",
+        ],
+        &[
+            "在本地与 TOS 之间复制本地文件、对象或前缀",
+            "本地源路径或 tos:// URI",
+        ],
+        &["Copy local files, objects", "Source local path"],
+        &["source", "--recursive", "PutObject", "tos://bucket"],
+    );
+
+    let english = successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-tos",
+        "cp",
+        "--describe",
+        "--language",
+        "en",
+    ]);
+    let rendered = english["data"].to_string();
+    assert!(rendered.contains("Copy local files, objects, or prefixes"));
+    assert!(rendered.contains("Source local path or tos:// URI"));
+}
+
+#[test]
+fn test_chinese_ve_tos_nested_and_config_describe_are_localized() {
+    assert_chinese_ve_tos_describe(
+        &[
+            "--output",
+            "json",
+            "ve-tos",
+            "bucket",
+            "create",
+            "--describe",
+            "--language",
+            "zh",
+        ],
+        &[
+            "通过 CreateBucket 创建 Bucket",
+            "存储桶 URI（tos://bucket）",
+        ],
+        &["CreateBucket with optional", "Bucket URI (tos://bucket)"],
+        &["CreateBucket", "bucket_name", "fns", "hns"],
+    );
+    assert_chinese_ve_tos_describe(
+        &[
+            "--output",
+            "json",
+            "ve-tos",
+            "config",
+            "set",
+            "--describe",
+            "--language",
+            "zh",
+        ],
+        &[
+            "在共享 profile 或 TOS 覆盖 profile 中设置配置值",
+            "配置 key",
+            "配置 value",
+        ],
+        &["Set a configuration value", "Config key", "Config value"],
+        &["auth-mode", "TOS_AUTH_MODE", "aksk", "unified"],
+    );
+}
+
+#[test]
+fn test_chinese_ve_tos_skill_describe_is_localized() {
+    assert_chinese_ve_tos_describe(
+        &[
+            "--output",
+            "json",
+            "ve-tos",
+            "skill",
+            "list",
+            "--describe",
+            "--language",
+            "zh",
+        ],
+        &["列出用于 MCP 工具声明", "外部 Agent 目录"],
+        &["List TOS skill v1 metadata", "external Agent catalogs"],
+        &["ve-tos skill list", "Markdown SKILL.md", "--query"],
+    );
+}
+
+#[test]
+fn test_chinese_ve_tos_skill_list_and_export_have_no_english_fallback() {
+    assert_chinese_ve_tos_cp_skill_list();
+    assert_chinese_ve_tos_cp_skill_export();
+    assert_english_ve_tos_cp_skill_unchanged();
+}
+
+// [Review Fix #VeTosZh4] Keep each public Skill assertion focused and under
+// the repository function-size limit while covering list, export, and English.
+fn assert_chinese_ve_tos_cp_skill_list() {
+    let list = successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-tos",
+        "skill",
+        "list",
+        "--language",
+        "zh",
+    ]);
+    let skill = list["data"]["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|skill| skill["name"] == "ve_tos_cp")
+        .expect("ve_tos_cp Skill");
+    let rendered = skill.to_string();
+    assert_contains_all(
+        &rendered,
+        &["在本地与 TOS 之间复制", "源自 live TOS CLI"],
+        "Skill list",
+    );
+    for source in [
+        "原始英文说明",
+        "参数说明：",
+        "Copy local files",
+        "Source local path",
+        "Derived from the live",
+    ] {
+        assert!(!rendered.contains(source), "source={source:?}: {rendered}");
+    }
+    assert_contains_all(
+        &rendered,
+        &["ve_tos_cp", "Markdown SKILL.md", "tos://"],
+        "Skill identifiers",
+    );
+}
+
+fn assert_chinese_ve_tos_cp_skill_export() {
+    let markdown =
+        export_skill_markdown("ve-tos", "ve_tos_cp", "tos-transfer", "ve-tos-cp-skill-zh");
+    assert_contains_all(
+        &markdown,
+        &["在本地与 TOS 之间复制", "--recursive", "tos://"],
+        "Skill export",
+    );
+    for source in [
+        "原始英文说明",
+        "参数说明：",
+        "Copy local files",
+        "Source local path",
+    ] {
+        assert!(!markdown.contains(source), "source={source:?}: {markdown}");
+    }
+}
+
+fn assert_english_ve_tos_cp_skill_unchanged() {
+    let english = successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-tos",
+        "skill",
+        "list",
+        "--language",
+        "en",
+    ]);
+    let rendered = english["data"].to_string();
+    assert!(rendered.contains("Copy local files, objects, or prefixes"));
+    assert!(rendered.contains("Derived from the live TOS CLI"));
+}
+
+fn assert_chinese_tos_describe(
+    args: &[&str],
+    expected: &[&str],
+    forbidden: &[&str],
+    identifiers: &[&str],
+) -> serde_json::Value {
+    let document = successful_cli_json(args);
+    let rendered = document["data"].to_string();
+    assert_contains_all(&rendered, expected, &format!("args={args:?}"));
+    assert_contains_all(&rendered, identifiers, &format!("args={args:?}"));
+    for source in forbidden {
+        assert!(
+            !rendered.contains(source),
+            "args={args:?}, source={source:?}: {rendered}"
+        );
+    }
+    document
+}
+
+#[test]
+fn test_chinese_tos_root_group_and_leaf_describe_are_localized() {
+    assert_chinese_tos_describe(
+        &["--output", "json", "tos", "--describe", "--language", "zh"],
+        &["ByteCloud TOS CLI 高层对象存储工作流和实用工具"],
+        &["high-level object storage workflows and utilities"],
+        &["tos", "high_level", "utilities", "tos://bucket/key"],
+    );
+    assert_chinese_tos_describe(
+        &[
+            "--output",
+            "json",
+            "tos",
+            "config",
+            "--describe",
+            "--language",
+            "zh",
+        ],
+        &["配置管理"],
+        &["Configuration management"],
+        &["tos config", "meta"],
+    );
+    assert_chinese_tos_describe(
+        &[
+            "--output",
+            "json",
+            "tos",
+            "cp",
+            "--describe",
+            "--language",
+            "zh",
+        ],
+        &["复制本地文件、TOS 对象或前缀"],
+        &["Copy local files, TOS objects, or prefixes"],
+        &["tos cp", "high_level", "PutObject"],
+    );
+}
+
+#[test]
+fn test_chinese_tos_api_describe_localizes_generated_prose() {
+    let chinese = assert_chinese_tos_describe(
+        &[
+            "--output",
+            "json",
+            "tos",
+            "api",
+            "object",
+            "list",
+            "--describe",
+            "--language",
+            "zh",
+        ],
+        &["受保护的 TOS 工具 API 元数据"],
+        &["Guarded TOS utility API metadata"],
+        &["tos api object list", "object.list", "guarded_utility"],
+    );
+    let english = successful_cli_json(&[
+        "--output",
+        "json",
+        "tos",
+        "api",
+        "object",
+        "list",
+        "--describe",
+    ]);
+    let explicit_english = successful_cli_json(&[
+        "--output",
+        "json",
+        "tos",
+        "api",
+        "object",
+        "list",
+        "--describe",
+        "--language",
+        "en",
+    ]);
+    assert_describe_machine_payload_matches(&chinese, &english);
+    assert_eq!(explicit_english["data"], english["data"]);
+}
+
+#[test]
+fn test_chinese_tos_utility_describe_is_localized() {
+    assert_chinese_tos_describe(
+        &[
+            "--output",
+            "json",
+            "tos",
+            "skill",
+            "--describe",
+            "--language",
+            "zh",
+        ],
+        &["列出 TOS Skill 元数据或导出 Markdown SKILL.md 文件"],
+        &["List TOS skill metadata or export Markdown SKILL.md files"],
+        &["tos skill", "meta", "SKILL.md"],
+    );
+}
+
+#[test]
+fn test_chinese_tos_skill_list_and_export_have_no_english_fallback() {
+    let list = successful_cli_json(&[
+        "--output",
+        "json",
+        "tos",
+        "skill",
+        "list",
+        "--language",
+        "zh",
+    ]);
+    let skill = list["data"]["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|skill| skill["name"] == "tos_cp")
+        .expect("tos_cp Skill");
+    let rendered = skill.to_string();
+    assert_contains_all(
+        &rendered,
+        &[
+            "复制本地文件、TOS 对象或前缀",
+            "本地路径或 tos://bucket/key 源",
+        ],
+        "TOS Skill list",
+    );
+    for source in [
+        "原始英文说明",
+        "参数说明：",
+        "Copy local files",
+        "Local path or tos://bucket/key source",
+    ] {
+        assert!(!rendered.contains(source), "source={source:?}: {rendered}");
+    }
+}
+
+// [Review Fix #TosZh4] Keep list and export regressions independently readable
+// and within the repository function-size limit.
+#[test]
+fn test_chinese_tos_skill_export_has_no_english_fallback() {
+    let markdown =
+        export_skill_markdown("tos", "tos_cp", "tos-transfer", "tos-cp-skill-zh-complete");
+    assert_contains_all(
+        &markdown,
+        &[
+            "复制本地文件、TOS 对象或前缀",
+            "本地路径或 tos://bucket/key 源",
+            "tos://bucket",
+        ],
+        "TOS Skill export",
+    );
+    assert!(!markdown.contains("原始英文说明"), "{markdown}");
+    assert!(!markdown.contains("参数说明："), "{markdown}");
+}
+
+#[test]
+fn test_english_tos_describe_and_skill_metadata_are_unchanged() {
+    let describe = successful_cli_json(&["--output", "json", "tos", "cp", "--describe"]);
+    let explicit_describe = successful_cli_json(&[
+        "--output",
+        "json",
+        "tos",
+        "cp",
+        "--describe",
+        "--language",
+        "en",
+    ]);
+    assert_eq!(describe["data"], explicit_describe["data"]);
+    assert_eq!(
+        describe["data"]["description"],
+        "Copy local files, TOS objects, or prefixes"
+    );
+    let list = successful_cli_json(&[
+        "--output",
+        "json",
+        "tos",
+        "skill",
+        "list",
+        "--language",
+        "en",
+    ]);
+    let implicit_list = successful_cli_json(&["--output", "json", "tos", "skill", "list"]);
+    assert_eq!(implicit_list["data"]["skills"], list["data"]["skills"]);
+    let skill = list["data"]["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|skill| skill["name"] == "tos_cp")
+        .expect("English tos_cp Skill");
+    assert_eq!(
+        skill["description"],
+        "Copy local files, TOS objects, or prefixes"
+    );
+    assert_eq!(
+        skill["input_schema"]["properties"]["source"]["description"],
+        "Local path or tos://bucket/key source"
+    );
+}
+
+// [Review Fix #ADriveZh2] Keep the public regressions within the function-size
+// limit while checking exact Chinese prose and stable machine identifiers.
+fn assert_chinese_adrive_cp_skill() {
+    let markdown = export_skill_markdown(
+        "ve-adrive",
+        "ve_adrive_cp",
+        "adrive-transfer",
+        "adrive-cp-skill-zh",
+    );
+    for forbidden in ["原始英文说明", "Copy local files", "Source path"] {
+        assert!(
+            !markdown.contains(forbidden),
+            "forbidden={forbidden:?}: {markdown}"
+        );
+    }
+    assert_contains_all(
+        &markdown,
+        &["ADrive", "--force", "adrive://"],
+        "ADrive cp Skill",
+    );
+}
+
+fn assert_chinese_adrive_describe(
+    command: &str,
+    expected: &[&str],
+    forbidden: &[&str],
+    identifiers: &[&str],
+) {
+    let document = successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-adrive",
+        command,
+        "--describe",
+        "--language",
+        "zh",
+    ]);
+    let rendered = document["data"].to_string();
+    assert_contains_all(&rendered, expected, command);
+    assert_contains_all(&rendered, identifiers, command);
+    assert_contains_all(
+        &rendered,
+        &[
+            "ve-adrive",
+            "--output",
+            "json",
+            "scenario_routing",
+            "examples",
+        ],
+        command,
+    );
+    for source in forbidden.iter().chain(["原始英文说明"].iter()) {
+        assert!(
+            !rendered.contains(source),
+            "command={command}, source={source:?}: {rendered}"
+        );
+    }
+}
+
+fn assert_adrive_metadata_localized(
+    document: &serde_json::Value,
+    expected: &[&str],
+    forbidden: &[&str],
+    context: &str,
+) {
+    let rendered = document["data"].to_string();
+    assert_contains_all(&rendered, expected, context);
+    for source in forbidden {
+        assert!(
+            !rendered.contains(source),
+            "context={context}, source={source:?}: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn test_chinese_adrive_root_config_and_raw_api_describe_are_localized() {
+    let root = successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-adrive",
+        "--describe",
+        "--language",
+        "zh",
+    ]);
+    assert_adrive_metadata_localized(
+        &root,
+        &[
+            "ADrive CLI 高层文件操作与 Agent 工具",
+            "adrive:// URI 和 flags",
+        ],
+        &["high-level file operations", "File management operations"],
+        "ve-adrive root",
+    );
+    assert_eq!(
+        root["data"]["uri_format"],
+        "adrive://instance/space/folder/file"
+    );
+
+    let group = successful_cli_json(&[
+        "--output",
+        "json",
+        "--describe",
+        "ve-adrive",
+        "config",
+        "--language",
+        "zh",
+    ]);
+    assert_adrive_metadata_localized(
+        &group,
+        &["管理 ADrive CLI 配置"],
+        &["Configuration management", "Initialize configuration"],
+        "ve-adrive config",
+    );
+    assert_eq!(group["data"]["command"], "ve-adrive config");
+}
+
+#[test]
+fn test_chinese_adrive_config_action_and_raw_api_recovery_are_localized() {
+    let action = successful_cli_json(&[
+        "--output",
+        "json",
+        "--describe",
+        "ve-adrive",
+        "config",
+        "init",
+        "--language",
+        "zh",
+    ]);
+    assert_adrive_metadata_localized(
+        &action,
+        &["初始化配置"],
+        &["Initialize configuration"],
+        "ve-adrive config init",
+    );
+    assert_eq!(action["data"]["command"], "ve-adrive config init");
+
+    let api = successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-adrive",
+        "api",
+        "instance",
+        "create",
+        "--describe",
+        "--language",
+        "zh",
+    ]);
+    assert_adrive_metadata_localized(
+        &api,
+        &[
+            "受保护的 ADrive 工具 API 规划",
+            "instance.create",
+            "暂不支持直接执行原始 API",
+        ],
+        &["Guarded ADrive utility API planning"],
+        "ve-adrive api instance create",
+    );
+    assert_eq!(api["data"]["mode"], "guarded_utility_passthrough");
+    assert_eq!(api["data"]["raw_api_execution_implemented"], false);
+}
+
+#[test]
+fn test_chinese_adrive_parameterized_api_preserves_canonical_payload() {
+    let chinese = successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-adrive",
+        "api",
+        "Files",
+        "ListFiles",
+        "--describe",
+        "--language",
+        "zh",
+    ]);
+    assert_adrive_metadata_localized(
+        &chinese,
+        &["受保护的 ADrive 工具 API 规划", "查看 API 元数据"],
+        &[
+            "Guarded ADrive utility API planning",
+            "Inspect API metadata",
+        ],
+        "ve-adrive parameterized api",
+    );
+    let canonical = successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-adrive",
+        "api",
+        "Files",
+        "ListFiles",
+        "--describe",
+    ]);
+    let english = successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-adrive",
+        "api",
+        "Files",
+        "ListFiles",
+        "--describe",
+        "--language",
+        "en",
+    ]);
+    assert_describe_machine_payload_matches(&chinese, &canonical);
+    assert_eq!(english["data"], canonical["data"]);
+
+    let leading_global = successful_cli_json(&[
+        "--output",
+        "json",
+        "--describe",
+        "--language",
+        "zh",
+        "ve-adrive",
+        "api",
+        "Files",
+        "ListFiles",
+    ]);
+    assert_describe_machine_payload_matches(&leading_global, &canonical);
+}
+
+#[test]
+fn test_chinese_adrive_skill_usage_is_localized_and_machine_fields_stay_exact() {
+    let skills = successful_cli_json(&[
+        "--output",
+        "json",
+        "ve-adrive",
+        "skill",
+        "list",
+        "--language",
+        "zh",
+    ]);
+    let skill = skills["data"]["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|skill| skill["name"] == "ve_adrive_cp")
+        .unwrap();
+    assert_contains_all(
+        &skill["usage"].to_string(),
+        &["源自 live ADrive CLI capability registry", "默认返回计划"],
+        "ve_adrive_cp usage",
+    );
+    assert!(!skill["usage"].to_string().contains("Derived from the live"));
+    assert_eq!(skill["usage"]["format"], "Markdown SKILL.md");
+    assert_eq!(skill["usage"]["mcp_tool_name"], "ve_adrive_cp");
+    assert!(skill["usage"]["mcp_server"]
+        .as_str()
+        .unwrap()
+        .contains("serve --mcp"));
+
+    let markdown = export_skill_markdown(
+        "ve-adrive",
+        "ve_adrive_cp",
+        "adrive-transfer",
+        "adrive-cp-usage-skill-zh",
+    );
+    assert!(!markdown.contains("Derived from the live ADrive CLI"));
+    assert!(!markdown.contains("Portable Markdown skill pack"));
+}
+
+#[test]
+fn test_chinese_adrive_cp_skill_and_describe_have_no_english_fallback() {
+    assert_chinese_adrive_cp_skill();
+
+    assert_chinese_adrive_describe(
+        "cp",
+        &[
+            "复制本地文件、ADrive 文件或文件夹",
+            "本地路径或 adrive://instance/space/path 源路径",
+        ],
+        &[
+            "Copy local files",
+            "returns a deterministic plan",
+            "Source path",
+        ],
+        &[
+            "source",
+            "destination",
+            "recursive",
+            "put_file",
+            "adrive://",
+        ],
+    );
+    assert_chinese_adrive_describe(
+        "completion",
+        &[
+            "生成 shell 补全脚本和安装片段",
+            "Shell 名称：bash、zsh、fish 或 powershell",
+        ],
+        &[
+            "Generate shell completion scripts",
+            "generated scripts register",
+            "Shell name:",
+        ],
+        &["bash", "zsh", "fish", "powershell"],
+    );
+
+    let english = successful_cli_json(&["--output", "json", "ve-adrive", "cp", "--describe"]);
+    assert!(english["data"].to_string().contains("Copy local files"));
 }
 
 #[test]
@@ -2014,6 +3719,93 @@ fn test_adrive_help() {
     let subcommand_stdout = String::from_utf8_lossy(&subcommand_output.stdout);
     assert!(!subcommand_stdout.contains("--control-endpoint"));
     assert!(!subcommand_stdout.contains("--account-id"));
+}
+
+#[test]
+fn test_adrive_create_help_documents_oauth_owner_defaults() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
+        .args(["ve-adrive", "crt", "--help"])
+        .output()
+        .expect("Failed to execute");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for expected in [
+        "--service-type <SERVICE_TYPE>",
+        "--owner-type <OWNER_TYPE>",
+        "--owner-id <OWNER_ID>",
+        "Defaults to arkclaw for AK/SK and paas for OAuth",
+        "OAuth user Space ownership defaults to the logged-in user_id",
+        "OAuth group Space ownership requires --owner-id",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected}:\n{stdout}");
+    }
+}
+
+#[test]
+fn test_adrive_create_describe_documents_oauth_owner_routing() {
+    let output = cli_with_empty_home(
+        "adrive-create-describe-oauth-owner",
+        &["ve-adrive", "crt", "--describe", "--output", "json"],
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid create describe json");
+    let payload = &parsed["data"];
+    let owner_id = payload["parameters"]
+        .as_array()
+        .expect("parameters")
+        .iter()
+        .find(|parameter| parameter["name"] == "owner-id")
+        .expect("owner-id parameter");
+    let description = owner_id["description"]
+        .as_str()
+        .expect("owner-id description");
+    assert!(description.contains("logged-in user_id"));
+    assert!(description.contains("group ownership requires"));
+    assert!(payload["scenario_routing"]["create_defaults"]
+        .as_str()
+        .expect("create defaults routing")
+        .contains("OAuth user Space"));
+}
+
+#[test]
+fn test_adrive_list_describe_documents_auth_aware_routing() {
+    // [Review Fix #1] Agents must not mistake OAuth root listing for an
+    // unscoped list_instances call or reuse collection pagination semantics.
+    let output = cli_with_empty_home(
+        "adrive-list-describe-auth-routing",
+        &["ve-adrive", "ls", "--describe", "--output", "json"],
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid list describe json");
+    let target_matrix = parsed["data"]["scenario_routing"]["target_matrix"]
+        .as_str()
+        .expect("target matrix");
+
+    for expected in [
+        "AK/SK no target -> list_instances",
+        "OAuth no target -> the credentials-bound single Instance",
+        "oauth_instance_required",
+        "OAuth root rejects --marker",
+        "AK/SK instance target -> list_spaces",
+        "OAuth instance target -> list_my_spaces",
+        "--owner-type group -> list_my_group_spaces",
+    ] {
+        assert!(
+            target_matrix.contains(expected),
+            "missing {expected}: {target_matrix}"
+        );
+    }
 }
 
 #[test]
@@ -2852,6 +4644,29 @@ fn test_adrive_capabilities_schema_matches_agent_contract() {
     let semantics = data["high_level_semantics"]
         .as_object()
         .expect("high_level_semantics");
+    // [Review Fix #1] Capabilities must expose the same auth-aware ls routing
+    // contract as `ls --describe`.
+    let list_semantics = semantics["ls"]
+        .as_array()
+        .expect("ls semantics")
+        .iter()
+        .filter_map(|line| line.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    for expected in [
+        "AK/SK no target -> list_instances",
+        "OAuth no target -> the credentials-bound single Instance",
+        "oauth_instance_required",
+        "OAuth root rejects --marker",
+        "AK/SK instance target -> list_spaces",
+        "OAuth instance target -> list_my_spaces",
+        "--owner-type group -> list_my_group_spaces",
+    ] {
+        assert!(
+            list_semantics.contains(expected),
+            "missing {expected}: {list_semantics}"
+        );
+    }
     // [Review Fix #1] Derive the expected semantics keys from capability rows
     // so future high-level commands cannot be added without discovery text.
     for command in capabilities
@@ -3677,7 +5492,14 @@ fn test_adrive_skill_export_writes_markdown_skill_pack() {
     )
     .expect("read exported zh ve-adrive skill");
     assert!(zh_markdown.contains("## 说明"), "markdown={zh_markdown}");
-    assert!(zh_markdown.contains("参数说明"), "markdown={zh_markdown}");
+    assert!(
+        zh_markdown.contains("分页 marker"),
+        "markdown={zh_markdown}"
+    );
+    assert!(
+        !zh_markdown.contains("参数说明："),
+        "markdown={zh_markdown}"
+    );
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_dir_all(&zh_dir);
 }
@@ -3699,13 +5521,7 @@ fn test_adrive_serve_describe_documents_mcp_transport_details() {
         ])
         .output()
         .expect("Failed to execute");
-    assert!(
-        output.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    let parsed = assert_sse_security_contract(&output, 19091);
     assert_eq!(parsed["command"], "ve-adrive serve");
     assert_eq!(parsed["data"]["protocol"], "MCP standard protocol via rmcp");
     assert_eq!(parsed["data"]["tcp_listener"], true);
@@ -4746,13 +6562,7 @@ fn test_tos_serve_sse_dry_run_reports_plan() {
         ])
         .output()
         .expect("Failed to execute");
-    assert!(
-        output.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
+    let parsed = assert_sse_security_contract(&output, 18080);
     assert_eq!(parsed["status"], "success");
     assert_eq!(parsed["command"], "ve-tos serve");
     assert_eq!(parsed["data"]["mode"], "mcp");
@@ -4778,13 +6588,7 @@ fn test_tos_serve_describe_documents_mcp_transport_details() {
         ])
         .output()
         .expect("Failed to execute");
-    assert!(
-        output.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    let parsed = assert_sse_security_contract(&output, 19090);
     assert_eq!(parsed["data"]["protocol"], "MCP standard protocol via rmcp");
     assert_eq!(parsed["data"]["tcp_listener"], true);
     assert_eq!(parsed["data"]["bind"], "127.0.0.1:19090");
@@ -4850,6 +6654,61 @@ fn test_byted_tos_serve_help_uses_tos_tool_names() {
     assert!(stdout.contains("tos serve --mcp"), "stdout={stdout}");
     assert!(!stdout.contains("ve_tos_ls"), "stdout={stdout}");
     assert!(!stdout.contains("ve_tos_bucket_create"), "stdout={stdout}");
+}
+
+#[test]
+fn test_all_serve_help_documents_sse_security_contract() {
+    for surface in ["ve-tos", "tos", "ve-adrive"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
+            .args([surface, "serve", "--help"])
+            .output()
+            .expect("Failed to execute");
+        assert!(
+            output.status.success(),
+            "surface={surface} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for expected in [
+            "fresh Bearer token",
+            "Authorization header",
+            "Host header",
+            "Origin header",
+        ] {
+            assert!(
+                stdout.contains(expected),
+                "surface={surface} missing {expected:?}: {stdout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_all_sse_serve_surfaces_reject_port_zero() {
+    // [Review Fix #7] Dry-run metadata cannot promise :0 when the OS selects an ephemeral port.
+    for surface in ["ve-tos", "tos", "ve-adrive"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
+            .args([
+                "--output",
+                "json",
+                "--dry-run",
+                surface,
+                "serve",
+                "--mcp",
+                "--transport",
+                "sse",
+                "--port",
+                "0",
+            ])
+            .output()
+            .expect("Failed to execute");
+        assert!(!output.status.success(), "surface={surface}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("0 is not in"),
+            "surface={surface} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

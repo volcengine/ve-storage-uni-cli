@@ -28,3 +28,4 @@ pub mod registry;
 pub use cli::command_path;
 pub use cli::print_grouped_help;
 pub use cli::TosCommand;
+pub use cli::VeTosAuthArgs;

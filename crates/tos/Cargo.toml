@@ -43,6 +43,8 @@ reqwest = { workspace = true }
 jmespath = { workspace = true }
 strsim = { workspace = true }
 ulid = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }
 quick-xml = { workspace = true }
 indicatif = { workspace = true }
 base64 = "0.22"

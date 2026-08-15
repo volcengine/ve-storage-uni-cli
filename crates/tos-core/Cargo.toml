@@ -28,6 +28,7 @@ include = [
 ]
 
 [dependencies]
+axum = "0.8"
 clap = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
@@ -44,6 +45,7 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
+httpdate = { workspace = true }
 url = { workspace = true }
 aes-gcm = "0.10"
 base64 = "0.22"
@@ -52,3 +54,9 @@ jmespath = { workspace = true }
 strsim = { workspace = true }
 ulid = { workspace = true }
 rmcp = { workspace = true }
+subtle = "2"
+tokio-util = "0.7"
+volcengine-rust-sdk-auth = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

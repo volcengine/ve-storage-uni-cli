@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+pub mod auth;
 pub mod bucket;
 pub mod core;
 pub mod multipart;

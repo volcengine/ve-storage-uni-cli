@@ -17,7 +17,6 @@
 //! Encrypted credential persistence shared by the public CLI surfaces.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -117,6 +116,16 @@ impl StoredOAuthCredentials {
             } else {
                 other.scope.clone()
             },
+            legacy_client_id: None,
+            instance_id: other
+                .instance_id
+                .clone()
+                .or_else(|| self.instance_id.clone()),
+            user_id: other.user_id.clone().or_else(|| self.user_id.clone()),
+            auth_endpoint: other
+                .auth_endpoint
+                .clone()
+                .or_else(|| self.auth_endpoint.clone()),
         }
     }
 
@@ -126,7 +135,7 @@ impl StoredOAuthCredentials {
     }
 }
 
-/// Persisted OAuth fields reserved for ADrive service integration.
+/// Persisted OAuth tokens and issuer metadata used by ADrive authentication.
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredOAuthCredentials {
@@ -140,6 +149,20 @@ pub struct StoredOAuthCredentials {
     pub token_type: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope: Vec<String>,
+    // [Review Fix #1] Read the field written by pre-release OAuth builds so a
+    // shared credentials file remains usable, but never persist it again.
+    #[doc(hidden)]
+    #[serde(default, rename = "client_id", skip_serializing)]
+    pub legacy_client_id: Option<String>,
+    /// IDS Instance bound to this credential set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    /// OAuth subject returned by the Token endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// OAuth Authorization Server base URL that issued this credential set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_endpoint: Option<String>,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -245,7 +268,7 @@ impl CredentialsFile {
         let content = toml::to_string_pretty(&encrypted).map_err(|error| {
             CliError::ValidationError(format!("Failed to serialize credentials: {error}"))
         })?;
-        write_atomic(path, content.as_bytes())
+        super::atomic_file::write_owner_only_atomic(path, content.as_bytes())
     }
 
     /// Set one AK/SK field in a profile and credential section.
@@ -321,6 +344,16 @@ impl CredentialsFile {
             .and_then(|adrive| adrive.oauth.clone())
             .unwrap_or_default();
         decrypt_oauth(oauth, path)
+    }
+
+    /// Return whether a profile contains persisted ADrive OAuth tokens without
+    /// decrypting them or creating local key material.
+    pub fn has_adrive_oauth_tokens(&self, profile_name: &str) -> bool {
+        self.profiles
+            .get(profile_name)
+            .and_then(|profile| profile.adrive.as_ref())
+            .and_then(|adrive| adrive.oauth.as_ref())
+            .is_some_and(|oauth| oauth.access_token.is_some() || oauth.refresh_token.is_some())
     }
 
     /// Replace the OAuth credentials for an ADrive profile.
@@ -549,79 +582,6 @@ fn oauth_requires_decryption(credentials: &StoredOAuthCredentials) -> bool {
     .any(crypto::is_encrypted)
 }
 
-fn write_atomic(path: &Path, content: &[u8]) -> Result<(), CliError> {
-    let temp_path = path.with_extension(format!("tmp-{}", ulid::Ulid::new()));
-    // [Review Fix #13] Flush the complete sibling file before replacement so
-    // a crash cannot leave a partially-written credentials file.
-    let prepare_result = (|| {
-        let mut temp_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .map_err(CliError::Io)?;
-        set_owner_only_permissions(&temp_path)?;
-        temp_file.write_all(content).map_err(CliError::Io)?;
-        temp_file.sync_all().map_err(CliError::Io)
-    })();
-    if let Err(error) = prepare_result {
-        // [Review Fix #15] Failed permission/write/sync operations must not
-        // leave secret-bearing temporary files beside the credential store.
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(error);
-    }
-    replace_file(&temp_path, path).map_err(|error| {
-        let _ = std::fs::remove_file(&temp_path);
-        CliError::Io(error)
-    })?;
-    set_owner_only_permissions(path)?;
-    sync_parent_directory(path)
-}
-
-#[cfg(not(windows))]
-fn replace_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
-    std::fs::rename(temp_path, path)
-}
-
-#[cfg(windows)]
-fn replace_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
-    if !path.exists() {
-        return std::fs::rename(temp_path, path);
-    }
-    let backup_path = path.with_extension(format!("backup-{}", ulid::Ulid::new()));
-    std::fs::rename(path, &backup_path)?;
-    if let Err(error) = std::fs::rename(temp_path, path) {
-        let _ = std::fs::rename(&backup_path, path);
-        return Err(error);
-    }
-    std::fs::remove_file(backup_path)
-}
-
-#[cfg(unix)]
-fn sync_parent_directory(path: &Path) -> Result<(), CliError> {
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::File::open(directory)
-        .and_then(|file| file.sync_all())
-        .map_err(CliError::Io)
-}
-
-#[cfg(not(unix))]
-fn sync_parent_directory(_path: &Path) -> Result<(), CliError> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_owner_only_permissions(path: &Path) -> Result<(), CliError> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = std::fs::metadata(path).map_err(CliError::Io)?.permissions();
-    permissions.set_mode(0o600);
-    std::fs::set_permissions(path, permissions).map_err(CliError::Io)
-}
-
-#[cfg(not(unix))]
-fn set_owner_only_permissions(_path: &Path) -> Result<(), CliError> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,6 +771,100 @@ mod tests {
     }
 
     #[test]
+    fn oauth_metadata_round_trip() {
+        let directory = temp_path("oauth-metadata");
+        let path = directory.join("credentials.toml");
+        let expected = StoredOAuthCredentials {
+            access_token: Some("access".to_string()),
+            refresh_token: Some("refresh".to_string()),
+            expires_at: Some("2026-08-01T12:00:00Z".to_string()),
+            token_type: Some("Bearer".to_string()),
+            scope: vec!["file:read".to_string()],
+            legacy_client_id: None,
+            instance_id: Some("inst-1".to_string()),
+            user_id: Some("user-1".to_string()),
+            auth_endpoint: Some("https://idsauth.volces.com".to_string()),
+        };
+        let mut store = CredentialsFile::default();
+        store.set_adrive_oauth("default", expected.clone()).unwrap();
+        store.save_to_path(&path).unwrap();
+
+        let loaded = CredentialsFile::load_from(&path)
+            .unwrap()
+            .adrive_oauth("default", &path)
+            .unwrap();
+        assert_eq!(loaded.access_token, expected.access_token);
+        assert_eq!(loaded.refresh_token, expected.refresh_token);
+        assert_eq!(loaded.expires_at, expected.expires_at);
+        assert_eq!(loaded.token_type, expected.token_type);
+        assert_eq!(loaded.scope, expected.scope);
+        assert_eq!(loaded.instance_id, expected.instance_id);
+        assert_eq!(loaded.user_id, expected.user_id);
+        assert_eq!(loaded.auth_endpoint, expected.auth_endpoint);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("client_id"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn schema_v1_oauth_without_user_id_is_read_as_none() {
+        let directory = temp_path("oauth-without-user-id");
+        let path = directory.join("credentials.toml");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            &path,
+            "schema_version = 1\n\n[default.adrive.oauth]\ninstance_id = \"inst-1\"\nauth_endpoint = \"https://idsauth.volces.com\"\n",
+        )
+        .unwrap();
+
+        let oauth = CredentialsFile::load_from(&path)
+            .unwrap()
+            .adrive_oauth("default", &path)
+            .unwrap();
+
+        assert_eq!(oauth.user_id, None);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn oauth_merge_preserves_user_id_when_override_omits_it() {
+        let shared = StoredOAuthCredentials {
+            user_id: Some("user-1".to_string()),
+            ..StoredOAuthCredentials::default()
+        };
+        let override_credentials = StoredOAuthCredentials {
+            instance_id: Some("inst-1".to_string()),
+            ..StoredOAuthCredentials::default()
+        };
+
+        assert_eq!(
+            shared.merge(&override_credentials).user_id.as_deref(),
+            Some("user-1")
+        );
+    }
+
+    #[test]
+    fn legacy_oauth_client_id_is_read_but_not_rewritten() {
+        let directory = temp_path("legacy-oauth-client-id");
+        let path = directory.join("credentials.toml");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            &path,
+            "schema_version = 1\n\n[default.adrive.oauth]\nclient_id = \"legacy-client\"\ninstance_id = \"inst-1\"\nauth_endpoint = \"https://idsauth.volces.com\"\n",
+        )
+        .unwrap();
+
+        let credentials = CredentialsFile::load_from(&path).unwrap();
+        let oauth = credentials.adrive_oauth("default", &path).unwrap();
+        assert_eq!(oauth.instance_id.as_deref(), Some("inst-1"));
+
+        credentials.save_to_path(&path).unwrap();
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(!rewritten.contains("client_id"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn adrive_aksk_and_oauth_coexist_without_overriding_each_other() {
         let directory = temp_path("adrive-auth-families");
         let path = directory.join("credentials.toml");
@@ -892,7 +946,9 @@ mod tests {
         let destination = directory.join("credentials.toml");
         std::fs::create_dir_all(&destination).unwrap();
 
-        assert!(write_atomic(&destination, b"secret").is_err());
+        assert!(
+            super::super::atomic_file::write_owner_only_atomic(&destination, b"secret").is_err()
+        );
         let has_temporary_file = std::fs::read_dir(&directory).unwrap().any(|entry| {
             entry
                 .unwrap()

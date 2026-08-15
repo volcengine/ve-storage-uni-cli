@@ -20,7 +20,7 @@ use crate::cli::low_level::*;
 use crate::domain::core::{self, DownloadResult, RawResponseData};
 use crate::domain::object as object_domain;
 use crate::handler::common::{
-    build_profile, build_query, classify_body_input, ensure_force_for_destructive, marker_query,
+    build_query, build_runtime, classify_body_input, ensure_force_for_destructive, marker_query,
     output_result, output_result_with_columns, parse_kv_pairs, parse_object_target,
     read_body_input, read_json_input, validate_bucket_flag_target, BodyInput,
 };
@@ -146,8 +146,8 @@ pub async fn handle_object_command(
         }
     }
 
-    let profile = build_profile(global)?;
-    let client = TosClient::new(&profile, "tos")?;
+    let runtime = build_runtime(global)?;
+    let client = runtime.client(global, "tos")?;
 
     match action {
         ObjectAction::Upload(args) => handle_upload(global, &client, args).await,
@@ -388,19 +388,17 @@ async fn handle_download(
         ("response-expires", args.response_expires.clone()),
         ("partNumber", args.part_number.map(|n| n.to_string())),
     ]);
-    let resp =
-        core::send_object_request(client, Method::GET, &bucket, &key, query, headers, None).await?;
-    let request_id = core::extract_request_id(&resp);
-    let response_headers = core::extract_headers(&resp);
-    let mut resp = client.check_response(resp).await?;
-
     // [Review Fix #M1] Stream the response body instead of buffering it all
     // into memory; this keeps `ve-tos object download` aligned with the
     // "Streaming I/O" hard constraint and behaves identically to high-level
     // `cp` for arbitrarily large objects.
     if let Some(output) = &args.body {
         if output == "-" {
-            crate::handler::high_level::stream_response_to_stdout(&mut resp).await?;
+            let response =
+                core::send_object_request(client, Method::GET, &bucket, &key, query, headers, None)
+                    .await?;
+            let mut response = client.check_response(response).await?;
+            crate::handler::high_level::stream_response_to_stdout(&mut response).await?;
             return Ok(());
         }
 
@@ -409,14 +407,37 @@ async fn handle_download(
         // leave the destination in a half-written state.
         let dest_path = std::path::Path::new(output);
         let temp_path = crate::handler::high_level::partial_path(dest_path);
-        let bytes_written =
-            match crate::handler::high_level::write_response_stream(&mut resp, &temp_path).await {
-                Ok(n) => n,
-                Err(err) => {
-                    let _ = std::fs::remove_file(&temp_path);
-                    return Err(err);
+        let retry_temp_path = temp_path.clone();
+        let download_result = core::send_object_request_with_consumer(
+            client,
+            core::ReplayableObjectBytesRequest {
+                method: Method::GET,
+                bucket: &bucket,
+                key: &key,
+                query,
+                headers,
+                body: None,
+            },
+            move |response| {
+                let attempt_temp_path = retry_temp_path.clone();
+                async move {
+                    let request_id = core::extract_request_id(&response);
+                    let response_headers = core::extract_headers(&response);
+                    let mut response = client.check_response(response).await?;
+                    let bytes_written = crate::handler::high_level::write_response_stream(
+                        &mut response,
+                        &attempt_temp_path,
+                    )
+                    .await?;
+                    Ok((request_id, response_headers, bytes_written))
                 }
-            };
+            },
+        )
+        .await;
+        if download_result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        let (request_id, response_headers, bytes_written) = download_result?;
         if let Err(err) = std::fs::rename(&temp_path, dest_path) {
             let _ = std::fs::remove_file(&temp_path);
             return Err(CliError::Io(err));
@@ -442,15 +463,34 @@ async fn handle_download(
     // response by Content-Type and return base64 for binary bodies, while
     // still streaming the body into memory in bounded chunks. Operators that
     // want zero-copy behavior MUST pass `--body <path>` or `--body -`.
+    let (request_id, status_code, response_headers, buffer) =
+        core::send_object_request_with_consumer(
+            client,
+            core::ReplayableObjectBytesRequest {
+                method: Method::GET,
+                bucket: &bucket,
+                key: &key,
+                query,
+                headers,
+                body: None,
+            },
+            |response| async move {
+                let request_id = core::extract_request_id(&response);
+                let status_code = response.status().as_u16();
+                let response_headers = core::extract_headers(&response);
+                let mut response = client.check_response(response).await?;
+                let mut buffer = Vec::new();
+                while let Some(chunk) = response.chunk().await.map_err(CliError::Http)? {
+                    buffer.extend_from_slice(&chunk);
+                }
+                Ok((request_id, status_code, response_headers, buffer))
+            },
+        )
+        .await?;
     let content_type = response_headers
         .get("content-type")
-        .map(String::as_str)
-        .unwrap_or("");
+        .map_or("", String::as_str);
     let is_textual = is_textual_content_type(content_type);
-    let mut buffer: Vec<u8> = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(CliError::Http)? {
-        buffer.extend_from_slice(&chunk);
-    }
 
     let (body_format, body_value) = if is_textual {
         match String::from_utf8(buffer.clone()) {
@@ -473,7 +513,7 @@ async fn handle_download(
     let envelope = tos_core::agent::envelope::Envelope::success(
         "ve-tos object download",
         RawResponseData {
-            status_code: 200,
+            status_code,
             headers: response_headers,
             body_format: Some(body_format),
             body: Some(body_value),
@@ -537,8 +577,9 @@ async fn handle_form_upload(
         .unwrap_or("upload");
 
     // [Review Fix] PostObject requires form-based signing (not header-based V4).
-    // Step 1: Prepare credential/date/algorithm for policy construction
-    let prep = client.form_prepare();
+    // Step 1: Resolve one signer, then reuse it for policy preparation and signing.
+    let form_auth = client.prepare_form_auth().await?;
+    let prep = form_auth.prepare();
 
     // Step 2: Build policy JSON with expiration and conditions
     let expiration = (chrono::Utc::now() + chrono::Duration::minutes(5))
@@ -575,7 +616,7 @@ async fn handle_form_upload(
     };
 
     // Step 3: Compute the real signature over the base64 policy
-    let signature = client.form_sign(&prep.date_short, &policy_base64);
+    let signature = form_auth.sign(&prep.date_short, &policy_base64);
 
     // Step 4: Build multipart/form-data body
     let boundary = format!(
@@ -642,8 +683,8 @@ async fn handle_form_upload(
         .await?;
 
     // Step 6: Check response through the standard error-handling path
-    let resp = client.check_response(response).await?;
-    let response_body = resp.text().await.unwrap_or_default();
+    let response = client.check_response(response).await?;
+    let response_body = response.text().await.unwrap_or_default();
     let envelope = tos_core::agent::envelope::Envelope::success(
         "ve-tos object form-upload",
         if response_body.is_empty() {

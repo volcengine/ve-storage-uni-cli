@@ -16,5 +16,7 @@
 
 pub mod auth;
 pub mod client;
+pub mod oauth;
 pub mod rate_limiter;
+pub mod token_manager;
 pub mod types;

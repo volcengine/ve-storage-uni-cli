@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use crate::cli::low_level::*;
 use crate::domain::core;
 use crate::handler::common::{
-    build_profile, ensure_force_for_destructive, output_result, read_body_input,
+    build_runtime, ensure_force_for_destructive, output_result, read_body_input,
 };
 use reqwest::Method;
 use serde::Serialize;
@@ -32,7 +32,6 @@ use tos_core::agent::dryrun::{DryRunResult, Impact};
 use tos_core::agent::envelope::Envelope;
 use tos_core::agent::error::CliError;
 use tos_core::agent::global_args::GlobalArgs;
-use tos_core::infra::client::TosClient;
 
 #[derive(Clone, Copy, Debug, Serialize)]
 enum EndpointKind {
@@ -254,11 +253,11 @@ where
             "`{group}` requires a subcommand; use `{group} --help` or `{group} --describe`"
         )));
     };
-    let profile = build_profile(global)?;
+    let runtime = build_runtime(global)?;
     // [Review Fix #4] Advanced control-plane APIs often model region as an
     // explicit query parameter. The CLI flag wins, but a configured/env region
     // must still satisfy that request field when --region is omitted.
-    let op = op_builder(action, profile.region.as_deref())?;
+    let op = op_builder(action, runtime.profile.region.as_deref())?;
     if op.spec.has_body && op.body.is_none() {
         return Err(CliError::ValidationError(format!(
             "{} requires --config for JSON body",
@@ -274,7 +273,7 @@ where
         ensure_force_for_destructive(global, op.force, op.spec.command, &op.target)?;
     }
 
-    let client = TosClient::new(&profile, "tos")?;
+    let client = runtime.client(global, "tos")?;
     let result = match op.spec.endpoint {
         EndpointKind::DataPlane => {
             let bucket = op.bucket.as_deref().ok_or_else(|| {

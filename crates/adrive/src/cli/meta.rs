@@ -110,7 +110,7 @@ pub enum SkillAction {
 #[command(
     about = "Inspect and modify A-Drive CLI configuration",
     long_about = "Inspect and modify A-Drive CLI configuration stored in ~/.tos/config.toml.",
-    after_help = "Examples:\n  ve-adrive-cli config init\n  ve-adrive-cli config show\n  ve-adrive-cli config set region cn-beijing\n  ve-adrive-cli config set default.adrive.endpoint https://ids-cn-beijing.volces.com\n  ve-adrive-cli config set max_retry_count 3\n  ve-adrive-cli config set requesttimeout 60"
+    after_help = "Examples:\n  ve-adrive-cli config init\n  ve-adrive-cli config show\n  ve-adrive-cli config set auth_mode unified\n  ve-adrive-cli config set region cn-beijing\n  ve-adrive-cli config set default.adrive.endpoint https://ids-cn-beijing.volces.com\n  ve-adrive-cli config set max_retry_count 3\n  ve-adrive-cli config set requesttimeout 300"
 )]
 pub struct ConfigCommand {
     #[command(subcommand)]
@@ -128,7 +128,7 @@ pub enum ConfigAction {
     Show,
     /// Set a configuration value
     #[command(
-        after_help = "Supported KEY values:\n  auth_mode / region / endpoint / access_key_id / secret_access_key / security_token\n  account_id / default_instance / default_space\n  checkpoint_dir / batch_report_dir / batch_report_format / progress_enabled\n  max_retry_count / requesttimeout / connecttimeout / maxconnections\n\nExamples:\n  ve-adrive-cli config set auth_mode oauth\n  ve-adrive-cli config set region cn-beijing\n  ve-adrive-cli config set endpoint https://ids-cn-beijing.volces.com\n  ve-adrive-cli config set max_retry_count 3\n  ve-adrive-cli config set requesttimeout 60"
+        after_help = "Supported KEY values:\n  auth_mode (aksk, oauth, or unified) / region / endpoint / auth_endpoint\n  access_key_id / secret_access_key / security_token\n  account_id / default_instance / default_space\n  checkpoint_dir / batch_report_dir / batch_report_format / progress_enabled\n  max_retry_count / requesttimeout / connecttimeout / maxconnections\n\nBare access_key_id / secret_access_key / security_token keys write to [active-profile.adrive] in credentials.toml. Unified ignores those local credentials, selects the same-name external profile, and uses `ve login`.\n\nExamples:\n  ve-adrive-cli config set auth_mode oauth\n  ve-adrive-cli config set auth_mode unified\n  ve-adrive-cli config set auth_endpoint https://idsauth.volces.com\n  ve-adrive-cli config set access_key_id AKxxx\n  ve-adrive-cli config set region cn-beijing\n  ve-adrive-cli config set endpoint https://ids-cn-beijing.volces.com\n  ve-adrive-cli config set max_retry_count 3\n  ve-adrive-cli config set requesttimeout 300"
     )]
     Set { key: String, value: String },
 }
@@ -145,7 +145,7 @@ pub struct CompletionArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    long_about = "Start the ADrive MCP server from the same registry-backed skill definitions used by `skill list`.\n\n`stdio` is the default MCP transport for clients that spawn the CLI as a child process. `sse` starts a local HTTP/SSE listener on 127.0.0.1:<port> with rmcp's standard `/sse` and `/message` endpoints. `--dry-run` and `--describe` report the startup plan without launching a long-lived server.",
+    long_about = "Start the ADrive MCP server from the same registry-backed skill definitions used by `skill list`.\n\n`stdio` is the default MCP transport for clients that spawn the CLI as a child process. `sse` is same-host only and listens on 127.0.0.1:<port>. After binding, it prints a fresh Bearer token once to stderr. Every `/sse` and `/message` request must send it in the Authorization header; URL/query credentials are rejected. The Host header must be exact `127.0.0.1:<port>` or `localhost:<port>`. Native clients may omit Origin; when the Origin header is present, it must be the matching HTTP loopback origin on the same port. `--dry-run` and `--describe` report this startup contract without generating a token or launching a server.",
     after_help = "Examples:\n  ve-adrive-cli serve --mcp\n  ve-adrive-cli serve --mcp --transport sse --port 9090\n  ve-adrive-cli serve --mcp --dry-run --output json\n\nMCP usage:\n  Tool names come from skills, e.g. `ve_adrive_ls` for `ve-adrive ls` and `ve_adrive_cp` for `ve-adrive cp`.\n  `tools/call` plans by default; pass argument `execute: true` to run the underlying CLI command."
 )]
 pub struct ServeArgs {
@@ -156,7 +156,12 @@ pub struct ServeArgs {
     #[arg(long, default_value = "stdio", value_parser = ["stdio", "sse"])]
     pub transport: String,
     /// Port for SSE transport
-    #[arg(long, default_value = "8080")]
+    // [Review Fix #7] Port zero cannot describe the OS-selected listener port consistently.
+    #[arg(
+        long,
+        default_value = "8080",
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
     pub port: u16,
 }
 
