@@ -1115,15 +1115,19 @@ pub async fn handle_high_level_command(
     if global.describe {
         // [Review Fix #RebaseDescribe] --describe must be parameter-independent;
         // do not build the executable operation before registry metadata lookup.
-        let mut desc = describe_command_metadata(tos_high_level_command_path(command))
-            .or_else(|| {
+        let mut desc = if active_tos_config_binary() == Binary::Tos {
+            // [Review Fix #20] Parse recovery and parsed commands must render
+            // the same ByteTOS contract from one metadata builder.
+            let public_command = public_high_level_command(tos_high_level_command_path(command));
+            describe_byte_tos_high_level_command(&public_command)
+        } else {
+            describe_command_metadata(tos_high_level_command_path(command)).or_else(|| {
                 build_operation(command)
                     .ok()
                     .map(|operation| describe_operation(&operation))
             })
-            .ok_or_else(|| {
-                CliError::ValidationError("unsupported high-level command".to_string())
-            })?;
+        }
+        .ok_or_else(|| CliError::ValidationError("unsupported high-level command".to_string()))?;
         desc.command = public_high_level_command(&desc.command);
         output_result(global, &Envelope::success(desc.command.clone(), desc))?;
         return Ok(0);
@@ -1171,6 +1175,368 @@ pub async fn handle_high_level_command(
     }
 
     execute_high_level_command(global, command).await
+}
+
+/// Describe a public ByteTOS high-level command without requiring operands.
+///
+/// `command` is a `tos <subcommand>` path. Returns `None` when the shared
+/// registry has no matching high-level command; this function does no IO.
+pub fn describe_byte_tos_high_level_command(
+    command: &str,
+) -> Option<tos_core::agent::describe::CommandDescription> {
+    let suffix = command.strip_prefix("tos ")?;
+    // [Review Fix #22] Recovery also probes utilities; only high-level
+    // commands may reuse the shared high-level registry projection.
+    if !matches!(
+        suffix,
+        "cp" | "mv"
+            | "sync"
+            | "mkdir"
+            | "rm"
+            | "ls"
+            | "stat"
+            | "du"
+            | "find"
+            | "cat"
+            | "put"
+            | "presign"
+    ) {
+        return None;
+    }
+    let shared_command = format!("ve-tos {suffix}");
+    let mut desc = describe_command_metadata(&shared_command)?;
+    desc.command = command.to_string();
+    adapt_byte_tos_description(&mut desc);
+    let mut auth_parameter = tos_core::infra::byte_tos_auth::byte_tos_auth_parameter();
+    if command == "tos presign" {
+        // [Review Fix #4] Presign remains AK/SK-only even though tos accepts ZTI elsewhere.
+        auth_parameter.description =
+            "ByteTOS presign requires AK/SK; ZTI is not supported".to_string();
+        auth_parameter.schema =
+            Some(serde_json::json!({"type": "string", "enum": ["aksk"], "default": "aksk"}));
+    }
+    desc.parameters
+        .get_or_insert_with(Vec::new)
+        .push(auth_parameter);
+    Some(desc)
+}
+
+fn adapt_byte_tos_description(desc: &mut tos_core::agent::describe::CommandDescription) {
+    let tos_prefix = std::env::var("VE_STORAGE_UNI_BYTED_TOS_EXAMPLE_PREFIX")
+        .unwrap_or_else(|_| "tos-cli".to_string());
+    // [Review Fix #17] Shared ve-tos examples contain literal placeholders,
+    // and cat emits raw bytes rather than the JSON Envelope they suggest.
+    desc.output_filter_examples =
+        byte_tos_filter_example(&desc.command, &tos_prefix).map(|example| vec![example]);
+    // [Review Fix #24] Match the dedicated ByteTOS capability descriptions
+    // across parsed and recovered metadata, including the presign boundary.
+    if let Some(description) = byte_tos_command_description(&desc.command) {
+        desc.description = description.to_string();
+    }
+    // ByteTOS has no low-level command entrypoints, while the OpenAPI list
+    // remains available through low_level_apis/wraps_apis.
+    desc.related_commands = None;
+    // [Review Fix #19] The shared registry lists ve-tos actions, including
+    // composite names and service-level calls ByteTOS does not execute.
+    if let Some(actions) = byte_tos_api_actions(&desc.command) {
+        let actions = actions
+            .iter()
+            .map(|action| (*action).to_string())
+            .collect::<Vec<_>>();
+        desc.api = Some(actions.join(" + "));
+        desc.low_level_apis = Some(actions.clone());
+        desc.wraps_apis = Some(actions);
+    }
+    if desc.command == "tos rm" {
+        adapt_byte_tos_rm_parameters(desc);
+    }
+    adapt_byte_tos_shared_parameters(desc);
+    if let Some(routing) = &mut desc.scenario_routing {
+        match desc.command.as_str() {
+            "tos ls" => {
+                routing.insert(
+                    "target_matrix".to_string(),
+                    "bucket or prefix target -> ListObjectsType2; bucket is required".to_string(),
+                );
+                routing.insert("output_shapes".to_string(), "JSON object listing uses raw data.objects/data.common_prefixes; table/csv render a synthesized typed row view".to_string());
+            }
+            "tos rm" => {
+                // [Review Fix #28] ByteTOS has no HNS direct mode; ordinary,
+                // versioned, and multipart cleanup have distinct list APIs.
+                routing.insert(
+                    "recursive_delete".to_string(),
+                    "recursive delete lists objects; --all-versions lists object versions and delete markers; --include-uploads lists incomplete multipart uploads before planned deletion"
+                        .to_string(),
+                );
+                routing.insert("target_scope".to_string(), "rm accepts object or prefix targets only; bucket deletion is unavailable in tos".to_string());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn byte_tos_command_description(command: &str) -> Option<&'static str> {
+    Some(match command {
+        "tos cp" => "Copy local files, TOS objects, or prefixes",
+        "tos mv" => "Move files or objects by copy plus source delete",
+        "tos sync" => "Synchronize source and destination incrementally",
+        "tos mkdir" => "Create a folder marker",
+        "tos rm" => "Delete objects or prefixes",
+        "tos ls" => "List object prefixes or objects within a bucket",
+        "tos stat" => "Show bucket or object metadata",
+        "tos du" => "Calculate size statistics for a prefix",
+        "tos find" => "Find objects by filters",
+        "tos cat" => "Stream object content",
+        "tos put" => "Upload stdin to an object",
+        "tos presign" => "Generate presigned URL (AK/SK only; ZTI is not supported)",
+        _ => return None,
+    })
+}
+
+fn byte_tos_api_actions(command: &str) -> Option<&'static [&'static str]> {
+    const TRANSFER: &[&str] = &[
+        "HeadBucket",
+        "ListObjectsType2",
+        "HeadObject",
+        "GetObject",
+        "PutObject",
+        "CopyObject",
+        "CreateMultipartUpload",
+        "UploadPart",
+        "UploadPartCopy",
+        "ListParts",
+        "CompleteMultipartUpload",
+    ];
+    const TRANSFER_WITH_DELETE: &[&str] = &[
+        "HeadBucket",
+        "ListObjectsType2",
+        "HeadObject",
+        "GetObject",
+        "PutObject",
+        "CopyObject",
+        "CreateMultipartUpload",
+        "UploadPart",
+        "UploadPartCopy",
+        "ListParts",
+        "CompleteMultipartUpload",
+        "DeleteObject",
+    ];
+    Some(match command {
+        "tos cp" => TRANSFER,
+        "tos mv" | "tos sync" => TRANSFER_WITH_DELETE,
+        "tos mkdir" => &["PutObject"],
+        "tos rm" => &[
+            "HeadBucket",
+            "DeleteObject",
+            "ListObjectsType2",
+            "ListObjectVersions",
+            "ListMultipartUploads",
+            "AbortMultipartUpload",
+        ],
+        "tos ls" | "tos find" => &["ListObjectsType2"],
+        "tos du" => &["HeadBucket", "ListObjectsType2"],
+        "tos stat" => &["HeadBucket", "HeadObject"],
+        "tos cat" => &["GetObject"],
+        "tos put" => &[
+            "PutObject",
+            "CreateMultipartUpload",
+            "UploadPart",
+            "CompleteMultipartUpload",
+            "AbortMultipartUpload",
+        ],
+        "tos presign" => &["Presign"],
+        _ => return None,
+    })
+}
+
+fn byte_tos_filter_example(command: &str, prefix: &str) -> Option<String> {
+    let suffix = match command {
+        "tos cp" => "cp ./file.txt tos://bucket/file.txt --dry-run --query 'data'",
+        "tos mv" => "mv tos://bucket/old.txt tos://bucket/new.txt --dry-run --query 'data'",
+        "tos sync" => "sync ./dir/ tos://bucket/dir/ --dry-run --query 'data'",
+        "tos mkdir" => "mkdir tos://bucket/folder/ --dry-run --query 'data'",
+        "tos rm" => "rm tos://bucket/key --dry-run --query 'data'",
+        "tos ls" => "ls tos://bucket/ --query 'data'",
+        "tos stat" => "stat tos://bucket/key --query 'data'",
+        "tos du" => "du tos://bucket/ --query 'data'",
+        "tos find" => "find tos://bucket/ --query 'data'",
+        "tos cat" => "cat tos://bucket/key | head -c 1024",
+        "tos put" => "put tos://bucket/key --dry-run --query 'data'",
+        "tos presign" => "presign tos://bucket/key --dry-run --query 'data'",
+        _ => return None,
+    };
+    Some(format!("{prefix} {suffix}"))
+}
+
+fn adapt_byte_tos_rm_parameters(desc: &mut tos_core::agent::describe::CommandDescription) {
+    use tos_core::agent::describe::{CommandParameter, ParameterLocation};
+
+    let parameters = desc.parameters.get_or_insert_with(Vec::new);
+    // [Review Fix #4] ByteTOS has no HNS delete strategy, but does expose
+    // version and multipart cleanup flags absent from the shared ve-tos row.
+    parameters.retain(|parameter| parameter.name != "recursive-delete-mode");
+    for (name, description) in [
+        (
+            "all-versions",
+            "Delete every object version and delete marker",
+        ),
+        (
+            "include-uploads",
+            "Also abort incomplete multipart uploads matching the prefix",
+        ),
+    ] {
+        parameters.push(CommandParameter {
+            name: name.to_string(),
+            location: ParameterLocation::Flag,
+            required: false,
+            description: description.to_string(),
+            schema: Some(serde_json::json!({"type": "boolean"})),
+        });
+    }
+}
+
+fn adapt_byte_tos_shared_parameters(desc: &mut tos_core::agent::describe::CommandDescription) {
+    let Some(parameters) = desc.parameters.as_mut() else {
+        return;
+    };
+    // [Review Fix #27] ByteTOS accepts --bucket/--key instead of the URI path
+    // for object-target commands; the shared ve-tos row marks path mandatory.
+    if let Some(path) = parameters
+        .iter_mut()
+        .find(|parameter| parameter.name == "path")
+    {
+        path.required = false;
+        path.description = if matches!(
+            desc.command.as_str(),
+            "tos mkdir" | "tos cat" | "tos put" | "tos presign"
+        ) {
+            "Optional tos://bucket/key target; alternatively use --bucket and --key"
+        } else {
+            "Optional tos://bucket/key or tos://bucket/prefix target; alternatively use --bucket with optional --key"
+        }
+        .to_string();
+    }
+    // [Review Fix #9] The ByteTOS parser rejects these ve-tos options, so
+    // describe must not claim that they are executable on the tos surface.
+    if matches!(
+        desc.command.as_str(),
+        "tos cp" | "tos mv" | "tos sync" | "tos put" | "tos find"
+    ) {
+        parameters.retain(|parameter| parameter.name != "storage-class");
+    }
+    // [Review Fix #12] The shared ve-tos registry includes flags that the
+    // ByteTOS clap arguments do not accept for these commands.
+    if desc.command == "tos mv" {
+        parameters.retain(|parameter| parameter.name != "checkpoint");
+    }
+    if desc.command == "tos mkdir" {
+        parameters.retain(|parameter| parameter.name != "content-type");
+    }
+    if matches!(
+        desc.command.as_str(),
+        "tos cp" | "tos mv" | "tos sync" | "tos rm"
+    ) {
+        if let Some(parameter) = parameters
+            .iter_mut()
+            .find(|parameter| parameter.name == "recursive-list-mode")
+        {
+            parameter.description = "Recursive listing mode: hierarchical only".to_string();
+            parameter.schema =
+                Some(serde_json::json!({"type": "string", "enum": ["hierarchical"]}));
+        }
+    }
+    add_byte_tos_missing_parameters(&desc.command, parameters);
+}
+
+fn add_byte_tos_missing_parameters(
+    command: &str,
+    parameters: &mut Vec<tos_core::agent::describe::CommandParameter>,
+) {
+    use tos_core::agent::describe::{CommandParameter, ParameterLocation};
+
+    // [Review Fix #16] The shared ve-tos registry omits several clap flags
+    // that ByteTOS capabilities and the executable parser already expose.
+    let extras: &[&str] = match command {
+        "tos cp" => &[
+            "bandwidth-limit",
+            "checkpoint-threshold",
+            "content-type",
+            "multipart-concurrency",
+            "no-clobber",
+            "overwrite-strategy",
+            "progress-granularity",
+        ],
+        "tos mv" => &[
+            "checkpoint-threshold",
+            "confirm",
+            "content-type",
+            "multipart-concurrency",
+            "overwrite-strategy",
+            "progress-granularity",
+        ],
+        "tos sync" => &[
+            "bandwidth-limit",
+            "checkpoint-threshold",
+            "confirm",
+            "content-type",
+            "multipart-concurrency",
+            "overwrite-strategy",
+            "progress-granularity",
+        ],
+        "tos rm" => &["bucket", "confirm", "key"],
+        "tos ls" | "tos stat" | "tos du" | "tos find" | "tos cat" | "tos put" | "tos presign" => {
+            &["bucket", "key"]
+        }
+        _ => &[],
+    };
+    for name in extras {
+        let (description, schema) = byte_tos_extra_parameter_metadata(name);
+        parameters.push(CommandParameter {
+            name: (*name).to_string(),
+            location: if *name == "content-type" {
+                ParameterLocation::Header
+            } else {
+                ParameterLocation::Flag
+            },
+            required: false,
+            description: description.to_string(),
+            schema,
+        });
+    }
+}
+
+fn byte_tos_extra_parameter_metadata(name: &str) -> (&'static str, Option<serde_json::Value>) {
+    match name {
+        "bandwidth-limit" => ("Throttle upload/download bandwidth, e.g. 100MB", None),
+        "checkpoint-threshold" => (
+            "File size threshold for checkpoint multipart/range transfer",
+            None,
+        ),
+        "content-type" => ("Content-Type for uploaded or copied objects", None),
+        "multipart-concurrency" => (
+            "Maximum parts/ranges running concurrently for one large file",
+            None,
+        ),
+        "no-clobber" => (
+            "Fail when the destination already exists",
+            Some(serde_json::json!({"type": "boolean"})),
+        ),
+        "overwrite-strategy" => (
+            "Destination overwrite strategy",
+            Some(serde_json::json!({"type": "string", "enum": ["force", "no-clobber", "newer"]})),
+        ),
+        "progress-granularity" => (
+            "Progress granularity: part or byte",
+            Some(serde_json::json!({"type": "string", "enum": ["part", "byte"]})),
+        ),
+        "confirm" => (
+            "Exact target confirmation for non-interactive destructive commands",
+            None,
+        ),
+        "bucket" => ("Bucket name when URI style is not used", None),
+        "key" => ("Object key or prefix when URI style is not used", None),
+        _ => unreachable!("byte_tos_extra_parameter_metadata only receives known names"),
+    }
 }
 
 async fn execute_high_level_command(
@@ -16368,6 +16734,12 @@ fn validate_tos_uri(uri: &str, allow_bucket_only: bool) -> Result<(), CliError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_tos_high_level_describe_does_not_claim_utility_commands() {
+        assert!(describe_byte_tos_high_level_command("tos cp").is_some());
+        assert!(describe_byte_tos_high_level_command("tos config show").is_none());
+    }
 
     #[test]
     fn runtime_controls_use_supplied_profile_snapshot() {

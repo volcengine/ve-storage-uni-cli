@@ -1348,6 +1348,8 @@ fn export_markdown_skills(
         }
     }
 
+    // [Review Fix #Skill6] Build parser metadata once rather than once per file.
+    let root = tos_core::agent::skill_markdown::command_tree::<crate::cli::ADriveCommand>();
     let mut files = Vec::new();
     let skills = export_plan
         .iter()
@@ -1366,7 +1368,7 @@ fn export_markdown_skills(
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, skill_markdown(&skill, language))?;
+        fs::write(&path, skill_markdown(&skill, language, &root))?;
         files.push(path.display().to_string());
     }
 
@@ -1400,12 +1402,15 @@ fn skill_index_markdown(
     for skill in skills {
         domains.entry(&skill.domain).or_default().push(skill);
     }
+    let public_surface = public_adrive_example(&format!("{surface} "))
+        .trim()
+        .to_string();
     let mut body = match language {
         DocumentationLanguage::En => format!(
-            "# {surface} skills\n\nUse this skill pack when the user wants to operate `{surface}` commands. Select a domain below, then use the nested command skill.\n\n"
+            "# {surface} skills\n\nUse this skill pack when the user wants to operate `{public_surface}` commands. Select a domain below, then use the nested command skill.\n\n"
         ),
         DocumentationLanguage::Zh => format!(
-            "# {surface} Skills\n\n当用户需要操作 `{surface}` 命令时使用此 Skill 包。先按领域选择，再进入对应的命令 Skill。\n\n"
+            "# {surface} Skills\n\n当用户需要操作 `{public_surface}` 命令时使用此 Skill 包。先按领域选择，再进入对应的命令 Skill。\n\n"
         ),
     };
     for (domain, skills) in domains {
@@ -1417,110 +1422,62 @@ fn skill_index_markdown(
             };
             body.push_str(&format!(
                 "- [{}](./{}/{}/SKILL.md): `{}` - {}\n",
-                skill.name, skill.domain, skill.name, skill.command, description
+                skill.name,
+                skill.domain,
+                skill.name,
+                public_adrive_example(&skill.command),
+                description
             ));
         }
         body.push('\n');
     }
-    body
+    let description = match language {
+        DocumentationLanguage::En => format!(
+            "Use when operating {public_surface}; select a command reference from this index."
+        ),
+        DocumentationLanguage::Zh => {
+            format!("当用户需要使用 {public_surface} 时，先从此索引选择对应命令。")
+        }
+    };
+    tos_core::agent::skill_markdown::frontmatter(&format!("{surface}-commands"), &description)
+        + &body
 }
 
-fn skill_markdown(skill: &SkillDefinition, language: DocumentationLanguage) -> String {
-    let examples = if skill.examples.is_empty() {
-        match language {
-            DocumentationLanguage::En => {
-                "- Run with `--describe` first to inspect the command contract.".to_string()
-            }
-            DocumentationLanguage::Zh => {
-                "- 先运行 `--describe` 检查命令契约，再决定是否执行。".to_string()
-            }
-        }
+fn skill_markdown(
+    skill: &SkillDefinition,
+    language: DocumentationLanguage,
+    root: &clap::Command,
+) -> String {
+    use tos_core::agent::skill_markdown::{render, CommandSkill};
+
+    let is_chinese = matches!(language, DocumentationLanguage::Zh);
+    let description = if is_chinese {
+        localized_skill_description_zh(skill)
     } else {
-        skill
-            .examples
-            .iter()
-            .map(|example| format!("- `{example}`"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        skill.description.clone()
     };
-    let input_schema = localized_input_schema(&skill.input_schema, language);
-    let schema = serde_json::to_string_pretty(&input_schema).unwrap_or_else(|_| "{}".to_string());
-    match language {
-        DocumentationLanguage::En => format!(
-            r#"# {name}
-
-Use this skill when the user wants to run `{command}` with the Volcano Engine ADrive CLI.
-
-## Description
-
-{description}
-
-## Command
-
-`{command}`
-
-Risk level: `{risk_level}`
-
-## Inputs
-
-```json
-{schema}
-```
-
-## Examples
-
-{examples}
-
-## Execution
-
-Prefer `{public_command} --describe` or `{public_command} --dry-run --output json` before executing a command that writes or deletes data. Destructive commands must include the required `--force` and exact `--confirm` target.
-"#,
-            name = skill.name,
-            command = skill.command,
-            description = skill.description,
-            risk_level = skill.risk_level,
-            schema = schema,
-            examples = examples,
-            public_command = public_adrive_command(&skill.command),
-        ),
-        DocumentationLanguage::Zh => format!(
-            r#"# {name}
-
-当用户需要通过火山引擎 ADrive CLI 运行 `{command}` 时使用此 Skill。
-
-## 说明
-
-{description}
-
-## 命令
-
-`{command}`
-
-风险等级：`{risk_level}`
-
-## 输入
-
-```json
-{schema}
-```
-
-## 示例
-
-{examples}
-
-## 执行建议
-
-执行会写入或删除数据的命令前，优先运行 `{public_command} --describe` 或 `{public_command} --dry-run --output json`。破坏性命令必须包含必需的 `--force` 和精确匹配目标的 `--confirm`。
-"#,
-            name = skill.name,
-            command = skill.command,
-            description = localized_skill_description_zh(skill),
-            risk_level = skill.risk_level,
-            schema = schema,
-            examples = examples,
-            public_command = public_adrive_command(&skill.command),
-        ),
-    }
+    // [Review Fix #Skill2] Resolve every displayed command at export time;
+    // canonical registry IDs and MCP names remain stable across entrypoints.
+    let public_command = public_adrive_example(&skill.command);
+    let examples = skill
+        .examples
+        .iter()
+        .map(|example| public_adrive_example(example))
+        .collect::<Vec<_>>();
+    let schema = localized_input_schema(&skill.input_schema, language);
+    render(
+        &CommandSkill {
+            name: &skill.name,
+            command: &skill.command,
+            public_command: &public_command,
+            description: &description,
+            risk: &skill.risk_level,
+            schema: &schema,
+            examples: &examples,
+            is_chinese,
+        },
+        root,
+    )
 }
 
 /// Handle ADrive config.

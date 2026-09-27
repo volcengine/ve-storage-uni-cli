@@ -15,6 +15,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RELEASE_SCRIPT = REPO_ROOT / "packaging" / "scripts" / "release.py"
+ARCHIVES_SCRIPT = REPO_ROOT / "packaging" / "scripts" / "archives.py"
 PUBLIC_CLI_PACKAGES = ("ve-tos-cli", "tos-cli", "ve-adrive-cli")
 PIP_PACKAGES = ("ve-tos-cli", "tos-cli", "byted-tos-cli", "ve-adrive-cli")
 
@@ -25,6 +26,26 @@ def load_release_module():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def load_archives_module():
+    spec = importlib.util.spec_from_file_location("archives_script", ARCHIVES_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_release_tar_archive_contains_each_binary_once(tmp_path):
+    archives = load_archives_module()
+    stage_dir = tmp_path / "stage"
+    bin_dir = stage_dir / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "tos-cli").write_text("binary", encoding="utf-8")
+    archive_path = tmp_path / "release.tar.gz"
+    archives.make_archive(stage_dir, archive_path)
+    with tarfile.open(archive_path, "r:gz") as archive:
+        assert archive.getnames().count("bin/tos-cli") == 1
 
 
 def current_shell_installer_triple() -> str | None:
@@ -243,6 +264,24 @@ def test_packaging_readme_documents_github_release_upload_and_release_phases():
     assert readme.index("release.py github-release") > readme.index("### 3. Publish package registries")
 
 
+def test_packaging_readme_documents_public_zti_platform_and_release_checks():
+    readme = (REPO_ROOT / "packaging" / "README.md").read_text(encoding="utf-8")
+    section = readme.split("## ByteCloud TOS ZTI release contract", 1)[1].split(
+        "## What Solves What", 1
+    )[0]
+    for required in (
+        "no private ZTI",
+        "--locked",
+        "SEC_TOKEN_STRING",
+        "SEC_TOKEN_PATH",
+        "Windows",
+        "presign",
+        "--skip-build",
+        "native CI runners",
+    ):
+        assert required in section
+
+
 def test_root_readme_is_user_facing_and_points_release_docs_to_packaging():
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
@@ -444,6 +483,7 @@ def test_release_builds_three_public_entry_crates(monkeypatch):
             "cargo",
             "build",
             "--release",
+            "--locked",
             "--target",
             "x86_64-apple-darwin",
             "--manifest-path",
@@ -453,6 +493,7 @@ def test_release_builds_three_public_entry_crates(monkeypatch):
             "cargo",
             "build",
             "--release",
+            "--locked",
             "--target",
             "x86_64-apple-darwin",
             "--manifest-path",
@@ -462,12 +503,121 @@ def test_release_builds_three_public_entry_crates(monkeypatch):
             "cargo",
             "build",
             "--release",
+            "--locked",
             "--target",
             "x86_64-apple-darwin",
             "--manifest-path",
             "packaging/cargo/ve-adrive-cli/Cargo.toml",
         ),
     ]
+
+
+def test_native_release_guard_rejects_missing_zti(tmp_path, monkeypatch):
+    release = load_release_module()
+    binary_dir = tmp_path / "release"
+    binary_dir.mkdir()
+    (binary_dir / "tos-cli").write_text("binary", encoding="utf-8")
+    monkeypatch.setattr(release, "native_target_matches_host", lambda target: True)
+    monkeypatch.setattr(release, "entry_release_dir", lambda name, target: binary_dir)
+    response = {
+        "data": {
+            "authentication": {
+                "modes": ["aksk"],
+                "zti_built_in": False,
+                "zti_presign_supported": False,
+            }
+        }
+    }
+    monkeypatch.setattr(
+        release.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, json.dumps(response), ""
+        ),
+    )
+
+    with pytest.raises(SystemExit, match="built-in ZTI"):
+        release.verify_native_bytetos_auth("aarch64-apple-darwin")
+
+
+def test_native_target_match_rejects_other_architectures_and_musl(monkeypatch):
+    release = load_release_module()
+    monkeypatch.setattr(release.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(release.platform, "machine", lambda: "arm64")
+    assert release.native_target_matches_host("aarch64-apple-darwin")
+    assert not release.native_target_matches_host("x86_64-apple-darwin")
+    monkeypatch.setattr(release.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(release.platform, "libc_ver", lambda: ("musl", "1.2"))
+    assert not release.native_target_matches_host("aarch64-unknown-linux-gnu")
+    monkeypatch.setattr(release.platform, "libc_ver", lambda: ("glibc", "2.39"))
+    assert release.native_target_matches_host("aarch64-unknown-linux-gnu.2.17")
+    monkeypatch.setattr(release.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(release.platform, "machine", lambda: "AMD64")
+    assert release.native_target_matches_host("x86_64-pc-windows-msvc")
+    assert not release.native_target_matches_host("aarch64-pc-windows-msvc")
+
+
+def test_native_release_guard_accepts_public_zti_and_skips_cross_target(tmp_path, monkeypatch):
+    release = load_release_module()
+    binary_dir = tmp_path / "release"
+    binary_dir.mkdir()
+    (binary_dir / "tos-cli").write_text("binary", encoding="utf-8")
+    monkeypatch.setattr(release, "entry_release_dir", lambda name, target: binary_dir)
+    calls = []
+    response = {
+        "data": {
+            "authentication": {
+                "default": "aksk",
+                "modes": ["aksk", "zti"],
+                "zti_built_in": True,
+                "precedence": [
+                    "command_line", "profile.tos.auth_mode", "BYTETOS_AUTH_MODE", "aksk"
+                ],
+                "zti_fallback_to_aksk": False,
+                "zti_presign_supported": False,
+                "zti_sources": ["SEC_TOKEN_STRING", "local_agent", "SEC_TOKEN_PATH"],
+            }
+        }
+    }
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, json.dumps(response), "")
+
+    monkeypatch.setattr(release.subprocess, "run", fake_run)
+    monkeypatch.setattr(release, "native_target_matches_host", lambda target: True)
+    release.verify_native_bytetos_auth("aarch64-apple-darwin")
+    assert calls[0][1:] == ["--describe", "--output", "json"]
+    monkeypatch.setattr(release, "native_target_matches_host", lambda target: False)
+    release.verify_native_bytetos_auth("x86_64-pc-windows-msvc")
+    assert len(calls) == 1
+
+
+def test_native_release_guard_accepts_windows_file_and_environment_sources(tmp_path, monkeypatch):
+    release = load_release_module()
+    binary_dir = tmp_path / "release"
+    binary_dir.mkdir()
+    (binary_dir / "tos-cli.exe").write_text("binary", encoding="utf-8")
+    monkeypatch.setattr(release, "native_target_matches_host", lambda target: True)
+    monkeypatch.setattr(release, "entry_release_dir", lambda name, target: binary_dir)
+    authentication = {
+        "default": "aksk",
+        "modes": ["aksk", "zti"],
+        "precedence": ["command_line", "profile.tos.auth_mode", "BYTETOS_AUTH_MODE", "aksk"],
+        "zti_built_in": True,
+        "zti_fallback_to_aksk": False,
+        "zti_presign_supported": False,
+        "zti_sources": ["SEC_TOKEN_STRING", "SEC_TOKEN_PATH"],
+    }
+    monkeypatch.setattr(
+        release.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, json.dumps({"data": {"authentication": authentication}}), ""
+        ),
+    )
+
+    release.verify_native_bytetos_auth("x86_64-pc-windows-msvc")
 
 
 def test_release_uses_zigbuild_for_linux_gnu_compatibility(monkeypatch):
@@ -487,6 +637,7 @@ def test_release_uses_zigbuild_for_linux_gnu_compatibility(monkeypatch):
             "cargo",
             "zigbuild",
             "--release",
+            "--locked",
             "--target",
             "x86_64-unknown-linux-gnu.2.17",
             "--manifest-path",
@@ -496,6 +647,7 @@ def test_release_uses_zigbuild_for_linux_gnu_compatibility(monkeypatch):
             "cargo",
             "zigbuild",
             "--release",
+            "--locked",
             "--target",
             "x86_64-unknown-linux-gnu.2.17",
             "--manifest-path",
@@ -505,6 +657,7 @@ def test_release_uses_zigbuild_for_linux_gnu_compatibility(monkeypatch):
             "cargo",
             "zigbuild",
             "--release",
+            "--locked",
             "--target",
             "x86_64-unknown-linux-gnu.2.17",
             "--manifest-path",
@@ -516,11 +669,15 @@ def test_release_uses_zigbuild_for_linux_gnu_compatibility(monkeypatch):
 def test_archives_uses_linux_compat_target_as_public_asset_target(tmp_path, monkeypatch):
     release = load_release_module()
     commands = []
+    auth_checks = []
 
     monkeypatch.setattr(
         release,
         "run_command",
         lambda command, execute=True: commands.append(tuple(str(part) for part in command)),
+    )
+    monkeypatch.setattr(
+        release, "verify_native_bytetos_auth", lambda target: auth_checks.append(target)
     )
 
     args = argparse.Namespace(
@@ -533,6 +690,7 @@ def test_archives_uses_linux_compat_target_as_public_asset_target(tmp_path, monk
 
     release.run_archives(args)
 
+    assert auth_checks == ["x86_64-unknown-linux-gnu.2.17"]
     archive_command = commands[0]
     assert "--target" in archive_command
     assert archive_command[archive_command.index("--target") + 1] == "x86_64-unknown-linux-gnu.2.17"
@@ -585,6 +743,7 @@ def test_release_uses_zigbuild_for_base_linux_gnu(monkeypatch):
         "cargo",
         "zigbuild",
         "--release",
+        "--locked",
         "--target",
         "x86_64-unknown-linux-gnu",
         "--manifest-path",
@@ -609,6 +768,7 @@ def test_release_uses_xwin_for_windows_msvc_from_macos(monkeypatch):
         "xwin",
         "build",
         "--release",
+        "--locked",
         "--target",
         "x86_64-pc-windows-msvc",
         "--manifest-path",

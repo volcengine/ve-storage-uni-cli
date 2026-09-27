@@ -17,6 +17,27 @@
 use std::process::Command;
 
 #[test]
+fn direct_entry_rejects_bytetos_zti_mode() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ve-adrive-cli"))
+        .args([
+            "--auth-mode",
+            "zti",
+            "doctor",
+            "--check",
+            "auth",
+            "--output",
+            "json",
+        ])
+        .output()
+        .expect("run ve-adrive-cli");
+    assert!(!output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    let message = response["error"]["message"].as_str().unwrap();
+    assert!(message.contains("invalid value 'zti'"));
+    assert!(message.contains("aksk, oauth, unified"));
+}
+
+#[test]
 fn dedicated_adrive_cli_direct_invocation() {
     let help = Command::new(env!("CARGO_BIN_EXE_ve-adrive-cli"))
         .arg("--help")

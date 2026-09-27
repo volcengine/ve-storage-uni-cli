@@ -17,6 +17,25 @@
 use std::process::Command;
 
 #[test]
+fn direct_entry_exposes_public_zti_without_loading_credentials() {
+    let output = Command::new(env!("CARGO_BIN_EXE_tos-cli"))
+        .args(["--describe", "--output", "json"])
+        .output()
+        .expect("run tos-cli describe");
+    assert!(output.status.success());
+    let description: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        description["data"]["authentication"]["modes"],
+        serde_json::json!(["aksk", "zti"])
+    );
+    assert_eq!(description["data"]["authentication"]["zti_built_in"], true);
+    assert_eq!(
+        description["data"]["authentication"]["zti_presign_supported"],
+        false
+    );
+}
+
+#[test]
 fn direct_help_exposes_tos_cli_surface() {
     let output = Command::new(env!("CARGO_BIN_EXE_tos-cli"))
         .arg("--help")

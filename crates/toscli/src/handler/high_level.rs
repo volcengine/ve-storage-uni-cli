@@ -59,7 +59,11 @@ pub async fn handle_high_level_command(
     global: &GlobalArgs,
     command: TosCliCommand,
 ) -> Result<i32, CliError> {
-    validate_tos_cli_high_level_options(&command)?;
+    // [Review Fix #8] Describe reports the command contract without an
+    // executable target; runtime-only checks must not block metadata lookup.
+    if !global.describe {
+        validate_tos_cli_high_level_options(&command)?;
+    }
     let _guard = EnvGuard::set(&[(FORCE_HIERARCHICAL_ENV, "1"), (FNS_DELETE_ENV, "1")]);
     let _config_guard = EnvGuard::set(&[(TOS_CONFIG_BINARY_ENV, "tos")]);
     let ve_command = match command {

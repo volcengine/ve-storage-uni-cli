@@ -117,7 +117,7 @@ export TOS_SECRET_KEY=<your-secret-access-key>
 export TOS_SECURITY_TOKEN=<optional-sts-token>
 ```
 
-`ve-tos-cli` supports `aksk or unified`; `tos-cli` remains AK/SK-only. Unified
+`ve-tos-cli` supports `aksk or unified`. Unified
 authentication selects the same-name profile managed by the external login
 framework. It ignores local AK/SK in `config.toml` and `credentials.toml`; the
 SDK supplies fresh signing credentials for each HTTP attempt. Login state is
@@ -132,6 +132,25 @@ ve login
 
 VeTos mode precedence is `--auth-mode` > `[profile.ve-tos].auth_mode` >
 `TOS_AUTH_MODE` > the backward-compatible `aksk` default.
+
+`tos-cli` supports `aksk` (default) and public, built-in `zti`. Select it with
+`tos-cli --auth-mode zti ls tos://bucket/` or `tos-cli config set auth_mode zti`.
+Its mode precedence is `--auth-mode` > `[profile.tos].auth_mode` >
+`BYTETOS_AUTH_MODE` > `aksk`. ZTI uses `SEC_TOKEN_STRING`, a local Agent at
+`ZTI_AGENT_SOCKET_PATH` (default `/run/zti-agent.sock`), or `SEC_TOKEN_PATH`,
+in that order. It ignores AK/SK and does not fall back to them. Agent access
+requires Unix; file Tokens are re-read per request, while Agent Tokens refresh
+within 600 seconds or before expiration. `tos-cli doctor --check auth` reports
+source availability offline; a storage request verifies remote access. ZTI does
+not support `presign`, which requires AK/SK. Never place Token values in command
+arguments or logs.
+
+For ByteCloud TOS PSM discovery, `tos-cli --psm <service>` normally checks
+bucket routing through BNS first. Set `TOS_FORCE_PSM=true` to skip BNS and
+resolve the selected CLI/configured PSM directly through Consul. This setting
+only affects `tos-cli` PSM mode; an explicit `--endpoint` takes precedence.
+`doctor --check network` reports configuration and does not validate a PSM;
+use a bucket request to test service discovery.
 
 Configure ADrive credentials with environment variables:
 
@@ -334,6 +353,10 @@ Credential variables are resolved by the config layer:
 | `TOS_SECRET_KEY`        | TOS secret access key.                                                         |
 | `TOS_SECURITY_TOKEN`    | Optional TOS STS security token.                                               |
 | `TOS_AUTH_MODE`         | VeTos authentication mode: `aksk` or `unified`; ignored by `tos-cli`.          |
+| `BYTETOS_AUTH_MODE`     | ByteCloud TOS authentication mode: `aksk` or `zti`.                            |
+| `SEC_TOKEN_STRING`      | Highest-priority ZTI Token source; keep its value out of logs.                |
+| `ZTI_AGENT_SOCKET_PATH` | Optional Unix Agent socket path; default `/run/zti-agent.sock`.              |
+| `SEC_TOKEN_PATH`        | ZTI Token file, used if no environment Token or Agent is available.          |
 | `ADRIVE_ACCESS_KEY`     | ADrive access key ID.                                                          |
 | `ADRIVE_SECRET_KEY`     | ADrive secret access key.                                                      |
 | `ADRIVE_SECURITY_TOKEN` | Optional ADrive STS security token.                                            |
@@ -347,6 +370,20 @@ Credential variables are resolved by the config layer:
 | `ADRIVE_REFRESH_TOKEN`  | Process-scoped OAuth group field; it is informational unless an Access Token is also supplied. |
 
 ## Skill Installation
+
+Choose the artifact according to the task:
+
+| Entry | Purpose | How it is used |
+|---|---|---|
+| `skills/*/SKILL.md` in this repository | Agent workflows: setup, command selection, execution, recovery and verification | Install the matching CLI skill with its `references/` directory |
+| `<cli> skill list --output json` | Live registry metadata and MCP input schemas | Discover tool IDs and contracts for the installed CLI version |
+| `<cli> skill export` | A command reference pack with an index and individual command skills | Export locally, then install or read the selected Markdown artifact |
+| `<cli> serve --mcp` | MCP server backed by the live command registry | Configure an MCP client to launch the CLI; it does not read exported Markdown |
+
+Installing an agent skill does not install the CLI executable. Repository skills
+teach multi-step workflows; exported command skills document individual command
+syntax, parameters, examples and operational behavior. Use current `--help` and
+`--describe` contracts if a skill and the installed binary differ.
 
 The repository provides one installable AI-agent skill per public CLI:
 
@@ -377,6 +414,50 @@ path: skills/ve-adrive-cli
 
 Install one skill by passing only the matching path or GitHub folder URL.
 Restart Codex after installing skills so agents pick up the new instructions.
+
+### Export command references
+
+Exported commands follow the entrypoint used to generate them. Registry IDs and
+MCP tool names do not change:
+
+| Export invocation | Example inside the export |
+|---|---|
+| `tos-cli skill export --name tos_cp` | `tos-cli cp ...` |
+| `ve-storage-uni-cli tos skill export --name tos_cp` | `ve-storage-uni-cli tos cp ...` |
+| `ve-tos-cli skill export --name ve_tos_cp` | `ve-tos-cli cp ...` |
+| `ve-storage-uni-cli ve-tos skill export --name ve_tos_cp` | `ve-storage-uni-cli ve-tos cp ...` |
+| `ve-adrive-cli skill export --name ve_adrive_cp` | `ve-adrive-cli cp ...` |
+| `ve-storage-uni-cli ve-adrive skill export --name ve_adrive_cp` | `ve-storage-uni-cli ve-adrive cp ...` |
+
+For example, discover the exact tool ID, preview paths, then export:
+
+```bash
+tos-cli skill list --output json
+tos-cli skill export --name tos_cp --language zh --dir ./tos-cp-skills --dry-run --output json
+tos-cli skill export --name tos_cp --language zh --dir ./tos-cp-skills --output json
+```
+
+`--language` accepts `en` (default) or `zh`. Omit `--name` to export all command
+skills. Use an exact tool ID from `skill list` for portable selection:
+
+| CLI | Additional `--name` matching |
+|---|---|
+| `tos-cli` | Exact canonical command, such as `"tos cp"` |
+| `ve-tos-cli` | Canonical command or suffix, such as `"ve-tos cp"` or `cp`; a suffix can match multiple commands |
+| `ve-adrive-cli` | Canonical command, short command, domain, or supported legacy name |
+
+Export creates `DIR/SKILL.md` as the index and
+`DIR/{domain}/{skill_name}/SKILL.md` as command references. Both have skill
+metadata. Read the root index with its children available, or install a single
+command directory independently. Export itself does not install or register
+anything with an agent. Keep the installed directory name consistent with the
+skill's `name` frontmatter when your installer requires it.
+
+The command refuses to overwrite existing target files, including the root
+index. To update a pack, export into a fresh directory, review the result and
+replace the installed copy. `--dry-run` previews paths without writing files.
+The parameter table describes CLI syntax; the JSON schema describes MCP
+arguments, so fields such as `execute` are not CLI flags.
 
 ## More Documentation
 

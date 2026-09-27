@@ -18,9 +18,74 @@ use clap::{Args, Subcommand};
 
 // Keep most utility argument contracts aligned with ve-tos while the new
 // top-level command owns the registry and dispatch surface.
-pub use ve_tos_cli::cli::meta::{
-    ApiArgs, CapabilitiesArgs, ConfigAction, ConfigCommand, DoctorArgs, DocumentationLanguage,
-};
+pub use ve_tos_cli::cli::meta::{ApiArgs, CapabilitiesArgs, DocumentationLanguage};
+
+// [Review Fix #16] ByteTOS has its own config contract. Sharing ve-tos Clap
+// help made unsupported control-plane keys appear in copyable tos examples.
+// [Review Fix #23] The help renderer rewrites ve-tos-cli to the active ByteTOS
+// entrypoint, including the unified CLI's "ve-storage-uni-cli tos" prefix.
+/// ByteTOS configuration command and its optional action.
+#[derive(Debug, Args)]
+#[command(
+    about = "Inspect and modify ByteTOS CLI configuration",
+    long_about = "Inspect and modify ByteTOS CLI configuration stored in ~/.tos/config.toml.",
+    after_help = "Examples:\n  ve-tos-cli config init\n  ve-tos-cli config show\n  ve-tos-cli config set region cn-beijing\n  ve-tos-cli config set endpoint https://tos.example.com\n  ve-tos-cli config set auth_mode zti"
+)]
+pub struct ConfigCommand {
+    #[command(subcommand)]
+    pub action: Option<ConfigAction>,
+}
+
+/// ByteTOS configuration actions with examples valid for this command surface.
+#[derive(Debug, Subcommand)]
+pub enum ConfigAction {
+    /// Initialize the selected profile without setting network defaults
+    #[command(
+        after_help = "Examples:\n  ve-tos-cli config init\n  ve-tos-cli config init --profile staging\n\nCreates shared and [profile.tos] sections. Configure an endpoint (and region if it cannot be inferred), or PSM service discovery, before making requests."
+    )]
+    Init {
+        /// Profile name to initialize (defaults to default)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Show current configuration with secrets redacted
+    #[command(
+        after_help = "Examples:\n  ve-tos-cli config show\n  ve-tos-cli config show --output json\n\nShows effective values with source annotations such as [default], [default.tos], env, and cli."
+    )]
+    Show,
+    /// Set a ByteTOS configuration value
+    #[command(
+        after_help = "Common KEY values:\n  region                         -> [active-profile]\n  endpoint / psm / idc / cluster / addr_family -> [active-profile.tos]\n  auth_mode (aksk or zti)        -> [active-profile.tos]\n  access_key_id / secret_access_key / security_token -> active tos credentials\n  checkpoint_dir / progress_enabled / max_retry_count -> [active-profile.tos]\n\nKEY may also name a profile, for example staging.region or staging.tos.psm.\n\nExamples:\n  ve-tos-cli config set region cn-beijing\n  ve-tos-cli config set endpoint https://tos.example.com\n  ve-tos-cli config set psm toutiao.tos.tosapi\n  ve-tos-cli config set auth_mode zti"
+    )]
+    Set {
+        /// Configuration key, for example region, endpoint, or staging.tos.psm
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// Configuration value
+        #[arg(value_name = "VALUE")]
+        value: String,
+    },
+}
+
+/// Offline-first diagnostics for the ByteTOS command surface.
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  ve-tos-cli doctor\n  ve-tos-cli doctor --check auth\n  ve-tos-cli doctor --check network\n  ve-tos-cli doctor --check completion"
+)]
+pub struct DoctorArgs {
+    /// Check one module: auth, config, registry, network (or endpoint), mcp, or completion
+    #[arg(long)]
+    pub check: Option<String>,
+    /// Kept for compatibility with existing invocations; ByteTOS doctor has no permission probe.
+    #[arg(long, hide = true)]
+    pub bucket: Option<String>,
+    /// Probe the configured TOS endpoint; off by default to keep doctor offline
+    #[arg(long, default_value_t = false)]
+    pub live_network: bool,
+    /// Timeout in milliseconds for --live-network
+    #[arg(long, default_value_t = 3000)]
+    pub network_timeout_ms: u64,
+}
 
 #[derive(Debug, Args)]
 #[command(
@@ -76,7 +141,10 @@ pub enum SkillAction {
     },
     /// Export skills as Markdown SKILL.md directories
     Export {
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Exact skill name or canonical command, e.g. tos_cp or \"tos cp\""
+        )]
         name: Option<String>,
         /// Output directory
         #[arg(long, default_value = "./tos-skills")]

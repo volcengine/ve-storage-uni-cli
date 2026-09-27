@@ -180,7 +180,10 @@ pub enum SkillAction {
     },
     /// Export skills to local directory
     Export {
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Skill name, canonical command, or command suffix, e.g. ve_tos_cp or cp"
+        )]
         name: Option<String>,
         /// Output directory
         #[arg(long, default_value = "./ve-tos-skills")]

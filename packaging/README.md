@@ -65,6 +65,35 @@ packaging/cargo/ve-adrive-cli/target/release/ve-adrive-cli
 When building with `--target <triple>`, the binary is written under
 `packaging/cargo/ve-adrive-cli/target/<triple>/release/`.
 
+## ByteCloud TOS ZTI release contract
+
+The public `tos-cli` source build includes ZTI in `tos-core`; no private ZTI
+crate or Cargo registry is required. The three standalone entry crates keep
+their `Cargo.lock` files in this repository, and the release archive builder
+uses `--locked` so archive builds cannot silently select a different dependency graph.
+The archive builder packages the dedicated binaries. npm, Homebrew, and WinGet
+consume those release archives; pip copies the same build outputs into wheels.
+The `ve-tos-cli` and `ve-adrive-cli` binaries continue to reject
+`--auth-mode zti`.
+
+On Unix platforms, `tos-cli` supports `SEC_TOKEN_STRING`, a local ZTI Agent
+socket, and `SEC_TOKEN_PATH`; on Windows it supports the environment and file
+sources but not the Unix Agent. `tos-cli presign` requires AK/SK. A release
+runner building its own native target checks the built `tos-cli --describe`
+authentication contract before creating an archive, including when
+`--skip-build` is used. Cross-target binaries cannot be executed by that
+runner; validate them on native CI runners before publishing. This check does
+not contact an Agent or ByteTOS service.
+
+For a local source and dedicated-binary check, run:
+
+```bash
+cargo test --manifest-path packaging/cargo/tos-cli/Cargo.toml --locked
+cargo test --manifest-path packaging/cargo/ve-tos-cli/Cargo.toml --locked
+cargo test --manifest-path packaging/cargo/ve-adrive-cli/Cargo.toml --locked
+python3 -m pytest packaging/tests/test_cargo_publish_metadata.py packaging/tests/test_release.py
+```
+
 ## What Solves What
 
 - `packaging/install/install.sh` is the curl installer. It downloads a GitHub
@@ -354,6 +383,11 @@ VE_STORAGE_UNI_CLI_VERSION=v<version> VE_STORAGE_UNI_CLI_INSTALL_DIR="$HOME/.loc
 ```
 
 ## AI-Agent Skills
+
+See [Skill Installation and export](../README.md#skill-installation) for the
+difference between repository workflow skills, CLI-exported command references
+and the registry-backed MCP server. Exports preserve the dedicated or unified
+entrypoint that generated them; installing a skill does not install a binary.
 
 Each skill is a standard skill directory with `SKILL.md` plus optional
 resources. Use any agent skill installer that can install from a GitHub folder

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use clap::Args;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::fs;
@@ -22,25 +23,34 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
-use tos_core::agent::describe::{CommandDescription, CommandLayer, RiskLevel};
+use tos_core::agent::describe::{
+    CommandDescription, CommandLayer, CommandParameter, ParameterLocation, RiskLevel,
+};
 use tos_core::agent::envelope::Envelope;
 use tos_core::agent::error::CliError;
 use tos_core::agent::global_args::GlobalArgs;
-use tos_core::infra::client::storage_user_agent;
-use tos_core::infra::config::{merge_tos_runtime_profile, Binary, ConfigFile, Profile};
-use tos_core::infra::credentials::{CredentialSection, CredentialsFile};
+use tos_core::infra::byte_tos_auth::ByteTosAuthMode;
+use tos_core::infra::client::{derive_region_from_endpoint, storage_user_agent};
+use tos_core::infra::config::Profile;
 
 use crate::cli::meta::{
-    ApiArgs, CapabilitiesArgs, CompletionArgs, ConfigCommand, DoctorArgs, DocumentationLanguage,
-    ServeArgs, SkillAction, SkillCommand,
+    ApiArgs, CapabilitiesArgs, CompletionArgs, ConfigAction, ConfigCommand, DoctorArgs,
+    DocumentationLanguage, ServeArgs, SkillAction, SkillCommand,
 };
 use crate::registry::{
     business_domain, capabilities, command_domains, find_capability, public_tos_command,
-    CapabilityRow,
+    public_tos_example, CapabilityRow, DOCTOR_CHECKS,
 };
 
 const TOS_CONFIG_BINARY_ENV: &str = "VE_STORAGE_UNI_TOS_CONFIG_BINARY";
 const TOS_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    ("Run one check: auth, config, registry, network (or endpoint), mcp, or completion", "运行一项检查：auth、config、registry、network（或 endpoint）、mcp 或 completion"),
+    ("Probe the configured endpoint during the network check", "在网络检查中探测已配置的 endpoint"),
+    ("Timeout in milliseconds for a live network probe", "实时网络探测的超时时间（毫秒）"),
+    ("Configuration key to set", "要设置的配置键"),
+    ("Configuration value", "配置值"),
+    ("Set a configuration value. Tos auth_mode supports aksk or zti. Bare credential keys write to the active profile's tos credentials; explicit key formats include staging.endpoint / default.tos.psm", "设置配置值。Tos auth_mode 支持 aksk 或 zti。未限定的凭证键写入当前 Profile 的 tos 凭证；显式键格式包括 staging.endpoint / default.tos.psm"),
+    ("ByteCloud TOS authentication mode. Priority: --auth-mode > [profile.tos].auth_mode > BYTETOS_AUTH_MODE > aksk. zti uses SEC_TOKEN_STRING, a local Agent, or SEC_TOKEN_PATH, ignores AK/SK, and has no fallback.", "ByteCloud TOS 鉴权模式。优先级：--auth-mode > [profile.tos].auth_mode > BYTETOS_AUTH_MODE > aksk。zti 使用 SEC_TOKEN_STRING、本地 Agent 或 SEC_TOKEN_PATH，忽略 AK/SK，且不会回退。"),
     ("API metadata action name", "API 元数据 action 名称"),
     ("API metadata group name", "API 元数据 group 名称"),
     ("Abort incomplete multipart uploads matching the prefix", "中止与前缀匹配的未完成分片上传"),
@@ -54,6 +64,7 @@ const TOS_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Create parent folder markers as needed", "按需创建父文件夹标记"),
     ("Custom TOS metadata as key=value pairs", "key=value 对形式的自定义 TOS 元数据"),
     ("Delete every object version and delete marker", "删除每个对象版本和删除标记"),
+    ("Also abort incomplete multipart uploads matching the prefix", "同时中止与前缀匹配的未完成分片上传"),
     ("Delete extraneous destination objects", "删除目标端多余对象"),
     ("Destination overwrite strategy", "目标覆盖策略"),
     ("Directory for transfer checkpoint state", "传输 checkpoint 状态目录"),
@@ -111,12 +122,18 @@ const TOS_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Create a folder marker", "创建文件夹标记"),
     ("Delete objects or prefixes", "删除对象或前缀"),
     ("List object prefixes or objects within a bucket", "列出 Bucket 内的对象前缀或对象"),
+    ("Recursive listing mode: hierarchical only", "递归列举模式：仅 hierarchical"),
+    ("bucket or prefix target -> ListObjects; bucket is required", "Bucket 或前缀目标调用 ListObjects；必须指定 Bucket"),
+    ("JSON object listing uses raw data.objects/data.common_prefixes; table/csv render a synthesized typed row view", "JSON 对象列举使用原始 data.objects/data.common_prefixes；table/csv 渲染合成的带类型行视图"),
+    ("rm accepts object or prefix targets only; bucket deletion is unavailable in tos", "rm 仅接受对象或前缀目标；tos 不支持删除 Bucket"),
     ("Show bucket or object metadata", "查看 Bucket 或对象元数据"),
     ("Calculate size statistics for a prefix", "统计前缀大小"),
     ("Find objects by filters", "按过滤条件查找对象"),
     ("Stream object content", "流式输出对象内容"),
     ("Upload stdin to an object", "将 stdin 上传为对象"),
     ("Generate presigned URL", "生成预签名 URL"),
+    ("Generate presigned URL (AK/SK only; ZTI is not supported)", "生成预签名 URL（仅支持 AK/SK，不支持 ZTI）"),
+    ("Generate a presigned URL for object access (AK/SK only; ZTI is not supported).", "生成用于访问对象的预签名 URL（仅支持 AK/SK，不支持 ZTI）。"),
     ("Discover CLI capabilities", "发现 CLI 能力"),
     ("Guarded API metadata and dry-run planning utility", "受保护的 API 元数据与 dry-run 规划工具"),
     ("Configuration management", "配置管理"),
@@ -137,6 +154,8 @@ const TOS_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Optional global endpoint override", "可选的全局 endpoint 覆盖"),
     ("Include extra diagnostic output where supported", "在支持时包含额外诊断输出"),
     ("Disable prompts and progress output", "禁用提示和进度输出"),
+    ("ByteTOS authentication override for this tool: aksk or zti; otherwise inherit the serve mode, profile, or environment", "此工具的 ByteTOS 鉴权模式覆盖值：aksk 或 zti；未指定时继承 serve 模式、Profile 或环境变量"),
+    ("ByteTOS presign requires AK/SK; ZTI is not supported", "ByteTOS 预签名需要 AK/SK；不支持 ZTI"),
 ];
 
 fn tos_metadata_translation_zh(text: &str) -> Option<&'static str> {
@@ -320,7 +339,7 @@ pub async fn handle_capabilities_command(
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| left.command.cmp(right.command));
 
-    let payload = match args.view.as_str() {
+    let mut payload = match args.view.as_str() {
         "groups" => json!({
             "tool": "tos",
             "version": env!("CARGO_PKG_VERSION"),
@@ -372,6 +391,7 @@ pub async fn handle_capabilities_command(
             )))
         }
     };
+    payload["authentication"] = tos_core::infra::byte_tos_auth::byte_tos_auth_metadata();
     ve_tos_cli::handler::common::output_result(
         global,
         &Envelope::success("tos capabilities", payload),
@@ -444,7 +464,19 @@ pub async fn handle_config_command(
     command: &ConfigCommand,
 ) -> Result<i32, CliError> {
     let _guard = EnvGuard::tos_namespace();
-    ve_tos_cli::handler::config::handle_config_command(global, &command.action).await
+    // [Review Fix #16] Keep ByteTOS-only Clap metadata while reusing the
+    // established config executor and its validation rules.
+    let action = command.action.as_ref().map(|action| match action {
+        ConfigAction::Init { profile } => ve_tos_cli::cli::meta::ConfigAction::Init {
+            profile: profile.clone(),
+        },
+        ConfigAction::Show => ve_tos_cli::cli::meta::ConfigAction::Show,
+        ConfigAction::Set { key, value } => ve_tos_cli::cli::meta::ConfigAction::Set {
+            key: key.clone(),
+            value: value.clone(),
+        },
+    });
+    ve_tos_cli::handler::config::handle_config_command(global, &action).await
 }
 
 pub async fn handle_completion_command(
@@ -516,6 +548,7 @@ fn serve_plan(args: &ServeArgs) -> Result<Value, CliError> {
         "bind": is_sse.then(|| format!("127.0.0.1:{}", args.port)),
         "endpoints": if is_sse { vec!["/sse", "/message"] } else { Vec::new() },
         "authentication": if is_sse { "ephemeral_bearer" } else { "process_stdio" },
+        "storage_authentication": tos_core::infra::byte_tos_auth::byte_tos_auth_metadata(),
         "token_output": is_sse.then_some("stderr_once_after_bind"),
         "authorization_header_required": is_sse,
         "allowed_hosts": if is_sse {
@@ -620,7 +653,7 @@ async fn mcp_execute_typed_command(
     let object = arguments.as_object().ok_or_else(|| {
         CliError::ValidationError(format!("{} arguments must be a JSON object", skill.name))
     })?;
-    let execute = bool_field(object, "execute").unwrap_or(false);
+    let execute = bool_field(object, "execute")?.unwrap_or(false);
     let argv = build_mcp_typed_argv(global, &skill.command, object)?;
     if !execute {
         return Ok((
@@ -635,6 +668,20 @@ async fn mcp_execute_typed_command(
     if skill.command == "tos serve" {
         return Err(CliError::ValidationError(
             "tos_serve MCP tool only supports planning; omit execute=true and use dry_run/describe"
+                .to_string(),
+        ));
+    }
+    // [Review Fix #14] A subprocess cannot inherit a caller-owned resolver.
+    // Reject ZTI and unresolved modes, but allow explicit AK/SK because it
+    // never uses the injected provider.
+    if global
+        .zti_token_provider
+        .as_ref()
+        .is_some_and(|provider| provider.is_caller_supplied())
+        && selected_mcp_auth_mode(global, object)? != Some(ByteTosAuthMode::Aksk)
+    {
+        return Err(CliError::ValidationError(
+            "MCP execute=true cannot use an injected ZTI provider; use the built-in token source or invoke the CLI directly"
                 .to_string(),
         ));
     }
@@ -653,10 +700,45 @@ fn build_mcp_typed_argv(
         CliError::ValidationError(format!("unknown typed MCP command '{}'", command))
     })?;
     let mut argv = Vec::new();
-    push_mcp_global_args(global, arguments, &mut argv);
+    for (flag, path) in [
+        ("--config-path", &global.config_path),
+        ("--credentials-path", &global.credentials_path),
+    ] {
+        if let Some(path) = path {
+            argv.extend([flag.to_string(), path.to_string_lossy().into_owned()]);
+        }
+    }
+    push_mcp_global_args(global, arguments, &mut argv)?;
     push_mcp_public_command_path(command, &mut argv);
+    if let Some(mode) = selected_mcp_auth_mode(global, arguments)? {
+        // [Review Fix #1] Reject a typed presign request whose explicit mode
+        // cannot sign; the published MCP schema is not a security boundary.
+        if command == "tos presign" && mode == ByteTosAuthMode::Zti {
+            return Err(CliError::ValidationError(
+                "tos presign requires aksk; ZTI is not supported".to_string(),
+            ));
+        }
+        argv.extend(["--auth-mode".to_string(), mode.as_str().to_string()]);
+    }
     push_mcp_command_args(row, arguments, &mut argv)?;
     Ok(argv)
+}
+
+fn selected_mcp_auth_mode(
+    global: &GlobalArgs,
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<Option<ByteTosAuthMode>, CliError> {
+    if let Some(value) = arguments.get("auth_mode") {
+        let mode = value.as_str().ok_or_else(|| {
+            CliError::ValidationError("MCP auth_mode must be aksk or zti".to_string())
+        })?;
+        return ByteTosAuthMode::parse(mode, "MCP auth_mode").map(Some);
+    }
+    global
+        .byte_tos_auth_mode
+        .as_deref()
+        .map(|mode| ByteTosAuthMode::parse(mode, "--auth-mode"))
+        .transpose()
 }
 
 fn push_mcp_public_command_path(command: &str, argv: &mut Vec<String>) {
@@ -683,16 +765,16 @@ fn push_mcp_global_args(
     global: &GlobalArgs,
     arguments: &serde_json::Map<String, Value>,
     argv: &mut Vec<String>,
-) {
+) -> Result<(), CliError> {
     argv.push("--output".to_string());
     argv.push(
-        string_field(arguments, "output")
+        string_field(arguments, "output")?
             .unwrap_or("json")
             .to_string(),
     );
     argv.push("--profile".to_string());
     argv.push(
-        string_field(arguments, "profile")
+        string_field(arguments, "profile")?
             .unwrap_or(&global.profile)
             .to_string(),
     );
@@ -700,7 +782,7 @@ fn push_mcp_global_args(
         ("region", "--region", global.region.as_deref()),
         ("endpoint", "--endpoint", global.endpoint.as_deref()),
     ] {
-        if let Some(value) = string_field(arguments, field).or(fallback) {
+        if let Some(value) = string_field(arguments, field)?.or(fallback) {
             argv.push(flag.to_string());
             argv.push(value.to_string());
         }
@@ -711,10 +793,13 @@ fn push_mcp_global_args(
         ("verbose", "--verbose", global.verbose),
         ("quiet", "--quiet", global.quiet),
     ] {
-        if bool_field(arguments, field).unwrap_or(fallback) {
+        // [Review Fix #24] Invalid global booleans must not change execution
+        // semantics by falling back to the serve process defaults.
+        if bool_field(arguments, field)?.unwrap_or(fallback) {
             argv.push(flag.to_string());
         }
     }
+    Ok(())
 }
 
 fn push_mcp_command_args(
@@ -723,8 +808,16 @@ fn push_mcp_command_args(
     argv: &mut Vec<String>,
 ) -> Result<(), CliError> {
     let reserved = [
-        "execute", "output", "profile", "region", "endpoint", "dry_run", "describe", "verbose",
+        "execute",
+        "output",
+        "profile",
+        "region",
+        "endpoint",
+        "dry_run",
+        "describe",
+        "verbose",
         "quiet",
+        "auth_mode",
     ];
     for key in arguments.keys() {
         if reserved.contains(&key.as_str()) {
@@ -761,7 +854,15 @@ fn push_mcp_command_args(
         };
         let flag = format!("--{}", parameter.name.replace('_', "-"));
         if is_boolean_parameter(parameter.name) {
-            if value.as_bool().unwrap_or(false) {
+            // [Review Fix #22] Reject malformed MCP switches before a command
+            // can execute with a silently omitted destructive option.
+            let is_enabled = value.as_bool().ok_or_else(|| {
+                CliError::ValidationError(format!(
+                    "MCP argument '{}' for '{}' must be boolean",
+                    parameter.name, row.command
+                ))
+            })?;
+            if is_enabled {
                 argv.push(flag);
             }
             continue;
@@ -892,10 +993,69 @@ pub async fn handle_skill_command(
     Ok(0)
 }
 
+#[cfg(test)]
+mod injected_provider_mcp_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn execute_rejects_provider_that_child_cannot_inherit() {
+        let global = GlobalArgs {
+            byte_tos_auth_mode: Some("zti".to_string()),
+            zti_token_provider: Some(tos_core::infra::zti_credentials::ZtiTokenProvider::new(
+                || async { panic!("injected provider must not be used by a child process") },
+            )),
+            ..GlobalArgs::default()
+        };
+        let arguments = json!({"path": "tos://bucket/key", "execute": true});
+        let error = mcp_invoke_tool(&global, "tos_cat".to_string(), arguments)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("injected ZTI provider"));
+
+        let planned = mcp_invoke_tool(
+            &global,
+            "tos_cat".to_string(),
+            json!({"path": "tos://bucket/key"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(planned.0["execution_status"], "planned_not_executed");
+    }
+
+    #[tokio::test]
+    async fn explicit_aksk_execution_ignores_unused_injected_provider() {
+        let global = GlobalArgs {
+            zti_token_provider: Some(tos_core::infra::zti_credentials::ZtiTokenProvider::new(
+                || async { panic!("AK/SK execution must not call the ZTI provider") },
+            )),
+            ..GlobalArgs::default()
+        };
+        let result = mcp_invoke_tool(
+            &global,
+            "tos_cat".to_string(),
+            json!({"path": "tos://bucket/key", "auth_mode": "aksk", "execute": true}),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+}
+
 pub async fn handle_doctor_command(
     global: &GlobalArgs,
     args: &DoctorArgs,
 ) -> Result<i32, CliError> {
+    if global.describe {
+        // [Review Fix #18] Describe must not read configuration or perform an
+        // optional live probe; report the command contract instead.
+        let description = describe_tos_command_metadata("tos doctor").ok_or_else(|| {
+            CliError::ValidationError("no metadata registered for tos doctor".to_string())
+        })?;
+        ve_tos_cli::handler::common::output_result(
+            global,
+            &Envelope::success("tos doctor", description),
+        )?;
+        return Ok(0);
+    }
     let selected = args.check.as_deref();
     let mut checks = Vec::new();
     maybe_push_result(&mut checks, selected, "config", || config_check(global));
@@ -953,6 +1113,42 @@ pub async fn handle_doctor_command(
 
 pub fn describe_tos_command_metadata(command: &str) -> Option<CommandDescription> {
     let row = find_capability(command)?;
+    let mut auth_parameter = tos_core::infra::byte_tos_auth::byte_tos_auth_parameter();
+    if command == "tos presign" {
+        // [Review Fix #1] The mode description must agree with presign's AK/SK-only schema.
+        auth_parameter.description =
+            "ByteTOS presign requires AK/SK; ZTI is not supported".to_string();
+        auth_parameter.schema =
+            Some(json!({"type": "string", "enum": ["aksk"], "default": "aksk"}));
+    }
+    // [Review Fix #13] The parse-recovery path must retain required paths and
+    // accepted flags; an auth-only payload is not a usable command contract.
+    let mut parameters = row
+        .parameters
+        .iter()
+        .map(|parameter| CommandParameter {
+            name: parameter.name.to_string(),
+            // [Review Fix #23] Utility operands are positional too; reuse the
+            // same command-aware rule as MCP argument assembly.
+            location: if is_positional_parameter(command, parameter.name) {
+                ParameterLocation::Path
+            } else {
+                ParameterLocation::Flag
+            },
+            required: parameter.required,
+            description: parameter.description.to_string(),
+            schema: match (command, parameter.name) {
+                (_, "recursive-list-mode") => {
+                    Some(json!({"type": "string", "enum": ["hierarchical"]}))
+                }
+                ("tos doctor", "check") => Some(json!({"type": "string", "enum": DOCTOR_CHECKS})),
+                ("tos doctor", "live-network") => Some(json!({"type": "boolean"})),
+                ("tos doctor", "network-timeout-ms") => Some(json!({"type": "integer"})),
+                _ => None,
+            },
+        })
+        .collect::<Vec<_>>();
+    parameters.push(auth_parameter);
     Some(CommandDescription {
         command: row.command.to_string(),
         layer: if row.layer == "high_level" {
@@ -967,6 +1163,7 @@ pub fn describe_tos_command_metadata(command: &str) -> Option<CommandDescription
             "medium" => RiskLevel::Medium,
             _ => RiskLevel::Low,
         },
+        parameters: Some(parameters),
         supports_dry_run: row.supports_dry_run,
         supports_pipe: matches!(row.domain, "cat"),
         low_level_apis: Some(row.api_actions.iter().map(|api| api.to_string()).collect()),
@@ -1018,6 +1215,13 @@ fn compact_row(row: &&CapabilityRow) -> Value {
 }
 
 fn public_row(row: &&CapabilityRow) -> Value {
+    let auth_modes: &[&str] = if row.layer != "high_level" {
+        &[]
+    } else if row.command == "tos presign" {
+        &["aksk"]
+    } else {
+        &["aksk", "zti"]
+    };
     json!({
         "command": row.command,
         "group": row.group,
@@ -1028,8 +1232,9 @@ fn public_row(row: &&CapabilityRow) -> Value {
         "supports_force": row.supports_force,
         "supports_dry_run": row.supports_dry_run,
         "api_actions": row.api_actions,
+        "auth_modes": auth_modes,
         "parameters": row.parameters,
-        "examples": row.examples.iter().map(|example| public_tos_command(example)).collect::<Vec<_>>(),
+        "examples": row.examples.iter().map(|example| public_tos_example(example)).collect::<Vec<_>>(),
     })
 }
 
@@ -1051,10 +1256,10 @@ fn completion_script(shell: &str) -> Result<String, CliError> {
     let commands = completion_words().join(" ");
     match shell {
         "bash" => Ok(format!(
-            "_tos_complete() {{\n  local cur=\"${{COMP_WORDS[COMP_CWORD]}}\"\n  if [[ \"${{COMP_WORDS[0]}}\" == \"ve-storage-uni-cli\" ]]; then\n    if [[ \"$COMP_CWORD\" -eq 1 ]]; then\n      COMPREPLY=( $(compgen -W \"tos\" -- \"$cur\") )\n      return\n    fi\n    [[ \"${{COMP_WORDS[1]}}\" == \"tos\" ]] || return\n  fi\n  COMPREPLY=( $(compgen -W \"{commands}\" -- \"$cur\") )\n}}\ncomplete -F _tos_complete tos\ncomplete -F _tos_complete tos-cli\ncomplete -F _tos_complete ve-storage-uni-cli"
+            "_tos_complete() {{\n  local cur=\"${{COMP_WORDS[COMP_CWORD]}}\"\n  if [[ \"${{COMP_WORDS[0]}}\" == \"ve-storage-uni-cli\" ]]; then\n    if [[ \"$COMP_CWORD\" -eq 1 ]]; then\n      COMPREPLY=( $(compgen -W \"tos\" -- \"$cur\") )\n      return\n    fi\n    [[ \"${{COMP_WORDS[1]}}\" == \"tos\" ]] || return\n  fi\n  if [[ \"${{COMP_WORDS[COMP_CWORD-1]}}\" == \"--auth-mode\" ]]; then\n    COMPREPLY=( $(compgen -W \"aksk zti\" -- \"$cur\") )\n    return\n  fi\n  COMPREPLY=( $(compgen -W \"--auth-mode {commands}\" -- \"$cur\") )\n}}\ncomplete -F _tos_complete tos\ncomplete -F _tos_complete tos-cli\ncomplete -F _tos_complete ve-storage-uni-cli"
         )),
         "zsh" => Ok(format!(
-            "#compdef tos tos-cli ve-storage-uni-cli\n_arguments '1:command:(tos {commands})'"
+            "#compdef tos tos-cli ve-storage-uni-cli\n_arguments '--auth-mode[ByteTOS mode]:mode:(aksk zti)' '1:command:(tos {commands})'"
         )),
         "fish" => Ok(commands
             .split_whitespace()
@@ -1065,11 +1270,16 @@ fn completion_script(shell: &str) -> Result<String, CliError> {
                     format!("complete -c ve-storage-uni-cli -n '__fish_seen_subcommand_from tos' -f -a {cmd}"),
                 ]
             })
-            .chain(["complete -c ve-storage-uni-cli -f -a tos".to_string()])
+            .chain([
+                "complete -c ve-storage-uni-cli -f -a tos".to_string(),
+                "complete -c tos -l auth-mode -r -a 'aksk zti'".to_string(),
+                "complete -c tos-cli -l auth-mode -r -a 'aksk zti'".to_string(),
+                "complete -c ve-storage-uni-cli -n '__fish_seen_subcommand_from tos' -l auth-mode -r -a 'aksk zti'".to_string(),
+            ])
             .collect::<Vec<_>>()
             .join("\n")),
         "powershell" => Ok(format!(
-            "Register-ArgumentCompleter -Native -CommandName tos,tos-cli,ve-storage-uni-cli -ScriptBlock {{\n  param($wordToComplete, $commandAst, $cursorPosition)\n  @('tos',{cmds}) | Where-Object {{ $_ -like \"$wordToComplete*\" }} | ForEach-Object {{ [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }}\n}}\n",
+            "Register-ArgumentCompleter -Native -CommandName tos,tos-cli,ve-storage-uni-cli -ScriptBlock {{\n  param($wordToComplete, $commandAst, $cursorPosition)\n  $elements = @($commandAst.CommandElements)\n  $isTos = $commandAst.GetCommandName() -ne 've-storage-uni-cli' -or ($elements.Count -gt 1 -and $elements[1].Extent.Text -eq 'tos')\n  if (-not $isTos) {{ return }}\n  $previous = if ($elements.Count -gt 1) {{ $elements[$elements.Count - 2].Extent.Text }} else {{ '' }}\n  $choices = if ($previous -eq '--auth-mode') {{ @('aksk','zti') }} else {{ @('--auth-mode','tos',{cmds}) }}\n  $choices | Where-Object {{ $_ -like \"$wordToComplete*\" }} | ForEach-Object {{ [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }}\n}}\n",
             cmds = commands
                 .split_whitespace()
                 .map(|command| format!("'{}'", command.replace('\'', "''")))
@@ -1108,7 +1318,7 @@ fn skill_definitions() -> Vec<SkillDefinition> {
             examples: row
                 .examples
                 .iter()
-                .map(|example| public_tos_command(example))
+                .map(|example| public_tos_example(example))
                 .collect(),
         })
         .collect()
@@ -1162,6 +1372,24 @@ fn skill_input_schema(row: &CapabilityRow) -> Value {
     for (name, schema) in mcp_common_schema_properties() {
         properties.entry(name.to_string()).or_insert(schema);
     }
+    if row.command == "tos presign" {
+        properties.insert(
+            "auth_mode".to_string(),
+            json!({"type": "string", "enum": ["aksk"], "description": "ByteTOS presign requires AK/SK; ZTI is not supported"}),
+        );
+    }
+    if row.command == "tos doctor" {
+        if let Some(check) = row
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == "check")
+        {
+            properties.insert(
+                "check".to_string(),
+                json!({"type": "string", "enum": DOCTOR_CHECKS, "description": check.description}),
+            );
+        }
+    }
     json!({
         "type": "object",
         "properties": properties,
@@ -1174,8 +1402,16 @@ fn parameter_schema_type(name: &str) -> &'static str {
     if is_boolean_parameter(name) {
         "boolean"
     } else if matches!(
-        name,
-        "port" | "max_keys" | "batch_concurrency" | "list_concurrency"
+        name.replace('-', "_").as_str(),
+        "port"
+            | "max_keys"
+            | "max_depth"
+            | "top_k"
+            | "batch_concurrency"
+            | "list_concurrency"
+            | "multipart_concurrency"
+            | "network_timeout_ms"
+            | "expires"
     ) {
         "integer"
     } else {
@@ -1183,7 +1419,7 @@ fn parameter_schema_type(name: &str) -> &'static str {
     }
 }
 
-fn mcp_common_schema_properties() -> [(&'static str, Value); 9] {
+fn mcp_common_schema_properties() -> [(&'static str, Value); 10] {
     [
         (
             "execute",
@@ -1221,15 +1457,27 @@ fn mcp_common_schema_properties() -> [(&'static str, Value); 9] {
             "quiet",
             json!({"type": "boolean", "description": "Disable prompts and progress output"}),
         ),
+        (
+            "auth_mode",
+            json!({"type": "string", "enum": ["aksk", "zti"], "description": "ByteTOS authentication override for this tool: aksk or zti; otherwise inherit the serve mode, profile, or environment"}),
+        ),
     ]
 }
 
 fn is_boolean_parameter(name: &str) -> bool {
+    // [Review Fix #19] Registry names use hyphens, while older MCP callers
+    // also use underscores. Normalize both before typing or emitting flags.
     matches!(
-        name,
+        name.replace('-', "_").as_str(),
         "recursive"
             | "force"
+            | "checkpoint"
             | "include_parent"
+            | "include_uploads"
+            | "all_versions"
+            | "size_only"
+            | "exact_timestamps"
+            | "parents"
             | "no_clobber"
             | "no_manifest"
             | "report_failures_only"
@@ -1239,6 +1487,8 @@ fn is_boolean_parameter(name: &str) -> bool {
             | "no_list_echo"
             | "delete"
             | "human_readable"
+            | "cost"
+            | "live_network"
             | "mcp"
             | "dry_run"
             | "describe"
@@ -1337,6 +1587,11 @@ fn export_markdown_skills(
         }
     }
 
+    // [Review Fix #Skill6] Build parser metadata once rather than once per file.
+    let mut root = crate::cli::auth::ByteTosAuthArgs::augment_args(
+        tos_core::agent::skill_markdown::command_tree::<crate::cli::TosCliCommand>(),
+    );
+    root.build();
     let mut files = Vec::new();
     let skills = export_plan
         .iter()
@@ -1352,7 +1607,7 @@ fn export_markdown_skills(
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, skill_markdown(&skill, language))?;
+        fs::write(&path, skill_markdown(&skill, language, &root))?;
         files.push(path.display().to_string());
     }
 
@@ -1386,12 +1641,15 @@ fn skill_index_markdown(
     for skill in skills {
         domains.entry(&skill.domain).or_default().push(skill);
     }
+    let public_surface = public_tos_command(&format!("{surface} "))
+        .trim()
+        .to_string();
     let mut body = match language {
         DocumentationLanguage::En => format!(
-            "# {surface} skills\n\nUse this skill pack when the user wants to operate `{surface}` commands. Select a domain below, then use the nested command skill.\n\n"
+            "# {surface} skills\n\nUse this skill pack when the user wants to operate `{public_surface}` commands. Select a domain below, then use the nested command skill.\n\n"
         ),
         DocumentationLanguage::Zh => format!(
-            "# {surface} Skills\n\n当用户需要操作 `{surface}` 命令时使用此 Skill 包。先按领域选择，再进入对应的命令 Skill。\n\n"
+            "# {surface} Skills\n\n当用户需要操作 `{public_surface}` 命令时使用此 Skill 包。先按领域选择，再进入对应的命令 Skill。\n\n"
         ),
     };
     for (domain, skills) in domains {
@@ -1403,116 +1661,62 @@ fn skill_index_markdown(
             };
             body.push_str(&format!(
                 "- [{}](./{}/{}/SKILL.md): `{}` - {}\n",
-                skill.name, skill.domain, skill.name, skill.command, description
+                skill.name,
+                skill.domain,
+                skill.name,
+                public_tos_command(&skill.command),
+                description
             ));
         }
         body.push('\n');
     }
-    body
+    let description = match language {
+        DocumentationLanguage::En => format!(
+            "Use when operating {public_surface}; select a command reference from this index."
+        ),
+        DocumentationLanguage::Zh => {
+            format!("当用户需要使用 {public_surface} 时，先从此索引选择对应命令。")
+        }
+    };
+    tos_core::agent::skill_markdown::frontmatter(&format!("{surface}-commands"), &description)
+        + &body
 }
 
-fn skill_markdown(skill: &SkillDefinition, language: DocumentationLanguage) -> String {
-    let examples = if skill.examples.is_empty() {
-        match language {
-            DocumentationLanguage::En => {
-                "- Run with `--describe` first to inspect the command contract.".to_string()
-            }
-            DocumentationLanguage::Zh => {
-                "- 先运行 `--describe` 检查命令契约，再决定是否执行。".to_string()
-            }
-        }
+fn skill_markdown(
+    skill: &SkillDefinition,
+    language: DocumentationLanguage,
+    root: &clap::Command,
+) -> String {
+    use tos_core::agent::skill_markdown::{render, CommandSkill};
+
+    let is_chinese = matches!(language, DocumentationLanguage::Zh);
+    let description = if is_chinese {
+        localized_skill_description_zh(skill)
     } else {
-        skill
-            .examples
-            .iter()
-            .map(|example| format!("- `{example}`"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        skill.description.clone()
     };
-    let input_schema = localized_input_schema(&skill.input_schema, language);
-    let schema = serde_json::to_string_pretty(&input_schema).unwrap_or_else(|_| "{}".to_string());
-    match language {
-        DocumentationLanguage::En => format!(
-            r#"# {name}
-
-Use this skill when the user wants to run `{command}` with the ByteCloud TOS CLI.
-
-## Description
-
-{description}
-
-## Command
-
-`{command}`
-
-Risk level: `{risk_level}`
-
-## Inputs
-
-```json
-{schema}
-```
-
-## Examples
-
-{examples}
-
-## Execution
-
-Prefer `tos {suffix} --describe` or `tos {suffix} --dry-run --output json` before executing a command that writes or deletes data. Destructive commands must include the required `--force` and exact `--confirm` target.
-"#,
-            name = skill.name,
-            command = skill.command,
-            description = skill.description,
-            risk_level = skill.risk_level,
-            schema = schema,
-            examples = examples,
-            suffix = skill
-                .command
-                .strip_prefix("tos ")
-                .unwrap_or(skill.command.as_str()),
-        ),
-        DocumentationLanguage::Zh => format!(
-            r#"# {name}
-
-当用户需要通过 ByteCloud TOS CLI 运行 `{command}` 时使用此 Skill。
-
-## 说明
-
-{description}
-
-## 命令
-
-`{command}`
-
-风险等级：`{risk_level}`
-
-## 输入
-
-```json
-{schema}
-```
-
-## 示例
-
-{examples}
-
-## 执行建议
-
-执行会写入或删除数据的命令前，优先运行 `tos {suffix} --describe` 或 `tos {suffix} --dry-run --output json`。破坏性命令必须包含必需的 `--force` 和精确匹配目标的 `--confirm`。
-"#,
-            name = skill.name,
-            command = skill.command,
-            description = localized_skill_description_zh(skill),
-            risk_level = skill.risk_level,
-            schema = schema,
-            examples = examples,
-            suffix = skill
-                .command
-                .strip_prefix("tos ")
-                .unwrap_or(skill.command.as_str()),
-        ),
-    }
+    // [Review Fix #Skill2] Resolve every displayed command at export time;
+    // canonical registry IDs and MCP names remain stable across entrypoints.
+    let public_command = public_tos_command(&skill.command);
+    let examples = skill
+        .examples
+        .iter()
+        .map(|example| public_tos_example(example))
+        .collect::<Vec<_>>();
+    let schema = localized_input_schema(&skill.input_schema, language);
+    render(
+        &CommandSkill {
+            name: &skill.name,
+            command: &skill.command,
+            public_command: &public_command,
+            description: &description,
+            risk: &skill.risk_level,
+            schema: &schema,
+            examples: &examples,
+            is_chinese,
+        },
+        root,
+    )
 }
 
 fn maybe_push<F>(
@@ -1562,9 +1766,21 @@ fn config_check(global: &GlobalArgs) -> Result<DoctorCheck, CliError> {
     let path = global.config_path();
     let profile = effective_tos_profile(global)?;
     let has_psm = has_non_empty_value(profile.psm.as_deref());
+    let endpoint = profile
+        .endpoint
+        .as_deref()
+        .filter(|value| has_non_empty_value(Some(value)));
+    let has_effective_region = has_non_empty_value(profile.region.as_deref())
+        || endpoint.and_then(derive_region_from_endpoint).is_some();
+    // [Review Fix #33] An explicit endpoint wins over PSM and retains region validation.
+    let is_ready = if endpoint.is_some() {
+        has_effective_region
+    } else {
+        has_psm
+    };
     Ok(DoctorCheck {
         name: "config",
-        status: if profile.endpoint.is_some() || (has_psm && profile.region.is_some()) {
+        status: if is_ready {
             "passed"
         } else {
             "warning"
@@ -1590,7 +1806,11 @@ fn config_check(global: &GlobalArgs) -> Result<DoctorCheck, CliError> {
 }
 
 fn auth_check(global: &GlobalArgs) -> Result<DoctorCheck, CliError> {
-    let profile = effective_tos_profile(global)?.redacted();
+    let inspection = ve_tos_cli::handler::common::inspect_byte_tos_runtime(global)?;
+    if inspection.mode == ByteTosAuthMode::Zti {
+        return Ok(zti_auth_check(inspection.source.as_str()));
+    }
+    let profile = inspection.profile.redacted();
     let has_access_key = profile.access_key_id.is_some();
     let has_secret_key = profile.secret_access_key.is_some();
     let has_security_token = profile.security_token.is_some();
@@ -1607,6 +1827,8 @@ fn auth_check(global: &GlobalArgs) -> Result<DoctorCheck, CliError> {
             "tos-cli credentials are incomplete (check BYTE_TOS_* or [profile.tos])".to_string()
         },
         details: json!({
+            "mode": "aksk",
+            "mode_source": inspection.source.as_str(),
             "has_access_key": has_access_key,
             "has_secret_key": has_secret_key,
             "has_security_token": has_security_token,
@@ -1616,6 +1838,33 @@ fn auth_check(global: &GlobalArgs) -> Result<DoctorCheck, CliError> {
             "env_prefix": "BYTE_TOS",
         }),
     })
+}
+
+fn zti_auth_check(mode_source: &str) -> DoctorCheck {
+    let source = tos_core::infra::zti_source::configured_source_kind();
+    DoctorCheck {
+        name: "auth",
+        status: if source.is_some() {
+            "passed"
+        } else {
+            "warning"
+        },
+        message: if source.is_some() {
+            "ZTI token source is configured; token and remote authorization were not verified"
+        } else {
+            "ZTI is built in, but no token source was found"
+        }
+        .to_string(),
+        details: json!({
+            "mode": "zti",
+            "mode_source": mode_source,
+            "provider_available": true,
+            "source": source.unwrap_or("none"),
+            "source_configured": source.is_some(),
+            "token_read": false,
+            "remote_verified": false,
+        }),
+    }
 }
 
 fn registry_check() -> DoctorCheck {
@@ -1635,17 +1884,11 @@ async fn network_check(global: &GlobalArgs, args: &DoctorArgs) -> Result<DoctorC
     let has_psm = has_non_empty_value(profile.psm.as_deref());
     let Some(target) = profile.endpoint.clone() else {
         let has_region = profile.region.is_some();
-        let (status, message, hint) = if has_psm && has_region {
+        let (status, message, hint) = if has_psm {
             (
                 "passed",
                 "tos-cli will use PSM service discovery; live endpoint probe is skipped without --endpoint",
                 "run a bucket command with --psm or configure [profile.tos].psm to validate service discovery",
-            )
-        } else if has_psm {
-            (
-                "warning",
-                "tos-cli PSM service discovery is configured, but region is required for signing",
-                "configure region via --region, BYTE_TOS_REGION, or [profile].region",
             )
         } else {
             (
@@ -1815,83 +2058,180 @@ fn completion_check() -> DoctorCheck {
 }
 
 fn effective_tos_profile(global: &GlobalArgs) -> Result<Profile, CliError> {
-    if global.profile.is_empty() {
-        return Err(CliError::ValidationError(
-            "Invalid profile name: profile must not be empty".to_string(),
-        ));
-    }
-
-    let config_path = global.existing_runtime_config_path()?;
-    let config_dir = ConfigFile::config_dir_from_path(&config_path);
-    let config = ConfigFile::load_from(&config_path)?;
-    let env_profile = Profile::from_byte_tos_env();
-    let credentials_path = global.existing_runtime_credentials_path()?;
-    let stored_credentials = CredentialsFile::load_from(&credentials_path)?.effective_aksk(
-        &global.profile,
-        CredentialSection::Tos,
-        &credentials_path,
-    )?;
-    let mut config_profile = if config.profiles.is_empty() && global.profile == "default" {
-        Profile::default()
-    } else {
-        match config.get_effective_profile_in_dir(&global.profile, Binary::Tos, &config_dir) {
-            Ok(effective) => effective.into_flat_profile(),
-            Err(CliError::ConfigMissing(_))
-                if has_profile_values(&env_profile) || !stored_credentials.is_empty() =>
-            {
-                Profile::default()
-            }
-            Err(err) => return Err(err),
-        }
-    };
-    stored_credentials.apply_to_profile(&mut config_profile);
-
-    let mut cli_profile = Profile::default();
-    cli_profile.region = global.region.clone();
-    cli_profile.endpoint = global.endpoint.clone();
-    cli_profile.control_endpoint = global.control_endpoint.clone();
-    cli_profile.account_id = global.account_id.clone();
-    Ok(merge_tos_runtime_profile(
-        env_profile,
-        config_profile,
-        cli_profile,
-    ))
+    Ok(ve_tos_cli::handler::common::inspect_byte_tos_runtime(global)?.profile)
 }
 
-fn has_profile_values(profile: &Profile) -> bool {
-    profile.region.is_some()
-        || profile.access_key_id.is_some()
-        || profile.secret_access_key.is_some()
-        || profile.security_token.is_some()
-        || profile.endpoint.is_some()
-        || profile.psm.is_some()
-        || profile.idc.is_some()
-        || profile.cluster.is_some()
-        || profile.addr_family.is_some()
-        || profile.control_endpoint.is_some()
-        || profile.account_id.is_some()
-        || profile.checkpoint_dir.is_some()
-        || profile.batch_report_dir.is_some()
-        || profile.batch_report_format.is_some()
-        || profile.progress_enabled.is_some()
-        || profile.max_retry_count.is_some()
-        || profile.requesttimeout.is_some()
-        || profile.connecttimeout.is_some()
-        || profile.maxconnections.is_some()
+fn string_field<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a str>, CliError> {
+    // [Review Fix #26] A present but malformed profile or endpoint must not
+    // silently select the server's defaults for an MCP execution.
+    object
+        .get(key)
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                CliError::ValidationError(format!("MCP argument '{key}' must be a string"))
+            })
+        })
+        .transpose()
 }
 
-fn string_field<'a>(object: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a str> {
-    object.get(key).and_then(Value::as_str)
-}
-
-fn bool_field(object: &serde_json::Map<String, Value>, key: &str) -> Option<bool> {
-    object.get(key).and_then(Value::as_bool)
+fn bool_field(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<bool>, CliError> {
+    object
+        .get(key)
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                CliError::ValidationError(format!("MCP argument '{key}' must be boolean"))
+            })
+        })
+        .transpose()
 }
 
 #[cfg(test)]
 mod chinese_metadata_tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn mcp_doctor_uses_switch_for_live_network_and_value_for_timeout() {
+        let arguments = json!({
+            "check": "network",
+            "live-network": true,
+            "network-timeout-ms": 2500,
+        });
+        let argv = build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            "tos doctor",
+            arguments.as_object().unwrap(),
+        )
+        .unwrap();
+        assert!(argv.iter().any(|arg| arg == "--live-network"));
+        assert!(argv.windows(2).any(|pair| pair == ["--check", "network"]));
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["--network-timeout-ms", "2500"]));
+        assert!(!argv.iter().any(|arg| arg == "true"));
+    }
+
+    #[test]
+    fn mcp_rejects_non_boolean_switch_values_before_building_delete_argv() {
+        for invalid in [json!("true"), json!(null), json!([true])] {
+            let arguments = json!({
+                "path": "tos://bucket/key",
+                "all-versions": invalid,
+                "execute": true,
+            });
+            let error = build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                "tos rm",
+                arguments.as_object().unwrap(),
+            )
+            .expect_err("invalid switch value must fail before execution");
+            assert!(error.to_string().contains("all-versions"), "{error}");
+        }
+    }
+
+    #[test]
+    fn mcp_rejects_non_boolean_dry_run_before_building_argv() {
+        let arguments = json!({"path": "tos://bucket/key", "dry_run": "true"});
+        let error = build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            "tos rm",
+            arguments.as_object().unwrap(),
+        )
+        .expect_err("invalid dry_run must not be silently omitted");
+        assert!(error.to_string().contains("dry_run"), "{error}");
+    }
+
+    #[test]
+    fn mcp_rejects_non_string_global_overrides_before_building_delete_argv() {
+        for field in ["profile", "region", "endpoint", "output"] {
+            let mut arguments = serde_json::Map::new();
+            arguments.insert("path".into(), json!("tos://bucket/key"));
+            arguments.insert(field.into(), json!(0));
+            let error = build_mcp_typed_argv(&GlobalArgs::default(), "tos rm", &arguments)
+                .expect_err("invalid global override must not fall back");
+            assert!(error.to_string().contains(field), "{field}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_rejects_non_boolean_execute_before_planning() {
+        let skill = skill_definitions()
+            .into_iter()
+            .find(|skill| skill.command == "tos rm")
+            .unwrap();
+        let arguments = json!({"path": "tos://bucket/key", "execute": "true"});
+        let error = mcp_execute_typed_command(&GlobalArgs::default(), &skill, &arguments)
+            .await
+            .expect_err("invalid execute must be rejected");
+        assert!(error.to_string().contains("execute"), "{error}");
+    }
+
+    #[test]
+    fn mcp_inherits_byte_tos_mode_and_explicit_config_paths() {
+        let global = GlobalArgs {
+            byte_tos_auth_mode: Some("zti".into()),
+            config_path: Some("/isolated/config.toml".into()),
+            credentials_path: Some("/isolated/credentials.toml".into()),
+            ..Default::default()
+        };
+        let argv = build_mcp_typed_argv(&global, "tos ls", &serde_json::Map::new()).unwrap();
+        for pair in [
+            ["--auth-mode", "zti"],
+            ["--config-path", "/isolated/config.toml"],
+            ["--credentials-path", "/isolated/credentials.toml"],
+        ] {
+            assert!(argv.windows(2).any(|window| window == pair), "{argv:?}");
+        }
+        assert!(
+            argv.iter().position(|arg| arg == "--auth-mode").unwrap()
+                > argv.iter().position(|arg| arg == "ls").unwrap()
+        );
+    }
+
+    #[test]
+    fn mcp_tool_auth_mode_overrides_serve_and_rejects_invalid_values() {
+        let global = GlobalArgs {
+            byte_tos_auth_mode: Some("aksk".into()),
+            ..Default::default()
+        };
+        let arguments = serde_json::json!({"auth_mode": "zti"});
+        let argv = build_mcp_typed_argv(&global, "tos ls", arguments.as_object().unwrap())
+            .expect("tool mode should override serve mode");
+        assert_eq!(argv.iter().filter(|arg| *arg == "--auth-mode").count(), 1);
+        assert!(argv.windows(2).any(|pair| pair == ["--auth-mode", "zti"]));
+
+        let schema = skill_input_schema(find_capability("tos ls").unwrap());
+        assert_eq!(
+            schema["properties"]["auth_mode"]["enum"],
+            serde_json::json!(["aksk", "zti"])
+        );
+        for invalid in [serde_json::json!("unified"), serde_json::json!(42)] {
+            let arguments = serde_json::json!({"auth_mode": invalid});
+            assert!(
+                build_mcp_typed_argv(&global, "tos ls", arguments.as_object().unwrap()).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_presign_does_not_advertise_or_accept_zti() {
+        let schema = skill_input_schema(find_capability("tos presign").unwrap());
+        assert_eq!(
+            schema["properties"]["auth_mode"]["enum"],
+            serde_json::json!(["aksk"])
+        );
+        let global = GlobalArgs {
+            byte_tos_auth_mode: Some("zti".into()),
+            ..Default::default()
+        };
+        assert!(build_mcp_typed_argv(&global, "tos presign", &serde_json::Map::new()).is_err());
+    }
 
     fn collect_human_metadata(
         value: &Value,

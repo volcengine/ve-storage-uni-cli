@@ -16,6 +16,7 @@
 
 pub(crate) mod atomic_file;
 pub mod auth;
+pub mod byte_tos_auth;
 pub mod client;
 pub mod config;
 pub mod credentials;
@@ -23,3 +24,6 @@ pub mod crypto;
 pub mod discovery;
 pub mod retry;
 pub mod unified_credentials;
+pub(crate) mod zti_agent;
+pub mod zti_credentials;
+pub mod zti_source;

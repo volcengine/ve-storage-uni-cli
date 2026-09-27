@@ -30,7 +30,8 @@ use crate::infra::retry::{
     should_retry_storage_status, storage_backoff_delay, storage_retry_after_delay,
 };
 use crate::infra::unified_credentials::{UnifiedCredentialProvider, UnifiedCredentialValue};
-use reqwest::{Body, Client, Method, Response, StatusCode};
+use crate::infra::zti_credentials::ZtiTokenProvider;
+use reqwest::{Body, Client, Method, RequestBuilder, Response, StatusCode};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -38,9 +39,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+#[cfg(test)]
+#[path = "client_zti_tests.rs"]
+mod zti_tests;
+
 pub const USER_AGENT_NAME_ENV: &str = "VE_STORAGE_UNI_USER_AGENT_NAME";
 const TOS_CONFIG_BINARY_ENV: &str = "VE_STORAGE_UNI_TOS_CONFIG_BINARY";
 const PSM_PLACEHOLDER_ENDPOINT: &str = "http://psm.invalid";
+const ZTI_TOKEN_HEADER: &str = "x-tos-ztitoken-with-acp";
 /// Maximum bytes to drain from a retryable (408/429/5xx) response body before
 /// giving up and letting the connection close. Error bodies are normally a few
 /// hundred bytes; 10 MiB is generous while preventing a misbehaving server from
@@ -118,12 +124,26 @@ enum TosSigner {
 
 enum RequestAuth {
     Static(TosSigner),
+    Zti(ZtiTokenProvider),
     Unified {
         provider: UnifiedCredentialProvider,
         algorithm: TosSignAlgorithm,
         region: String,
         service: String,
     },
+}
+
+enum CredentialSource {
+    Static,
+    Unified(UnifiedCredentialProvider),
+    Zti(ZtiTokenProvider),
+}
+
+struct SigningInput<'a> {
+    method: &'a Method,
+    path: &'a str,
+    query: &'a BTreeMap<String, String>,
+    payload_hash: &'a str,
 }
 
 enum AttemptSigner<'a> {
@@ -144,6 +164,9 @@ impl RequestAuth {
     async fn resolve_attempt_signer(&self) -> Result<AttemptSigner<'_>, CliError> {
         match self {
             Self::Static(signer) => Ok(AttemptSigner::Borrowed(signer)),
+            Self::Zti(_) => Err(CliError::ValidationError(
+                "ZTI authentication does not support presign or form signing".to_string(),
+            )),
             Self::Unified {
                 provider,
                 algorithm,
@@ -373,6 +396,57 @@ pub struct ReplayableStreamingRequest {
 }
 
 impl TosClient {
+    /// Build a ByteTOS client using an injected token provider, without AK/SK.
+    ///
+    /// # Parameters
+    /// * `profile` - Network and retry settings; static credentials are ignored.
+    /// * `provider` - Lazy token supplier, called once per HTTP attempt.
+    ///
+    /// # Returns
+    /// A ByteTOS client with a fresh request trace and redirects disabled.
+    ///
+    /// # Errors
+    /// Returns network configuration or HTTP client construction errors.
+    /// No token is requested until an HTTP attempt is made.
+    pub fn new_with_zti_credentials(
+        profile: &Profile,
+        provider: ZtiTokenProvider,
+    ) -> Result<Self, CliError> {
+        Self::new_with_zti_credentials_and_request_trace(
+            profile,
+            provider,
+            Arc::new(ServiceRequestTrace::default()),
+        )
+    }
+
+    /// Build a ByteTOS ZTI client with the invocation's request trace.
+    ///
+    /// # Parameters
+    /// * `profile` - Network and retry settings; static credentials are ignored.
+    /// * `provider` - Lazy token supplier; initialization and refresh belong to it.
+    /// * `request_trace` - Shared trace receiving HTTP request IDs.
+    ///
+    /// # Returns
+    /// A ByteTOS client that sends Token headers instead of AK/SK signatures.
+    /// Redirects are disabled to prevent forwarding tokens to another endpoint.
+    ///
+    /// # Errors
+    /// Returns network configuration or HTTP client construction errors.
+    /// Provider errors are deferred until a request; presign/form signing is unsupported.
+    pub fn new_with_zti_credentials_and_request_trace(
+        profile: &Profile,
+        provider: ZtiTokenProvider,
+        request_trace: Arc<ServiceRequestTrace>,
+    ) -> Result<Self, CliError> {
+        Self::new_with_auth(
+            profile,
+            "tos",
+            TosSignAlgorithm::ByteTosV1,
+            request_trace,
+            CredentialSource::Zti(provider),
+        )
+    }
+
     /// Build a TOS client with an isolated request-ID trace.
     pub fn new(profile: &Profile, service: &str) -> Result<Self, CliError> {
         Self::new_with_sign_algorithm(profile, service, active_tos_sign_algorithm())
@@ -425,7 +499,7 @@ impl TosClient {
             service,
             TosSignAlgorithm::Tos4,
             request_trace,
-            Some(provider),
+            CredentialSource::Unified(provider),
         )
     }
 
@@ -448,7 +522,13 @@ impl TosClient {
         sign_algorithm: TosSignAlgorithm,
         request_trace: Arc<ServiceRequestTrace>,
     ) -> Result<Self, CliError> {
-        Self::new_with_auth(profile, service, sign_algorithm, request_trace, None)
+        Self::new_with_auth(
+            profile,
+            service,
+            sign_algorithm,
+            request_trace,
+            CredentialSource::Static,
+        )
     }
 
     fn new_with_auth(
@@ -456,18 +536,20 @@ impl TosClient {
         service: &str,
         sign_algorithm: TosSignAlgorithm,
         request_trace: Arc<ServiceRequestTrace>,
-        unified_provider: Option<UnifiedCredentialProvider>,
+        credentials: CredentialSource,
     ) -> Result<Self, CliError> {
         let (endpoint, psm_resolver, region) =
             resolve_client_network(profile, service, sign_algorithm)?;
-        let request_auth = match unified_provider {
-            Some(provider) => RequestAuth::Unified {
+        let is_zti = matches!(&credentials, CredentialSource::Zti(_));
+        let request_auth = match credentials {
+            CredentialSource::Zti(provider) => RequestAuth::Zti(provider),
+            CredentialSource::Unified(provider) => RequestAuth::Unified {
                 provider,
                 algorithm: sign_algorithm,
                 region: region.clone(),
                 service: service.to_string(),
             },
-            None => RequestAuth::Static(static_signer_from_profile(
+            CredentialSource::Static => RequestAuth::Static(static_signer_from_profile(
                 profile,
                 service,
                 sign_algorithm,
@@ -475,7 +557,7 @@ impl TosClient {
             )?),
         };
         Ok(Self {
-            http: build_http_client(profile)?,
+            http: build_http_client(profile, is_zti)?,
             request_auth,
             sign_algorithm,
             region,
@@ -666,6 +748,11 @@ impl TosClient {
         key: &str,
         expires: u64,
     ) -> Result<String, CliError> {
+        if matches!(&self.request_auth, RequestAuth::Zti(_)) {
+            return Err(CliError::ValidationError(
+                "ZTI authentication does not support presign".to_string(),
+            ));
+        }
         if self.psm_resolver.is_some() {
             return Err(CliError::ValidationError(
                 "presign requires endpoint when using PSM; pass --endpoint or remove --psm"
@@ -817,9 +904,9 @@ impl TosClient {
         extra_headers: BTreeMap<String, String>,
         body: Option<Vec<u8>>,
     ) -> Result<Response, CliError> {
-        let payload_hash = match &body {
-            Some(b) => hash_payload(b),
-            None => EMPTY_PAYLOAD_HASH.to_string(),
+        let payload_hash = match (&self.request_auth, &body) {
+            (RequestAuth::Zti(_), _) | (_, None) => EMPTY_PAYLOAD_HASH.to_string(),
+            (_, Some(bytes)) => hash_payload(bytes),
         };
         let target = self.resolve_request_target(url, path).await?;
 
@@ -832,17 +919,6 @@ impl TosClient {
 
         let mut headers = extra_headers.clone();
         headers.insert("host".to_string(), host);
-
-        let signer = self.request_auth.resolve_attempt_signer().await?;
-        add_copy_source_signature(signer.signer(), method.as_str(), &mut headers);
-
-        let signed = signer.signer().sign_request(
-            method.as_str(),
-            path,
-            &query_params,
-            &headers,
-            &payload_hash,
-        );
 
         // 构建实际请求
         let mut full_url = target.url.clone();
@@ -857,18 +933,19 @@ impl TosClient {
             );
         }
 
-        let mut req = self.http.request(method, &full_url);
-        for (key, value) in &signed.headers {
-            req = req.header(key.as_str(), value.as_str());
-        }
-        // 附加额外 headers
-        for (key, value) in &headers {
-            if !key.eq_ignore_ascii_case("host")
-                && !has_header_case_insensitive(&signed.headers, key.as_str())
-            {
-                req = req.header(key.as_str(), value.as_str());
-            }
-        }
+        let signing = SigningInput {
+            method: &method,
+            path,
+            query: &query_params,
+            payload_hash: &payload_hash,
+        };
+        let mut req = self
+            .authenticate_request(
+                self.http.request(method.clone(), &full_url),
+                signing,
+                headers,
+            )
+            .await?;
 
         if let Some(body_bytes) = body {
             req = req.body(body_bytes);
@@ -1085,6 +1162,55 @@ impl TosClient {
         ))
     }
 
+    async fn authenticate_request(
+        &self,
+        mut request: RequestBuilder,
+        signing: SigningInput<'_>,
+        mut headers: BTreeMap<String, String>,
+    ) -> Result<RequestBuilder, CliError> {
+        if let RequestAuth::Zti(provider) = &self.request_auth {
+            // The selected provider owns identity; extra headers cannot override it
+            // or attach stale signatures from another authentication mode.
+            headers.retain(|name, _| !is_zti_reserved_header(name));
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            request = without_implicit_authorization(request).map_err(|error| {
+                // [Review Fix #3] Early builder errors must clear the previous
+                // response just like errors returned by reqwest's send path.
+                self.request_trace.record_no_response();
+                error
+            })?;
+            let token = provider.get_header_value().await.map_err(|error| {
+                // [Review Fix #1] A failed retry's token lookup must not retain
+                // the previous HTTP response as the terminal attempt's result.
+                self.request_trace.record_no_response();
+                error
+            })?;
+            return Ok(request.header(ZTI_TOKEN_HEADER, token));
+        }
+        let signer = self.request_auth.resolve_attempt_signer().await?;
+        add_copy_source_signature(signer.signer(), signing.method.as_str(), &mut headers);
+        let signed = signer.signer().sign_request(
+            signing.method.as_str(),
+            signing.path,
+            signing.query,
+            &headers,
+            signing.payload_hash,
+        );
+        for (name, value) in &signed.headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        for (name, value) in headers {
+            if !name.eq_ignore_ascii_case("host")
+                && !has_header_case_insensitive(&signed.headers, &name)
+            {
+                request = request.header(name, value);
+            }
+        }
+        Ok(request)
+    }
+
     async fn send_signed_request_once(
         &self,
         method: Method,
@@ -1105,17 +1231,6 @@ impl TosClient {
         let mut headers = extra_headers.clone();
         headers.insert("host".to_string(), host);
 
-        let signer = self.request_auth.resolve_attempt_signer().await?;
-        add_copy_source_signature(signer.signer(), method.as_str(), &mut headers);
-
-        let signed = signer.signer().sign_request(
-            method.as_str(),
-            path,
-            &query_params,
-            &headers,
-            &payload_hash,
-        );
-
         let mut full_url = target.url.clone();
         if !query_params.is_empty() {
             // [Review Fix #1] Keep streaming requests' URL query rendering
@@ -1127,17 +1242,19 @@ impl TosClient {
             );
         }
 
-        let mut req = self.http.request(method, &full_url);
-        for (key, value) in &signed.headers {
-            req = req.header(key.as_str(), value.as_str());
-        }
-        for (key, value) in &headers {
-            if !key.eq_ignore_ascii_case("host")
-                && !has_header_case_insensitive(&signed.headers, key.as_str())
-            {
-                req = req.header(key.as_str(), value.as_str());
-            }
-        }
+        let signing = SigningInput {
+            method: &method,
+            path,
+            query: &query_params,
+            payload_hash: &payload_hash,
+        };
+        let mut req = self
+            .authenticate_request(
+                self.http.request(method.clone(), &full_url),
+                signing,
+                headers,
+            )
+            .await?;
         if let Some(body) = body {
             req = req.body(body);
         }
@@ -1304,6 +1421,9 @@ fn resolve_client_network(
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .or_else(|| endpoint.as_deref().and_then(derive_region_from_endpoint))
+        // [Review Fix #32] ByteTOS PSM selects the target without a region;
+        // keep the SDK's empty signing region when none was configured.
+        .or_else(|| psm_resolver.as_ref().map(|_| String::new()))
         .ok_or_else(|| CliError::ConfigMissing("region is required".to_string()))?;
     Ok((endpoint, psm_resolver, region))
 }
@@ -1335,8 +1455,38 @@ fn static_signer_from_profile(
     })
 }
 
-fn build_http_client(profile: &Profile) -> Result<Client, CliError> {
+fn without_implicit_authorization(request: RequestBuilder) -> Result<RequestBuilder, CliError> {
+    // [Review Fix #2] reqwest creates Basic Authorization from URL userinfo
+    // before extra headers are applied; remove it from the actual request too.
+    let (client, request) = request.build_split();
+    let mut request = request.map_err(CliError::Http)?;
+    request.headers_mut().remove(reqwest::header::AUTHORIZATION);
+    Ok(RequestBuilder::from_parts(client, request))
+}
+
+fn is_zti_reserved_header(name: &str) -> bool {
+    [
+        "host",
+        "authorization",
+        "x-tos-signature",
+        "x-tos-copy-signature",
+        "x-tos-security-token",
+        "x-tos-date",
+        "x-tos-content-sha256",
+        ZTI_TOKEN_HEADER,
+    ]
+    .iter()
+    .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
+
+fn build_http_client(profile: &Profile, is_zti: bool) -> Result<Client, CliError> {
     Client::builder()
+        // Custom identity headers are not stripped by reqwest's redirect policy.
+        .redirect(if is_zti {
+            reqwest::redirect::Policy::none()
+        } else {
+            reqwest::redirect::Policy::default()
+        })
         .user_agent(storage_user_agent())
         .tcp_nodelay(true)
         .connect_timeout(Duration::from_secs(
@@ -1639,12 +1789,14 @@ fn add_copy_source_signature(
 mod tests {
     use super::{
         add_copy_source_signature, derive_region_from_endpoint, storage_user_agent_for_name,
-        ReplayableRequest, ReplayableStreamingRequest, TosClient, TosSignAlgorithm, TosSigner,
+        ReplayableRequest, ReplayableStreamingRequest, RequestAuth, TosClient, TosSignAlgorithm,
+        TosSigner, EMPTY_PAYLOAD_HASH,
     };
     use crate::agent::error::CliError;
     use crate::agent::request_id::ServiceRequestTrace;
     use crate::infra::config::Profile;
     use crate::infra::unified_credentials::{UnifiedCredentialProvider, UnifiedCredentialValue};
+    use crate::infra::zti_credentials::ZtiTokenProvider;
     use reqwest::{Method, StatusCode};
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
@@ -2271,6 +2423,43 @@ mod tests {
         .expect("endpoint client");
 
         assert!(endpoint_client.psm_resolver.is_none());
+    }
+
+    #[test]
+    fn bytetos_psm_accepts_missing_region_for_aksk_and_zti() {
+        let profile = Profile {
+            access_key_id: Some("ak".to_string()),
+            secret_access_key: Some("sk".to_string()),
+            psm: Some("tos.example.service".to_string()),
+            ..Default::default()
+        };
+        let (aksk, zti) = with_test_tosapi_addr(Some("127.0.0.1:1".to_string()), || {
+            (
+                TosClient::new_with_sign_algorithm(&profile, "tos", TosSignAlgorithm::ByteTosV1),
+                TosClient::new_with_zti_credentials(
+                    &profile,
+                    ZtiTokenProvider::new(|| async { Ok("unused".to_string()) }),
+                ),
+            )
+        });
+
+        let aksk = aksk.expect("AK/SK PSM client without region");
+        let zti = zti.expect("ZTI PSM client without region");
+        assert!(aksk.psm_resolver.is_some());
+        assert!(zti.psm_resolver.is_some());
+        assert_eq!(aksk.region(), "");
+        assert_eq!(zti.region(), "");
+        let RequestAuth::Static(signer) = &aksk.request_auth else {
+            panic!("AK/SK mode must retain its V1 signer");
+        };
+        let signature = signer.sign_request(
+            "GET",
+            "/bucket",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            EMPTY_PAYLOAD_HASH,
+        );
+        assert!(signature.headers["X-Tos-Signature"].contains("//tos/sig_request"));
     }
 
     #[test]

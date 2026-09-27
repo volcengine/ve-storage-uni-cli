@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+pub mod auth;
 pub mod meta;
 
 use clap::{Args, Subcommand};
@@ -46,7 +47,8 @@ pub enum TosCliCommand {
     Cat(high_level::CatArgs),
     /// Upload stdin to an object
     Put(high_level::PutArgs),
-    /// Generate a presigned URL
+    // [Review Fix #1] Presign inherits the mode flag, so its help must state the AK/SK boundary.
+    /// Generate presigned URL (AK/SK only; ZTI is not supported)
     Presign(high_level::PresignArgs),
 
     // Utilities
@@ -233,7 +235,7 @@ High-Level Commands:
   find          Find objects by name, size, or mtime
   cat           Stream object content
   put           Upload stdin to an object
-  presign       Generate a presigned URL
+  presign       Generate presigned URL (AK/SK only; ZTI is not supported)
 
 Capabilities / Utilities:
   capabilities  Discover CLI capabilities
@@ -251,11 +253,12 @@ TOS Target Syntax:
 
 Global Options:
   -P, --profile <PROFILE>          Configuration profile name
+      --auth-mode <MODE>           Authentication mode: aksk or zti (env: BYTETOS_AUTH_MODE)
       --config-path <PATH>         Path to config TOML (env: TOS_CONFIG_PATH)
       --credentials-path <PATH>    Path to credentials TOML (env: TOS_CREDENTIALS_PATH)
   -r, --region <REGION>            Region
   -e, --endpoint <ENDPOINT>        Custom endpoint
-      --psm <PSM>                  PSM service name for BNS discovery
+      --psm <PSM>                  PSM service name for discovery
       --idc <IDC>                  IDC used with --psm
       --cluster <CLUSTER>          Cluster used with --psm
       --addr-family <VALUE>        Address family used with --psm: v4, v6, or dual-stack
@@ -268,6 +271,15 @@ Global Options:
       --no-color [<BOOL>]          Disable colored output
   -v, --verbose                    Include extra diagnostic output where supported
   -q, --quiet                      Disable prompts and progress output
+
+Authentication:
+  Precedence: --auth-mode > [profile.tos].auth_mode > BYTETOS_AUTH_MODE > aksk.
+  ZTI uses SEC_TOKEN_STRING, a local Agent, or SEC_TOKEN_PATH; it ignores local AK/SK
+  and never falls back to AK/SK. This option does not enable ZTI for other tools.
+
+PSM Discovery:
+  BNS routes by bucket by default. TOS_FORCE_PSM=true skips BNS and resolves
+  the selected PSM directly through Consul. An explicit --endpoint overrides PSM.
 
 Examples:
   tos-cli ls tos://mybucket/

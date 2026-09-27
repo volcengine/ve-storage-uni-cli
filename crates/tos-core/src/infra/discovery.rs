@@ -43,6 +43,7 @@ const DEFAULT_LOCAL_PSM_WEIGHT: f32 = 100.0;
 const DEFAULT_CLUSTER: &str = "default";
 const HEADER_REMOTE_PSM: &str = "x-tos-remote-psm";
 const TEST_TOSAPI_ADDR_ENV: &str = "TEST_TOSAPI_ADDR";
+const TOS_FORCE_PSM_ENV: &str = "TOS_FORCE_PSM";
 const TOSV_BOE_ENDPOINT: &str = "http://tosv.boe.byted.org/obj/tos-bns-service/{idc}/{bucket}";
 const TOSV_ENDPOINT: &str = "http://tosv.byted.org/obj/tos-bns-service/{idc}/{bucket}";
 const TOSV_GISO_ENDPOINT: &str = "http://tosv.byted.org/obj/tos-bns-service-aiso/{idc}/{bucket}";
@@ -155,6 +156,7 @@ pub struct PsmResolver {
     consul: Arc<ConsulLookupClient>,
     managers: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<AddrManager>>>>,
     static_endpoints: Option<Vec<WeightedEndpoint>>,
+    is_force_psm: bool,
 }
 
 impl PsmResolver {
@@ -169,6 +171,10 @@ impl PsmResolver {
             consul: Arc::new(ConsulLookupClient::from_env()?),
             managers: tokio::sync::Mutex::new(HashMap::new()),
             static_endpoints: static_endpoints_from_env(),
+            // An explicit force request keeps the configured PSM authoritative
+            // instead of letting bucket-level BNS metadata replace it.
+            is_force_psm: std::env::var(TOS_FORCE_PSM_ENV)
+                .is_ok_and(|value| value.trim().eq_ignore_ascii_case("true")),
         })
     }
 
@@ -212,6 +218,7 @@ impl PsmResolver {
                 bucket,
                 self.config.clone(),
                 Arc::clone(&self.consul),
+                self.is_force_psm,
             )?)),
         )));
         managers.insert(bucket.to_string(), Arc::clone(&manager));
@@ -357,6 +364,7 @@ struct BnsTask {
     allocator: Mutex<PsmAllocator>,
     initialized: AtomicBool,
     last_refresh: Mutex<Instant>,
+    is_force_psm: bool,
 }
 
 impl BnsTask {
@@ -364,6 +372,7 @@ impl BnsTask {
         bucket: impl Into<String>,
         config: PsmDiscoveryConfig,
         consul: Arc<ConsulLookupClient>,
+        is_force_psm: bool,
     ) -> Result<Self, CliError> {
         let http = Client::builder()
             .timeout(Duration::from_secs(1))
@@ -377,6 +386,7 @@ impl BnsTask {
             allocator: Mutex::new(PsmAllocator::default()),
             initialized: AtomicBool::new(false),
             last_refresh: Mutex::new(Instant::now()),
+            is_force_psm,
         })
     }
 
@@ -397,18 +407,21 @@ impl BnsTask {
     }
 
     async fn allocate(&self) -> PsmEntry {
-        if !self.initialized.swap(true, Ordering::SeqCst) {
-            let _ = self.refresh_once().await;
-        }
-        if self.should_refresh() {
-            let _ = self.refresh_once().await;
-        }
         let local = PsmEntry {
             psm: self.config.psm.clone(),
             idc: self.config.idc.clone(),
             cluster: self.config.cluster.clone(),
             weight: DEFAULT_LOCAL_PSM_WEIGHT,
         };
+        if self.is_force_psm {
+            return local;
+        }
+        if !self.initialized.swap(true, Ordering::SeqCst) {
+            let _ = self.refresh_once().await;
+        }
+        if self.should_refresh() {
+            let _ = self.refresh_once().await;
+        }
         self.allocator
             .lock()
             .map(|mut allocator| allocator.allocate(&local))

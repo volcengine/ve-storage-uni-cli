@@ -71,6 +71,8 @@ enum ToolCommand {
     /// ByteCloud TOS commands (high-level + utilities)
     #[command(name = "tos")]
     TosCli {
+        #[command(flatten)]
+        auth: tos_cli::cli::auth::ByteTosAuthArgs,
         #[command(subcommand)]
         command: tos_cli::TosCliCommand,
     },
@@ -100,6 +102,30 @@ mod auth_mode_parser_tests {
     use super::{Cli, ToolCommand};
     use clap::Parser;
     use ve_tos_cli::domain::auth::AuthMode;
+
+    #[test]
+    fn tos_auth_mode_accepts_only_aksk_and_zti_before_or_after_command() {
+        for mode in ["aksk", "zti"] {
+            for arguments in [
+                vec!["ve-storage-uni-cli", "tos", "--auth-mode", mode, "ls"],
+                vec!["ve-storage-uni-cli", "tos", "ls", "--auth-mode", mode],
+            ] {
+                assert!(
+                    Cli::try_parse_from(arguments).is_ok(),
+                    "tos must accept {mode}"
+                );
+            }
+        }
+        for tool in ["ve-tos", "ve-adrive"] {
+            assert!(
+                Cli::try_parse_from(["ve-storage-uni-cli", tool, "--auth-mode", "zti", "ls"])
+                    .is_err()
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["ve-storage-uni-cli", "--auth-mode", "zti", "tos", "ls"]).is_err()
+        );
+    }
 
     #[test]
     fn ve_tos_auth_mode_is_tool_scoped() {
@@ -151,7 +177,9 @@ mod auth_mode_parser_tests {
         assert!(adrive_help.contains("ve logout"));
 
         let tos_help = byted_tos_grouped_help_zh();
-        assert!(!tos_help.contains("--auth-mode"));
+        assert!(tos_help.contains("--auth-mode <MODE>"));
+        assert!(tos_help.contains("BYTETOS_AUTH_MODE"));
+        assert!(tos_help.contains("aksk") && tos_help.contains("zti"));
         assert!(!tos_help.to_ascii_lowercase().contains("unified"));
     }
 }
@@ -383,6 +411,12 @@ fn display_help_text_for_args(effective_args: &[String]) -> Result<String, clap:
 
 fn localize_clap_help_zh(help: &str) -> String {
     let localized = translate_help_phrases_zh(&help)
+        // [Review Fix #18] ByteTOS narrows the shared clap enum after help
+        // rendering, so translate its surface-specific description here.
+        .replace(
+            "Recursive listing mode: hierarchical only",
+            "递归列举模式：仅支持 hierarchical",
+        )
         .replace("Usage:", "用法:")
         .replace("Arguments:", "参数:")
         .replace("Options:", "选项:")
@@ -463,6 +497,32 @@ fn help_translations_zh_longest_first() -> &'static [(&'static str, &'static str
 }
 
 const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    // [Review Fix #21] Keep ByteTOS-specific config and doctor help localized
+    // after their parser metadata stopped inheriting the ve-tos wording.
+    ("Inspect and modify ByteTOS CLI configuration", "查看和修改 ByteTOS CLI 配置"),
+    ("Inspect and modify ByteTOS CLI configuration stored in ~/.tos/config.toml.", "查看和修改存储在 ~/.tos/config.toml 中的 ByteTOS CLI 配置。"),
+    ("Initialize the selected profile without setting network defaults", "初始化所选 Profile，不设置网络默认值"),
+    ("Profile name to initialize (defaults to default)", "要初始化的 Profile 名称（默认为 default）"),
+    ("Show current configuration with secrets redacted", "显示当前配置并脱敏密钥"),
+    ("Set a ByteTOS configuration value", "设置 ByteTOS 配置值"),
+    ("Configuration key, for example region, endpoint, or staging.tos.psm", "配置键，例如 region、endpoint 或 staging.tos.psm"),
+    ("Check one module: auth, config, registry, network (or endpoint), mcp, or completion", "检查一个模块：auth、config、registry、network（或 endpoint）、mcp 或 completion"),
+    ("Kept for compatibility with existing invocations; ByteTOS doctor has no permission probe", "为兼容旧调用而保留；ByteTOS doctor 不提供权限探测"),
+    ("Probe the configured TOS endpoint; off by default to keep doctor offline", "探测已配置的 TOS endpoint；默认关闭以保持 doctor 离线运行"),
+    ("Timeout in milliseconds for --live-network", "--live-network 的超时时间（毫秒）"),
+    ("Common KEY values:", "常用 KEY 值："),
+    // [Review Fix #25] Keep the translated init hint aligned with the PSM
+    // path, which can make requests without an explicit endpoint.
+    ("Creates shared and [profile.tos] sections. Configure an endpoint (and region if it cannot be inferred), or PSM service discovery, before making requests.", "创建共享 section 和 [profile.tos] section。发起请求前请配置 endpoint（无法推导时还需配置 region），或配置 PSM 服务发现。"),
+    ("Shows effective values with source annotations such as [default], [default.tos], env, and cli.", "显示有效值及其来源标注，例如 [default]、[default.tos]、env 和 cli。"),
+    ("KEY may also name a profile, for example staging.region or staging.tos.psm.", "KEY 也可指定 Profile，例如 staging.region 或 staging.tos.psm。"),
+    ("region                         -> [active-profile]", "region                         -> 写入 [active-profile]"),
+    ("endpoint / psm / idc / cluster / addr_family -> [active-profile.tos]", "endpoint / psm / idc / cluster / addr_family -> 写入 [active-profile.tos]"),
+    ("auth_mode (aksk or zti)        -> [active-profile.tos]", "auth_mode（aksk 或 zti）        -> [active-profile.tos]"),
+    ("access_key_id / secret_access_key / security_token -> active tos credentials", "access_key_id / secret_access_key / security_token -> 当前 tos 凭证"),
+    ("checkpoint_dir / progress_enabled / max_retry_count -> [active-profile.tos]", "checkpoint_dir / progress_enabled / max_retry_count -> 写入 [active-profile.tos]"),
+    ("Exact skill name or canonical command, e.g. tos_cp or \"tos cp\"", "精确的 Skill 名称或规范命令，例如 tos_cp 或 \"tos cp\""),
+    ("Skill name, canonical command, or command suffix, e.g. ve_tos_cp or cp", "Skill 名称、规范命令或命令后缀，例如 ve_tos_cp 或 cp"),
     // [Review Fix #9] Preserve each aligned root invocation verbatim while
     // translating its separately audited human-facing service description.
     (
@@ -638,6 +698,12 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
         "Authentication mode for this invocation: aksk, oauth, or unified. Precedence is --auth-mode <MODE>, profile auth_mode, ADRIVE_AUTH_MODE, then aksk. Unified selects the same-name externally managed profile, ignores local AK/SK and OAuth credentials, and uses `ve login` / `ve logout`.",
         "本次调用的鉴权模式：aksk、oauth 或 unified。优先级为 --auth-mode <MODE>、profile auth_mode、ADRIVE_AUTH_MODE，最后为 aksk。Unified 使用同名的外部托管 profile，忽略本地 AK/SK 和 OAuth 凭证，并使用 `ve login` / `ve logout`。",
     ),
+    (
+        "Authentication mode for this invocation: aksk or zti. Precedence is --auth-mode <MODE>, [profile.tos].auth_mode, BYTETOS_AUTH_MODE, then aksk. ZTI uses SEC_TOKEN_STRING, a local Agent, or SEC_TOKEN_PATH, ignores local AK/SK, and never falls back to AK/SK.",
+        "本次调用的鉴权模式：aksk 或 zti。优先级为 --auth-mode <MODE>、[profile.tos].auth_mode、BYTETOS_AUTH_MODE，最后为 aksk。ZTI 使用 SEC_TOKEN_STRING、本地 Agent 或 SEC_TOKEN_PATH，忽略本地 AK/SK，且不会回退到 AK/SK。",
+    ),
+    ("Authentication mode for this invocation: aksk or zti", "本次调用的鉴权模式：aksk 或 zti"),
+    ("Authenticate using a ByteCloud ZTI token", "使用 ByteCloud ZTI Token 鉴权"),
     ("Availability zone", "可用区"),
     (
         "Bare AK/SK credential keys are written to the current command surface: `[active-profile.ve-tos]` for `ve-tos` and `[active-profile.tos]` for `tos`. Use an explicit `<profile>.access_key_id` or other two-segment credential key only when shared TOS credentials are intended. For `ve-tos`, an `endpoint` / `control_endpoint` / `account_id` / HTTP tuning key without an explicit binary qualifier is written to `[active-profile.ve-tos]` by default. For `tos`, `endpoint` and PSM keys are written to `[active-profile.tos]`; the `tos` entry rejects `control_endpoint` because only `ve-tos` has a control plane endpoint.",
@@ -1537,8 +1603,8 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ),
     ("ByteCloud TOS PSM service name.", "PSM 服务名。"),
     (
-        "CLI flag only. Supported by the `tos` command surface. When omitted, `--idc`, `--cluster`, and `--addr-family` do not enable PSM mode by themselves.",
-        "仅 CLI 参数。仅 tos 命令支持。未设置时，`--idc`、`--cluster` 和 `--addr-family` 不会单独启用 PSM 模式。",
+        "CLI flag only. Supported by the `tos` command surface. When omitted, `--idc`, `--cluster`, and `--addr-family` do not enable PSM mode by themselves. Set TOS_FORCE_PSM=true to skip bucket BNS routing and resolve the selected PSM directly through Consul.",
+        "仅 CLI 参数。仅 tos 命令支持。未设置时，`--idc`、`--cluster` 和 `--addr-family` 不会单独启用 PSM 模式。设置 TOS_FORCE_PSM=true 可跳过按 Bucket 的 BNS 路由，直接通过 Consul 解析所选 PSM。",
     ),
     (
         "IDC used with PSM service discovery",
@@ -1597,6 +1663,8 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Stream object content", "流式输出对象内容"),
     ("Upload stdin to an object", "将标准输入上传为对象"),
     ("Generate presigned URL", "生成预签名 URL"),
+    // [Review Fix #3] Keep the root Chinese help catalog aligned with TOS-only presign metadata.
+    ("Generate presigned URL (AK/SK only; ZTI is not supported)", "生成预签名 URL（仅支持 AK/SK，不支持 ZTI）"),
     ("Generate a presigned URL", "生成预签名 URL"),
     ("Restore archived objects", "恢复归档对象"),
     ("Restore archived object", "恢复归档对象"),
@@ -2937,6 +3005,7 @@ fn describe_language_for_canonical_dispatch(effective_args: &[String]) -> Option
     let needs_canonical_dispatch = match parsed.tool {
         ToolCommand::TosCli {
             command: tos_cli::TosCliCommand::Api(_),
+            ..
         }
         | ToolCommand::ADrive {
             command: ve_adrive_cli::ADriveCommand::Api(_),
@@ -3094,9 +3163,26 @@ fn byted_tos_grouped_help_zh() -> String {
     append_tos_target_syntax_zh(&mut output);
     append_root_common_options_zh(&mut output);
     append_byted_tos_psm_options_zh(&mut output);
+    append_byted_tos_auth_zh(&mut output, &prefix);
     append_help_language_section_zh(&mut output);
     append_byted_examples_zh(&mut output, &prefix);
     translate_help_phrases_zh(&output)
+}
+
+fn append_byted_tos_auth_zh(output: &mut String, prefix: &str) {
+    let _ = writeln!(
+        output,
+        "鉴权:\n  --auth-mode <MODE>          aksk 或 zti（默认 aksk）"
+    );
+    let _ = writeln!(
+        output,
+        "  优先级：--auth-mode > [profile.tos].auth_mode > BYTETOS_AUTH_MODE > aksk。"
+    );
+    let _ = writeln!(
+        output,
+        "  ZTI 使用 SEC_TOKEN_STRING、本地 Agent 或 SEC_TOKEN_PATH，忽略本地 AK/SK，失败不回退。\n"
+    );
+    let _ = writeln!(output, "  {prefix} config set auth_mode zti\n");
 }
 
 fn adrive_grouped_help_zh() -> String {
@@ -3181,9 +3267,10 @@ fn append_tos_target_syntax_zh(output: &mut String) {
 
 fn append_byted_tos_psm_options_zh(output: &mut String) {
     let _ = writeln!(output, "ByteCloud TOS PSM 选项:");
+    // [Review Fix #17] 强制 PSM 模式会跳过 BNS，帮助文案只将 BNS 描述为默认路径。
     let _ = writeln!(
         output,
-        "      --psm <PSM>             PSM 服务名（通过 BNS 服务发现访问）"
+        "      --psm <PSM>             PSM 服务名（默认按 Bucket 经 BNS 路由）"
     );
     let _ = writeln!(
         output,
@@ -3196,6 +3283,10 @@ fn append_byted_tos_psm_options_zh(output: &mut String) {
     let _ = writeln!(
         output,
         "      --addr-family <VALUE>   与 --psm 配合使用的地址族：v4、v6 或 dual-stack\n"
+    );
+    let _ = writeln!(
+        output,
+        "设置 TOS_FORCE_PSM=true 可跳过 BNS，直接通过 Consul 解析所选 PSM。\n"
     );
 }
 
@@ -3313,12 +3404,33 @@ pub async fn run_multi_tool() {
 /// Runs the dedicated ByteCloud TOS CLI entry point used by the `tos-cli` entry crate.
 pub async fn run_byted_tos_cli() {
     init_tracing();
+    run_byted_tos_entry(None).await;
+}
+
+/// Runs the dedicated ByteTOS entry with an invocation-owned ZTI token provider.
+///
+/// `provider` is passed lazily to ByteTOS requests and is ignored in AK/SK mode.
+/// This returns after successful help/version output; command handlers may exit
+/// the process with the normal CLI exit code on success or error. The caller owns
+/// tracing setup; this entry does not initialize tracing or parse `RUST_LOG`.
+/// MCP tools can be planned with this provider, but `execute=true` is rejected
+/// because the MCP subprocess cannot inherit the caller-owned resolver.
+pub async fn run_byted_tos_cli_with_zti_provider(
+    provider: tos_core::infra::zti_credentials::ZtiTokenProvider,
+) {
+    run_byted_tos_entry(Some(provider)).await;
+}
+
+async fn run_byted_tos_entry(provider: Option<tos_core::infra::zti_credentials::ZtiTokenProvider>) {
+    // [Review Fix #3] Injecting embedders own logging policy; parsing RUST_LOG here
+    // can emit misleading advice to remove the private build's security filter.
     let args: Vec<String> = std::env::args().collect();
     if maybe_print_direct_version(&args, "tos-cli") {
         return;
     }
     let effective_args = direct_tool_args(args, "byted-tos");
-    run_with_args(effective_args, InvocationSurface::BytedTosDirect).await;
+    run_with_args_and_zti_provider(effective_args, InvocationSurface::BytedTosDirect, provider)
+        .await;
 }
 
 /// Runs the dedicated TOS CLI entry point used by the `ve-tos-cli` entry crate.
@@ -3413,6 +3525,14 @@ fn canonical_tool_command(tool: &str) -> &str {
 }
 
 async fn run_with_args(args: Vec<String>, invocation_surface: InvocationSurface) {
+    run_with_args_and_zti_provider(args, invocation_surface, None).await;
+}
+
+async fn run_with_args_and_zti_provider(
+    args: Vec<String>,
+    invocation_surface: InvocationSurface,
+    provider: Option<tos_core::infra::zti_credentials::ZtiTokenProvider>,
+) {
     let binary_name = std::path::Path::new(&args[0])
         .file_stem()
         .and_then(|s| s.to_str())
@@ -3502,8 +3622,13 @@ async fn run_with_args(args: Vec<String>, invocation_surface: InvocationSurface)
     };
 
     match cli.tool {
-        ToolCommand::TosCli { command } => {
-            handle_byted_tos(cli.global, command).await;
+        ToolCommand::TosCli { auth, command } => {
+            let global = bind_byte_tos_auth(
+                cli.global,
+                auth.auth_mode.map(|mode| mode.as_str().to_string()),
+                provider,
+            );
+            handle_byted_tos(global, command).await;
         }
         ToolCommand::Tos { auth, command } => {
             let mut global = cli.global;
@@ -3514,6 +3639,17 @@ async fn run_with_args(args: Vec<String>, invocation_surface: InvocationSurface)
             handle_adrive(cli.global, auth, command).await;
         }
     }
+}
+
+fn bind_byte_tos_auth(
+    mut global: GlobalArgs,
+    mode: Option<String>,
+    provider: Option<tos_core::infra::zti_credentials::ZtiTokenProvider>,
+) -> GlobalArgs {
+    global.byte_tos_auth_mode = mode;
+    global.zti_token_provider =
+        Some(provider.unwrap_or_else(tos_core::infra::zti_source::provider));
+    global
 }
 
 fn configure_example_prefixes(invocation_surface: InvocationSurface) {
@@ -3686,7 +3822,45 @@ fn strip_byted_tos_unsupported_help(help: &str) -> String {
     // [Review Fix #TOS-StorageHelp] Strip the whole clap option block so the
     // removed `--storage-class` flag cannot leave its description under the
     // neighboring option.
-    strip_clap_help_option_blocks(help, &["--storage-class"])
+    let help = strip_clap_help_option_blocks(help, &["--storage-class"]);
+    byte_tos_recursive_list_help(&help)
+}
+
+fn byte_tos_recursive_list_help(help: &str) -> String {
+    // [Review Fix #15] ByteTOS reuses ve-tos clap argument types but rejects
+    // auto/flat at execution; show only the value users can actually select.
+    let mut in_list_mode = false;
+    let mut lines = Vec::new();
+    for line in help.lines() {
+        if line.contains("--recursive-list-mode") {
+            in_list_mode = true;
+        } else if in_list_mode && is_clap_help_block_boundary(line) {
+            in_list_mode = false;
+        }
+        let value = line.trim_start();
+        if in_list_mode && (value.starts_with("- auto:") || value.starts_with("- flat:")) {
+            continue;
+        }
+        lines.push(if in_list_mode {
+            line.replace(
+                "Recursive listing mode: auto, flat, or hierarchical",
+                "Recursive listing mode: hierarchical only",
+            )
+            // [Review Fix #25] clap -h renders enum values inline, unlike
+            // --help's expanded bullets; narrow that form as well.
+            .replace(
+                "[possible values: auto, flat, hierarchical]",
+                "[possible values: hierarchical]",
+            )
+        } else {
+            line.to_string()
+        });
+    }
+    let mut output = lines.join("\n");
+    if help.ends_with('\n') {
+        output.push('\n');
+    }
+    output
 }
 
 fn strip_clap_help_option_blocks(help: &str, option_names: &[&str]) -> String {
@@ -3766,7 +3940,18 @@ fn maybe_emit_byted_tos_describe_recovery(effective_args: &[String]) -> bool {
             "implemented_layers": ["high_level", "utilities"],
             "unimplemented_layers": ["low_level"],
             "listing_semantics": {"delimiter": "/"},
+            "authentication": tos_core::infra::byte_tos_auth::byte_tos_auth_metadata(),
         })
+    } else if let Some(desc) =
+        ve_tos_cli::handler::high_level::describe_byte_tos_high_level_command(&command)
+    {
+        // [Review Fix #21] Missing positional operands take the same rich
+        // metadata path as a successfully parsed ByteTOS command.
+        serde_json::to_value(desc).unwrap_or_else(|_| serde_json::json!({}))
+    } else if let Some(desc) =
+        ve_tos_cli::handler::config::describe_config_action_for_recovery(&command)
+    {
+        serde_json::to_value(desc).unwrap_or_else(|_| serde_json::json!({}))
     } else if let Some(desc) = tos_cli::handler::meta::describe_tos_command_metadata(&command) {
         serde_json::to_value(desc).unwrap_or_else(|_| serde_json::json!({}))
     } else if let Some(row) = tos_cli::registry::find_capability(&command) {
@@ -3983,6 +4168,14 @@ fn recovered_command_path(effective_args: &[String], tool: &str) -> String {
         return canonical_tool_command(tool).to_string();
     }
     if tool == "byted-tos" {
+        // [Review Fix #20] Config actions are parsed by Clap but not separate
+        // capability rows; retain the leaf when recovering missing operands.
+        if tokens.len() >= 2
+            && tokens[0] == "config"
+            && matches!(tokens[1], "init" | "show" | "set")
+        {
+            return format!("tos config {}", tokens[1]);
+        }
         for len in (1..=tokens.len()).rev() {
             let candidate = format!("tos {}", tokens[..len].join(" "));
             if tos_cli::registry::find_capability(&candidate).is_some() {
@@ -4935,5 +5128,39 @@ async fn handle_adrive_inner(
         ve_adrive_cli::ADriveCommand::Auth(command) => {
             ve_adrive_cli::handler::auth::handle_auth_command(global, auth, command).await
         }
+    }
+}
+
+#[cfg(test)]
+mod zti_entry_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tos_core::infra::zti_credentials::ZtiTokenProvider;
+
+    #[tokio::test]
+    async fn byte_entry_binds_provider_without_resolving_it() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let provider = ZtiTokenProvider::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { Ok("synthetic-entry-token".to_string()) }
+        });
+        let global = bind_byte_tos_auth(GlobalArgs::default(), Some("zti".into()), Some(provider));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(global.byte_tos_auth_mode.as_deref(), Some("zti"));
+        assert_eq!(
+            global
+                .clone()
+                .zti_token_provider
+                .unwrap()
+                .get_header_value()
+                .await
+                .unwrap(),
+            "synthetic-entry-token"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

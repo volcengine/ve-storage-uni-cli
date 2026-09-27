@@ -24,6 +24,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import platform
 import re
 import shlex
 import shutil
@@ -277,6 +278,7 @@ def build_release_binaries(target: str, skip_build: bool) -> None:
             [
                 *command_prefix,
                 "--release",
+                "--locked",
                 "--target",
                 target,
                 "--manifest-path",
@@ -285,9 +287,86 @@ def build_release_binaries(target: str, skip_build: bool) -> None:
         )
 
 
+def native_target_matches_host(target: str) -> bool:
+    """Check whether this host can execute ``target`` for a release smoke test.
+
+    Returns False for unknown platforms or non-glibc Linux hosts.
+    """
+    machine = platform.machine().lower()
+    arch = {
+        "arm64": "aarch64",
+        "aarch64": "aarch64",
+        "amd64": "x86_64",
+        "x86_64": "x86_64",
+    }.get(machine)
+    if arch is None:
+        return False
+    system = platform.system()
+    if system == "Darwin":
+        return target == f"{arch}-apple-darwin"
+    if system == "Windows":
+        return target == f"{arch}-pc-windows-msvc"
+    if system == "Linux" and platform.libc_ver()[0] == "glibc":
+        return target in (
+            f"{arch}-unknown-linux-gnu",
+            f"{arch}-unknown-linux-gnu.2.17",
+        )
+    return False
+
+
+def verify_native_bytetos_auth(target: str) -> None:
+    """Check a native ``tos-cli`` binary before archiving.
+
+    Cross targets are skipped. Raises SystemExit if the native binary is
+    missing, cannot be inspected within ten seconds, or lacks public ZTI.
+    """
+    if not native_target_matches_host(target):
+        print(f"# skip executable ZTI smoke check for cross target {target}")
+        return
+    suffix = ".exe" if target.endswith("windows-msvc") else ""
+    binary_dir = entry_release_dir("tos-cli", cargo_artifact_target(target))
+    binary = binary_dir / f"tos-cli{suffix}"
+    if not binary.is_file():
+        raise SystemExit(f"missing dedicated tos-cli binary: {binary}")
+    try:
+        result = subprocess.run(
+            [str(binary), "--describe", "--output", "json"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        authentication = json.loads(result.stdout)["data"]["authentication"]
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as error:
+        raise SystemExit("could not inspect dedicated tos-cli authentication") from error
+    expected_contract = {
+        "default": "aksk",
+        "modes": ["aksk", "zti"],
+        "precedence": [
+            "command_line", "profile.tos.auth_mode", "BYTETOS_AUTH_MODE", "aksk"
+        ],
+        "zti_built_in": True,
+        "zti_fallback_to_aksk": False,
+        "zti_presign_supported": False,
+        # [Review Fix #4] Native Windows has environment/file ZTI, without a Unix Agent.
+        "zti_sources": (
+            ["SEC_TOKEN_STRING", "SEC_TOKEN_PATH"]
+            if target.endswith("windows-msvc")
+            else ["SEC_TOKEN_STRING", "local_agent", "SEC_TOKEN_PATH"]
+        ),
+    }
+    if result.returncode != 0 or any(
+        authentication.get(field) != expected
+        for field, expected in expected_contract.items()
+    ):
+        raise SystemExit("dedicated tos-cli artifact does not expose built-in ZTI")
+
+
 def run_archives(args: argparse.Namespace) -> None:
     for target in args.target:
         build_release_binaries(target, args.skip_build)
+        verify_native_bytetos_auth(target)
         archive_args = [
             "--target",
             target,

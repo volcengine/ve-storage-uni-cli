@@ -10350,6 +10350,8 @@ fn parameter_schema_type(name: &str) -> &'static str {
             | "report-failures-only"
             | "progress"
             | "no-progress"
+            // [Review Fix #17] --checkpoint is a valueless Clap switch.
+            | "checkpoint"
             | "list-echo"
             | "no-list-echo"
             | "human-readable"

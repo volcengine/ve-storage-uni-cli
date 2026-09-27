@@ -660,7 +660,7 @@ fn adrive_config_show_includes_masked_oauth_credentials() {
 
 #[test]
 // [Review Fix #6] Both surfaces reject an explicit ADrive namespace, but tos
-// now points callers to the supported VeTos aksk/unified auth_mode contract.
+// directs callers to the supported ADrive auth_mode contract.
 fn auth_mode_config_is_rejected_by_non_adrive_surfaces() {
     for surface in ["tos", "ve-tos"] {
         let home = tempdir(&format!("auth-mode-scope-{surface}"));
@@ -677,11 +677,7 @@ fn auth_mode_config_is_rejected_by_non_adrive_surfaces() {
         );
         assert!(!output.status.success(), "surface={surface}");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let expected = if surface == "tos" {
-            "auth_mode is not supported by tos"
-        } else {
-            "only supported by ve-adrive"
-        };
+        let expected = "only supported by ve-adrive";
         assert!(
             stderr.contains(expected),
             "surface={surface}, stderr={stderr}"

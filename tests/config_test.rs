@@ -29,6 +29,12 @@
 //!   secrets encrypted on disk as ENC:..., show annotates source section.
 
 use std::process::Command;
+use std::{
+    io::{Read, Write},
+    net::TcpListener,
+    thread,
+    time::Duration,
+};
 
 fn cli(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
@@ -95,6 +101,7 @@ fn cli_with_home_and_env(
         "BYTE_TOS_MAXCONNECTIONS",
         "BYTE_TOS_MAX_CONNECTIONS",
         "TEST_TOSAPI_ADDR",
+        "TOS_FORCE_PSM",
         "ADRIVE_REGION",
         "ADRIVE_ENDPOINT",
         "ADRIVE_ACCESS_KEY",
@@ -198,13 +205,15 @@ fn test_config_set_help_lists_supported_keys() {
 }
 
 #[test]
-fn test_tos_config_set_help_marks_control_endpoint_ve_tos_only() {
+fn test_tos_config_set_help_only_lists_byte_tos_keys() {
     let output = cli(&["tos", "config", "set", "--help"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("control_endpoint"));
-    assert!(stdout.contains("ve-tos only"));
+    // [Review Fix #16] ByteTOS help should contain copyable supported examples.
+    assert!(!stdout.contains("control_endpoint"));
+    assert!(!stdout.contains("ve-tos"));
     assert!(stdout.contains("[active-profile.tos]"));
+    assert!(stdout.contains("auth_mode (aksk or zti)"));
 }
 
 #[test]
@@ -1279,8 +1288,43 @@ fn test_byted_tos_doctor_accepts_env_only_psm_without_config() {
     );
     let parsed = parse_json(&output);
     let check = &parsed["data"]["checks"][0];
-    assert_eq!(check["status"], "warning");
+    assert_eq!(check["status"], "passed");
     assert_eq!(check["details"]["has_psm"], true);
+    assert_eq!(check["details"]["has_region"], false);
+
+    let config_output = cli_with_home_and_env(
+        &tmp,
+        &["--output", "json", "tos", "doctor", "--check", "config"],
+        &[("BYTE_TOS_PSM", std::ffi::OsStr::new("toutiao.tos.tosapi"))],
+    );
+    assert!(config_output.status.success());
+    let config_check = &parse_json(&config_output)["data"]["checks"][0];
+    assert_eq!(config_check["status"], "passed");
+    assert_eq!(config_check["details"]["has_region"], false);
+}
+
+#[test]
+fn test_byted_tos_doctor_requires_region_for_endpoint_override_of_psm() {
+    let home = tempdir();
+    let output = cli_with_home_and_env(
+        &home,
+        &[
+            "--endpoint",
+            "https://private.example.com",
+            "--output",
+            "json",
+            "tos",
+            "doctor",
+            "--check",
+            "config",
+        ],
+        &[("BYTE_TOS_PSM", std::ffi::OsStr::new("toutiao.tos.tosapi"))],
+    );
+    assert!(output.status.success());
+    let check = &parse_json(&output)["data"]["checks"][0];
+    assert_eq!(check["status"], "warning");
+    assert_eq!(check["details"]["has_endpoint"], true);
+    assert_eq!(check["details"]["has_psm"], false);
     assert_eq!(check["details"]["has_region"], false);
 }
 
@@ -1314,6 +1358,115 @@ fn test_byted_tos_runtime_prefers_psm_over_byte_tos_endpoint_env() {
         !stderr.contains("tos-cn-north-boe.byted.org"),
         "stderr={stderr}"
     );
+}
+
+fn capture_first_consul_lookup(listener: TcpListener) -> String {
+    listener
+        .set_nonblocking(true)
+        .expect("make Consul mock nonblocking");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "Consul lookup timed out"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("accept Consul lookup: {error}"),
+        }
+    };
+    // [Review Fix #18] TCP may split the query across reads; capture the complete headers.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set Consul mock read timeout");
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        let length = stream.read(&mut buffer).expect("read Consul lookup");
+        assert!(length > 0, "Consul lookup ended before request headers");
+        request.extend_from_slice(&buffer[..length]);
+        assert!(
+            request.len() <= 16 * 1024,
+            "Consul lookup headers too large"
+        );
+    }
+    // An empty service list lets the CLI exit after its first lookup.
+    stream
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]")
+        .expect("reply to Consul lookup");
+    String::from_utf8_lossy(&request).to_string()
+}
+
+fn first_consul_lookup_with_force_psm(force_psm_value: Option<&str>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local Consul mock");
+    let address = listener
+        .local_addr()
+        .expect("Consul mock address")
+        .to_string();
+    let server = thread::spawn(move || capture_first_consul_lookup(listener));
+    let home = tempdir();
+    let mut environment = vec![
+        ("BYTE_TOS_REGION", std::ffi::OsStr::new("cn-beijing")),
+        ("BYTE_TOS_ACCESS_KEY", std::ffi::OsStr::new("test-ak")),
+        ("BYTE_TOS_SECRET_KEY", std::ffi::OsStr::new("test-sk")),
+        ("BYTE_TOS_MAX_RETRY_COUNT", std::ffi::OsStr::new("0")),
+        ("CONSUL_HTTP_ADDR", std::ffi::OsStr::new(&address)),
+    ];
+    if let Some(value) = force_psm_value {
+        environment.push(("TOS_FORCE_PSM", std::ffi::OsStr::new(value)));
+    }
+    let output = cli_with_home_and_env(
+        &home,
+        &[
+            "tos",
+            "--psm",
+            "forced.example.psm",
+            "ls",
+            "tos://example-bucket",
+        ],
+        &environment,
+    );
+    assert!(
+        !output.status.success(),
+        "mock returned no service endpoints"
+    );
+    server.join().expect("capture Consul lookup")
+}
+
+#[test]
+fn force_psm_queries_selected_service_without_bns() {
+    let forced_request = first_consul_lookup_with_force_psm(Some("true"));
+    assert!(
+        forced_request.contains("name=forced.example.psm"),
+        "{forced_request}"
+    );
+    let default_request = first_consul_lookup_with_force_psm(None);
+    assert!(
+        default_request.contains("name=tos.access.bns"),
+        "{default_request}"
+    );
+    let disabled_request = first_consul_lookup_with_force_psm(Some("false"));
+    assert!(
+        disabled_request.contains("name=tos.access.bns"),
+        "{disabled_request}"
+    );
+}
+
+#[test]
+fn byte_tos_psm_help_documents_force_mode() {
+    for command in [
+        vec!["tos", "--help"],
+        vec!["tos", "ls", "--help"],
+        vec!["tos", "--help", "--help-language", "zh"],
+    ] {
+        let output = cli(&command);
+        assert!(output.status.success(), "{command:?}");
+        let help = String::from_utf8_lossy(&output.stdout);
+        assert!(help.contains("TOS_FORCE_PSM=true"), "{command:?}: {help}");
+    }
 }
 
 #[test]
@@ -2572,10 +2725,7 @@ fn test_auth_mode_option_is_scoped_to_supported_tools() {
     let unsupported_tos_surface = cli(&["--output", "json", "tos", "--auth-mode", "unified", "ls"]);
     assert!(!unsupported_tos_surface.status.success());
     let stderr = String::from_utf8_lossy(&unsupported_tos_surface.stderr);
-    assert!(
-        stderr.contains("unexpected argument '--auth-mode'"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("possible values: aksk, zti"), "{stderr}");
 }
 
 #[test]

@@ -4087,7 +4087,8 @@ mod tests {
         }
 
         let tos_skill = include_str!("../../../skills/tos-cli/SKILL.md");
-        assert!(!tos_skill.contains("--auth-mode"));
-        assert!(!tos_skill.to_ascii_lowercase().contains("unified"));
+        assert!(tos_skill.contains("--auth-mode zti"));
+        assert!(!tos_skill.contains("--auth-mode unified"));
+        assert!(!tos_skill.contains("ve login"));
     }
 }

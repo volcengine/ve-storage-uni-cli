@@ -53,6 +53,8 @@ use crate::registry::{
 };
 
 const VE_TOS_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    // [Review Fix #2] The shared Skill export parameter must be localized on ve-tos Describe.
+    ("Skill name, canonical command, or command suffix, e.g. ve_tos_cp or cp", "Skill 名称、规范命令或命令后缀，例如 ve_tos_cp 或 cp"),
     ("ACL value", "ACL 值"),
     ("ACL value (private, public-read, public-read-write, authenticated-read)", "ACL 值（private、public-read、public-read-write、authenticated-read）"),
     ("ACL value (x-tos-acl)", "ACL 值（x-tos-acl）"),
@@ -2691,6 +2693,8 @@ fn export_markdown_skills(
         }
     }
 
+    // [Review Fix #Skill6] Build parser metadata once rather than once per file.
+    let root = tos_core::agent::skill_markdown::command_tree::<crate::cli::TosCommand>();
     let mut files = Vec::new();
     let skills = export_plan
         .iter()
@@ -2709,7 +2713,7 @@ fn export_markdown_skills(
         if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&file_path, skill_markdown(&definition, language))?;
+        fs::write(&file_path, skill_markdown(&definition, language, &root))?;
         files.push(file_path.display().to_string());
     }
     Ok(json!({
@@ -2742,12 +2746,15 @@ fn skill_index_markdown(
     for skill in skills {
         domains.entry(&skill.domain).or_default().push(skill);
     }
+    let public_surface = public_tos_example(&format!("{surface} "))
+        .trim()
+        .to_string();
     let mut body = match language {
         DocumentationLanguage::En => format!(
-            "# {surface} skills\n\nUse this skill pack when the user wants to operate `{surface}` commands. Select a domain below, then use the nested command skill.\n\n"
+            "# {surface} skills\n\nUse this skill pack when the user wants to operate `{public_surface}` commands. Select a domain below, then use the nested command skill.\n\n"
         ),
         DocumentationLanguage::Zh => format!(
-            "# {surface} Skills\n\n当用户需要操作 `{surface}` 命令时使用此 Skill 包。先按领域选择，再进入对应的命令 Skill。\n\n"
+            "# {surface} Skills\n\n当用户需要操作 `{public_surface}` 命令时使用此 Skill 包。先按领域选择，再进入对应的命令 Skill。\n\n"
         ),
     };
     for (domain, skills) in domains {
@@ -2759,110 +2766,62 @@ fn skill_index_markdown(
             };
             body.push_str(&format!(
                 "- [{}](./{}/{}/SKILL.md): `{}` - {}\n",
-                skill.name, skill.domain, skill.name, skill.command, description
+                skill.name,
+                skill.domain,
+                skill.name,
+                public_tos_example(&skill.command),
+                description
             ));
         }
         body.push('\n');
     }
-    body
+    let description = match language {
+        DocumentationLanguage::En => format!(
+            "Use when operating {public_surface}; select a command reference from this index."
+        ),
+        DocumentationLanguage::Zh => {
+            format!("当用户需要使用 {public_surface} 时，先从此索引选择对应命令。")
+        }
+    };
+    tos_core::agent::skill_markdown::frontmatter(&format!("{surface}-commands"), &description)
+        + &body
 }
 
-fn skill_markdown(skill: &SkillDefinition, language: DocumentationLanguage) -> String {
-    let examples = if skill.examples.is_empty() {
-        match language {
-            DocumentationLanguage::En => {
-                "- Run with `--describe` first to inspect the command contract.".to_string()
-            }
-            DocumentationLanguage::Zh => {
-                "- 先运行 `--describe` 检查命令契约，再决定是否执行。".to_string()
-            }
-        }
+fn skill_markdown(
+    skill: &SkillDefinition,
+    language: DocumentationLanguage,
+    root: &clap::Command,
+) -> String {
+    use tos_core::agent::skill_markdown::{render, CommandSkill};
+
+    let is_chinese = matches!(language, DocumentationLanguage::Zh);
+    let description = if is_chinese {
+        localized_skill_description_zh(skill)
     } else {
-        skill
-            .examples
-            .iter()
-            .map(|example| format!("- `{example}`"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        skill.description.clone()
     };
-    let input_schema = localized_input_schema(&skill.input_schema, language);
-    let schema = serde_json::to_string_pretty(&input_schema).unwrap_or_else(|_| "{}".to_string());
-    match language {
-        DocumentationLanguage::En => format!(
-            r#"# {name}
-
-Use this skill when the user wants to run `{command}` with the Volcano Engine TOS CLI.
-
-## Description
-
-{description}
-
-## Command
-
-`{command}`
-
-Risk level: `{risk_level}`
-
-## Inputs
-
-```json
-{schema}
-```
-
-## Examples
-
-{examples}
-
-## Execution
-
-Prefer `{public_command} --describe` or `{public_command} --dry-run --output json` before executing a command that writes or deletes data. Destructive commands must include the required `--force` and exact `--confirm` target.
-"#,
-            name = skill.name,
-            command = skill.command,
-            description = skill.description,
-            risk_level = skill.risk_level,
-            schema = schema,
-            examples = examples,
-            public_command = public_tos_command(&skill.command),
-        ),
-        DocumentationLanguage::Zh => format!(
-            r#"# {name}
-
-当用户需要通过火山引擎 TOS CLI 运行 `{command}` 时使用此 Skill。
-
-## 说明
-
-{description}
-
-## 命令
-
-`{command}`
-
-风险等级：`{risk_level}`
-
-## 输入
-
-```json
-{schema}
-```
-
-## 示例
-
-{examples}
-
-## 执行建议
-
-执行会写入或删除数据的命令前，优先运行 `{public_command} --describe` 或 `{public_command} --dry-run --output json`。破坏性命令必须包含必需的 `--force` 和精确匹配目标的 `--confirm`。
-"#,
-            name = skill.name,
-            command = skill.command,
-            description = localized_skill_description_zh(skill),
-            risk_level = skill.risk_level,
-            schema = schema,
-            examples = examples,
-            public_command = public_tos_command(&skill.command),
-        ),
-    }
+    // [Review Fix #Skill2] Resolve every displayed command at export time;
+    // canonical registry IDs and MCP names remain stable across entrypoints.
+    let public_command = public_tos_example(&skill.command);
+    let examples = skill
+        .examples
+        .iter()
+        .map(|example| public_tos_example(example))
+        .collect::<Vec<_>>();
+    let schema = localized_input_schema(&skill.input_schema, language);
+    render(
+        &CommandSkill {
+            name: &skill.name,
+            command: &skill.command,
+            public_command: &public_command,
+            description: &description,
+            risk: &skill.risk_level,
+            schema: &schema,
+            examples: &examples,
+            is_chinese,
+        },
+        root,
+    )
 }
 
 fn completion_script(shell: &str) -> Result<CompletionScript, CliError> {
@@ -3523,16 +3482,16 @@ async fn network_check(global: &GlobalArgs, args: &DoctorArgs) -> Result<DoctorC
     // [G6] Without --live-network, retain the existing offline-safe behavior so
     // `ve-tos doctor` keeps working in air-gapped environments.
     if !args.live_network {
-        let is_configured = endpoint.is_some() || (has_psm && has_region);
+        let is_configured = endpoint.is_some() || has_psm;
         return Ok(DoctorCheck {
             name: "network",
             status: if is_configured { "passed" } else { "warning" },
             message: if endpoint.is_some() {
                 "network endpoint is explicitly configured".to_string()
-            } else if has_psm && has_region {
+            } else if has_psm {
                 "ByteTOS PSM discovery is configured; no static endpoint is inferred".to_string()
             } else {
-                "no endpoint configured; ByteTOS may use explicit region plus PSM".to_string()
+                "no endpoint configured; ByteTOS may use PSM discovery".to_string()
             },
             details: json!({
                 "endpoint": endpoint,
@@ -3558,7 +3517,7 @@ async fn network_check(global: &GlobalArgs, args: &DoctorArgs) -> Result<DoctorC
         return Ok(DoctorCheck {
             name: "network",
             status: "warning",
-            message: if has_psm && has_region {
+            message: if has_psm {
                 "PSM discovery requires a bucket and cannot be probed as a static endpoint"
                     .to_string()
             } else {
@@ -3725,7 +3684,12 @@ fn config_check(global: &GlobalArgs) -> Result<DoctorCheck, CliError> {
             .as_deref()
             .map(str::trim)
             .is_some_and(|value| !value.is_empty());
-    let is_ready = has_effective_region && (has_endpoint || has_psm);
+    // [Review Fix #34] PSM cannot mask a missing region when endpoint mode wins.
+    let is_ready = if has_endpoint {
+        has_effective_region
+    } else {
+        has_psm
+    };
     Ok(DoctorCheck {
         name: "config",
         status: if is_ready { "passed" } else { "warning" },
@@ -3777,10 +3741,16 @@ impl UnifiedDoctorCredentialSource {
 
 async fn auth_check(global: &GlobalArgs) -> Result<DoctorCheck, CliError> {
     let runtime = build_runtime(global)?;
-    if runtime.auth_mode.mode == crate::domain::auth::AuthMode::Unified {
+    if let crate::handler::common::ResolvedRuntimeAuth::Ve(
+        auth_mode @ crate::domain::auth::ResolvedAuthMode {
+            mode: crate::domain::auth::AuthMode::Unified,
+            ..
+        },
+    ) = runtime.auth_mode
+    {
         return Ok(unified_auth_check_with_source(
             &global.profile,
-            runtime.auth_mode,
+            auth_mode,
             UnifiedDoctorCredentialSource::Provider(UnifiedCredentialProvider::new(
                 global.profile.clone(),
             )),
@@ -5555,6 +5525,8 @@ mod tests {
             confirm: None,
             request_trace: Default::default(),
             ve_tos_auth_mode: None,
+            byte_tos_auth_mode: None,
+            zti_token_provider: None,
             documentation_language: None,
         }
     }

@@ -1656,11 +1656,11 @@ fn assert_english_tos_skill_export(export_dir: &std::path::Path, export_dir_arg:
         .join("tos_ls")
         .join("SKILL.md");
     let markdown = fs::read_to_string(&skill_path).expect("read exported skill");
-    assert!(markdown.starts_with("# tos_ls"), "markdown={markdown}");
     assert!(
-        markdown.contains("Use this skill when"),
+        markdown.starts_with("---\nname: tos-ls\n"),
         "markdown={markdown}"
     );
+    assert!(markdown.contains("Use when running"), "markdown={markdown}");
     assert!(markdown.contains("```json"), "markdown={markdown}");
 }
 
@@ -5450,10 +5450,13 @@ fn test_adrive_skill_export_writes_markdown_skill_pack() {
         .join("SKILL.md");
     let markdown = fs::read_to_string(&skill_path).expect("read exported ve-adrive skill");
     assert!(
-        markdown.starts_with("# ve_adrive_ls"),
+        markdown.starts_with("---\nname: ve-adrive-ls\n"),
         "markdown={markdown}"
     );
-    assert!(markdown.contains("`ve-adrive ls`"), "markdown={markdown}");
+    assert!(
+        markdown.contains("`ve-storage-uni-cli ve-adrive ls`"),
+        "markdown={markdown}"
+    );
     assert!(markdown.contains("```json"), "markdown={markdown}");
     let zh_dir = std::env::temp_dir().join(format!(
         "ve-storage-uni-cli-adrive-skill-export-zh-{}",
@@ -6388,7 +6391,10 @@ fn test_tos_skill_list_and_export_consume_registry() {
     let skill_path = dir.join("tos-transfer").join("ve_tos_cp").join("SKILL.md");
     assert!(skill_path.exists());
     let exported = fs::read_to_string(skill_path).expect("exported skill");
-    assert!(exported.starts_with("# ve_tos_cp"), "exported={exported}");
+    assert!(
+        exported.starts_with("---\nname: ve-tos-cp\n"),
+        "exported={exported}"
+    );
     assert!(exported.contains("```json"), "exported={exported}");
     let _ = fs::remove_dir_all(&dir);
 }

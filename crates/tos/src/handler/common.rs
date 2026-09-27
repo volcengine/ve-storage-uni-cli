@@ -25,10 +25,12 @@ use tos_core::agent::envelope::Envelope;
 use tos_core::agent::error::CliError;
 use tos_core::agent::global_args::GlobalArgs;
 use tos_core::agent::output::{format_markdown, format_table, format_xml, OutputFormat};
+use tos_core::infra::byte_tos_auth::ByteTosAuthMode;
 use tos_core::infra::client::TosClient;
 use tos_core::infra::config::{merge_tos_runtime_profile, Binary, ConfigFile, Profile};
 use tos_core::infra::credentials::{CredentialSection, CredentialsFile};
 use tos_core::infra::unified_credentials::UnifiedCredentialProvider;
+use tos_core::infra::zti_credentials::ZtiTokenProvider;
 
 use crate::domain::auth::{AuthMode, AuthModeSource, ResolvedAuthMode};
 
@@ -37,6 +39,36 @@ const TOS_CONFIG_BINARY_ENV: &str = "VE_STORAGE_UNI_TOS_CONFIG_BINARY";
 enum RuntimeAuth {
     Aksk,
     Unified(UnifiedCredentialProvider),
+    Zti(ZtiTokenProvider),
+}
+
+/// Effective ByteTOS authentication mode and the layer that selected it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedByteTosAuthMode {
+    pub(crate) mode: ByteTosAuthMode,
+    pub(crate) source: AuthModeSource,
+}
+
+/// Binary-specific authentication selection; ZTI never masquerades as AK/SK.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResolvedRuntimeAuth {
+    Ve(ResolvedAuthMode),
+    Byte(ResolvedByteTosAuthMode),
+}
+
+impl ResolvedRuntimeAuth {
+    fn uses_static_credentials(self) -> bool {
+        matches!(
+            self,
+            Self::Ve(ResolvedAuthMode {
+                mode: AuthMode::Aksk,
+                ..
+            }) | Self::Byte(ResolvedByteTosAuthMode {
+                mode: ByteTosAuthMode::Aksk,
+                ..
+            })
+        )
+    }
 }
 
 /// One invocation's profile and authentication mode resolved from one config snapshot.
@@ -44,8 +76,21 @@ pub(crate) struct TosRuntime {
     /// Effective resource and HTTP profile for the invocation.
     pub(crate) profile: Profile,
     /// Effective authentication mode and its source.
-    pub(crate) auth_mode: ResolvedAuthMode,
+    pub(crate) auth_mode: ResolvedRuntimeAuth,
     auth: RuntimeAuth,
+}
+
+/// Credential-safe snapshot of the ByteTOS runtime for offline diagnostics.
+///
+/// The profile follows the same precedence as a real request. In ZTI mode it
+/// excludes local AK/SK and does not read the credentials file or a token.
+pub struct ByteTosRuntimeInspection {
+    /// Effective resource and HTTP profile for this invocation.
+    pub profile: Profile,
+    /// Selected ByteTOS authentication mode.
+    pub mode: ByteTosAuthMode,
+    /// Configuration layer that selected the mode.
+    pub source: AuthModeSource,
 }
 
 impl TosRuntime {
@@ -75,16 +120,36 @@ impl TosRuntime {
         profile: &Profile,
         request_trace: std::sync::Arc<tos_core::agent::request_id::ServiceRequestTrace>,
     ) -> Result<TosClient, CliError> {
-        // [Review Fix #1] Match both representations so a future constructor
-        // change cannot silently route Unified mode through static credentials.
-        match (self.auth_mode.mode, &self.auth) {
-            (AuthMode::Aksk, RuntimeAuth::Aksk) => {
+        match (self.auth_mode, &self.auth) {
+            (mode, RuntimeAuth::Aksk) if mode.uses_static_credentials() => {
                 TosClient::new_with_request_trace(profile, service, request_trace)
             }
-            (AuthMode::Unified, RuntimeAuth::Unified(provider)) => {
-                TosClient::new_with_unified_credentials_and_request_trace(
+            (
+                ResolvedRuntimeAuth::Ve(ResolvedAuthMode {
+                    mode: AuthMode::Unified,
+                    ..
+                }),
+                RuntimeAuth::Unified(provider),
+            ) => TosClient::new_with_unified_credentials_and_request_trace(
+                profile,
+                service,
+                provider.clone(),
+                request_trace,
+            ),
+            (
+                ResolvedRuntimeAuth::Byte(ResolvedByteTosAuthMode {
+                    mode: ByteTosAuthMode::Zti,
+                    ..
+                }),
+                RuntimeAuth::Zti(provider),
+            ) => {
+                if service != "tos" {
+                    return Err(CliError::ValidationError(
+                        "ZTI authentication is only supported for ByteTOS tos requests".to_string(),
+                    ));
+                }
+                TosClient::new_with_zti_credentials_and_request_trace(
                     profile,
-                    service,
                     provider.clone(),
                     request_trace,
                 )
@@ -127,110 +192,20 @@ pub(crate) fn build_runtime(global: &GlobalArgs) -> Result<TosRuntime, CliError>
     // [Review Fix #1] Resolve mode and resources from one config snapshot so
     // a concurrent config rewrite cannot select AK/SK after unified was read.
     let auth_mode = if active_binary == Binary::VeTos {
-        resolve_auth_mode_from_config(global, &config)?
+        ResolvedRuntimeAuth::Ve(resolve_auth_mode_from_config(global, &config)?)
     } else {
-        ResolvedAuthMode {
-            mode: AuthMode::Aksk,
-            source: AuthModeSource::CompatibilityDefault,
-        }
+        ResolvedRuntimeAuth::Byte(resolve_byte_tos_auth_mode_from_config(global, &config)?)
     };
-    let env_profile = match (active_binary, auth_mode.mode) {
-        (Binary::Tos, _) => Profile::from_byte_tos_env(),
-        // [Review Fix #4] Use the constructor that never queries TOS
-        // credential variables for the unified path.
-        (Binary::VeTos, AuthMode::Unified) => Profile::from_env_without_credentials(),
+    let is_static = auth_mode.uses_static_credentials();
+    let env_profile = match (active_binary, is_static) {
+        (Binary::Tos, false) => Profile::from_byte_tos_env_without_credentials(),
+        (Binary::Tos, true) => Profile::from_byte_tos_env(),
+        (_, false) => Profile::from_env_without_credentials(),
         _ => Profile::from_env(),
     };
-    let stored_credentials = match auth_mode.mode {
-        AuthMode::Unified => None,
-        AuthMode::Aksk => {
-            let credentials_path = global.existing_runtime_credentials_path()?;
-            let credentials = CredentialsFile::load_from(&credentials_path)?;
-            let credential_section = match active_binary {
-                Binary::Tos => CredentialSection::Tos,
-                _ => CredentialSection::VeTos,
-            };
-            Some(credentials.effective_aksk(
-                &global.profile,
-                credential_section,
-                &credentials_path,
-            )?)
-        }
-    };
-    let mut config_profile = if config.profiles.is_empty() && global.profile == "default" {
-        Profile::default()
-    } else {
-        // [Review Fix #3] Runtime-only controls may establish a missing named
-        // profile only for ve-tos unified; AKSK and tos retain legacy fallback.
-        let has_environment_profile =
-            if active_binary == Binary::VeTos && auth_mode.mode == AuthMode::Unified {
-                has_unified_non_secret_env_profile_values(&env_profile)
-            } else {
-                has_tos_env_profile_values(&env_profile)
-            };
-        let effective_profile = match auth_mode.mode {
-            AuthMode::Aksk => {
-                config.get_effective_profile_in_dir(&global.profile, active_binary, &config_dir)
-            }
-            AuthMode::Unified => config.get_effective_profile_without_credentials_in_dir(
-                &global.profile,
-                active_binary,
-                &config_dir,
-            ),
-        };
-        match effective_profile {
-            Ok(effective) => effective.into_flat_profile(),
-            Err(CliError::ConfigMissing(_))
-                if has_environment_profile
-                    || stored_credentials
-                        .as_ref()
-                        .is_some_and(|credentials| !credentials.is_empty()) =>
-            {
-                // [Review Fix #10] Keep runtime env-only profiles working for
-                // the active surface: `ve-tos` consumes TOS_* while the new
-                // ByteCloud `tos` consumes BYTE_TOS_*. Config-file namespaces
-                // remain isolated; env fallback is deliberately per-surface.
-                Profile::default()
-            }
-            Err(err) => return Err(err),
-        }
-    };
-    if let Some(stored_credentials) = stored_credentials {
-        stored_credentials.apply_to_profile(&mut config_profile);
-    }
-
-    let cli_profile = Profile {
-        region: global.region.clone(),
-        access_key_id: None,
-        secret_access_key: None,
-        security_token: None,
-        endpoint: global.endpoint.clone(),
-        psm: global.psm.clone(),
-        idc: global.idc.clone(),
-        cluster: global.cluster.clone(),
-        addr_family: global.addr_family.clone(),
-        control_endpoint: global.control_endpoint.clone(),
-        account_id: global.account_id.clone(),
-        checkpoint_dir: None,
-        batch_report_dir: None,
-        batch_report_format: None,
-        progress_enabled: None,
-        checkpoint_threshold: None,
-        batch_concurrency: None,
-        list_concurrency: None,
-        multipart_concurrency: None,
-        progress_granularity: None,
-        overwrite_strategy: None,
-        max_retry_count: None,
-        requesttimeout: None,
-        connecttimeout: None,
-        maxconnections: None,
-        tos: None,
-        ve_tos: None,
-        tosvector: None,
-        tostable: None,
-        adrive: None,
-    };
+    let config_profile =
+        runtime_config_profile(global, &config, &config_dir, &env_profile, auth_mode)?;
+    let cli_profile = cli_network_profile(global);
     // Priority: CLI > Config > Env. ByteCloud TOS also treats endpoint and
     // PSM as exclusive connection modes so lower-priority endpoint env cannot
     // suppress configured PSM discovery.
@@ -240,16 +215,185 @@ pub(crate) fn build_runtime(global: &GlobalArgs) -> Result<TosRuntime, CliError>
         env_profile.merge(&config_profile).merge(&cli_profile)
     };
     validate_tos_psm_cli_modifiers(global, &effective_profile)?;
-    let auth = match auth_mode.mode {
-        AuthMode::Aksk => RuntimeAuth::Aksk,
-        AuthMode::Unified => {
-            RuntimeAuth::Unified(UnifiedCredentialProvider::new(global.profile.clone()))
-        }
-    };
+    let auth = runtime_auth_provider(global, auth_mode);
     Ok(TosRuntime {
         profile: effective_profile,
         auth_mode,
         auth,
+    })
+}
+
+/// Inspect a ByteTOS invocation without resolving a token or making a request.
+///
+/// # Parameters
+///
+/// * `global` - The selected profile and invocation overrides.
+///
+/// # Returns
+///
+/// The effective profile, mode, and mode source from one configuration snapshot.
+///
+/// # Errors
+///
+/// Returns configuration or validation errors. AK/SK credentials are inspected
+/// only in AK/SK mode; ZTI never reads them.
+pub fn inspect_byte_tos_runtime(global: &GlobalArgs) -> Result<ByteTosRuntimeInspection, CliError> {
+    let runtime = build_runtime(global)?;
+    let ResolvedRuntimeAuth::Byte(resolved) = runtime.auth_mode else {
+        return Err(CliError::ValidationError(
+            "ByteTOS runtime inspection requires the tos command surface".to_string(),
+        ));
+    };
+    Ok(ByteTosRuntimeInspection {
+        profile: runtime.profile,
+        mode: resolved.mode,
+        source: resolved.source,
+    })
+}
+
+fn runtime_auth_provider(global: &GlobalArgs, auth_mode: ResolvedRuntimeAuth) -> RuntimeAuth {
+    match auth_mode {
+        ResolvedRuntimeAuth::Byte(ResolvedByteTosAuthMode {
+            mode: ByteTosAuthMode::Zti,
+            ..
+        }) => {
+            // [Review Fix #15] A child process cannot inherit a callback, so
+            // construct its lazy built-in source once per invocation.
+            let provider = global
+                .zti_token_provider
+                .clone()
+                .unwrap_or_else(tos_core::infra::zti_source::provider);
+            RuntimeAuth::Zti(provider)
+        }
+        ResolvedRuntimeAuth::Ve(ResolvedAuthMode {
+            mode: AuthMode::Unified,
+            ..
+        }) => RuntimeAuth::Unified(UnifiedCredentialProvider::new(global.profile.clone())),
+        _ => RuntimeAuth::Aksk,
+    }
+}
+
+fn cli_network_profile(global: &GlobalArgs) -> Profile {
+    Profile {
+        region: global.region.clone(),
+        endpoint: global.endpoint.clone(),
+        psm: global.psm.clone(),
+        idc: global.idc.clone(),
+        cluster: global.cluster.clone(),
+        addr_family: global.addr_family.clone(),
+        control_endpoint: global.control_endpoint.clone(),
+        account_id: global.account_id.clone(),
+        ..Profile::default()
+    }
+}
+
+fn runtime_config_profile(
+    global: &GlobalArgs,
+    config: &ConfigFile,
+    config_dir: &Path,
+    env_profile: &Profile,
+    auth_mode: ResolvedRuntimeAuth,
+) -> Result<Profile, CliError> {
+    let active_binary = active_tos_config_binary();
+    let is_static = auth_mode.uses_static_credentials();
+    let stored_credentials = if is_static {
+        let credentials_path = global.existing_runtime_credentials_path()?;
+        let credentials = CredentialsFile::load_from(&credentials_path)?;
+        let section = if active_binary == Binary::Tos {
+            CredentialSection::Tos
+        } else {
+            CredentialSection::VeTos
+        };
+        Some(credentials.effective_aksk(&global.profile, section, &credentials_path)?)
+    } else {
+        None
+    };
+    let has_fallback = if is_static {
+        has_tos_env_profile_values(env_profile)
+    } else {
+        has_unified_non_secret_env_profile_values(env_profile)
+            || (active_binary == Binary::Tos && has_cli_network_profile(global))
+    } || stored_credentials
+        .as_ref()
+        .is_some_and(|credentials| !credentials.is_empty());
+    let mut profile = match runtime_stored_profile(global, config, config_dir, is_static) {
+        Ok(profile) => profile,
+        Err(CliError::ConfigMissing(_)) if has_fallback => Profile::default(),
+        Err(error) => return Err(error),
+    };
+    if let Some(credentials) = stored_credentials {
+        credentials.apply_to_profile(&mut profile);
+    }
+    Ok(profile)
+}
+
+fn runtime_stored_profile(
+    global: &GlobalArgs,
+    config: &ConfigFile,
+    config_dir: &Path,
+    is_static: bool,
+) -> Result<Profile, CliError> {
+    if config.profiles.is_empty() && global.profile == "default" {
+        return Ok(Profile::default());
+    }
+    let binary = active_tos_config_binary();
+    let effective = if is_static {
+        config.get_effective_profile_in_dir(&global.profile, binary, config_dir)?
+    } else {
+        config.get_effective_profile_without_credentials_in_dir(
+            &global.profile,
+            binary,
+            config_dir,
+        )?
+    };
+    Ok(effective.into_flat_profile())
+}
+
+fn has_cli_network_profile(global: &GlobalArgs) -> bool {
+    global.endpoint.is_some() || global.psm.is_some() || global.region.is_some()
+}
+
+/// Resolve ByteTOS mode without accessing AK/SK or token providers.
+/// Returns validation errors for invalid values in the selected precedence layer.
+pub(crate) fn resolve_byte_tos_auth_mode_from_config(
+    global: &GlobalArgs,
+    config: &ConfigFile,
+) -> Result<ResolvedByteTosAuthMode, CliError> {
+    let configured = config
+        .profiles
+        .get(&global.profile)
+        .and_then(|profile| profile.tos.as_ref())
+        .and_then(|settings| settings.auth_mode.as_deref());
+    let selected = if let Some(value) = global.byte_tos_auth_mode.as_deref() {
+        (
+            ByteTosAuthMode::parse(value, "command line")?,
+            AuthModeSource::CommandLine,
+        )
+    } else if let Some(value) = configured {
+        (
+            ByteTosAuthMode::parse(value, "profile config")?,
+            AuthModeSource::Config,
+        )
+    } else {
+        match std::env::var("BYTETOS_AUTH_MODE") {
+            Ok(value) => (
+                ByteTosAuthMode::parse(&value, "BYTETOS_AUTH_MODE")?,
+                AuthModeSource::Environment,
+            ),
+            // [Review Fix #1] Only a missing mode may use the AK/SK compatibility default.
+            Err(std::env::VarError::NotPresent) => {
+                (ByteTosAuthMode::Aksk, AuthModeSource::CompatibilityDefault)
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(CliError::ValidationError(
+                    "BYTETOS_AUTH_MODE must contain valid UTF-8".to_string(),
+                ));
+            }
+        }
+    };
+    Ok(ResolvedByteTosAuthMode {
+        mode: selected.0,
+        source: selected.1,
     })
 }
 
@@ -1269,6 +1413,231 @@ mod tests {
     }
 
     #[test]
+    fn byte_auth_mode_precedence_is_isolated_from_ve_mode() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _restore = EnvironmentRestore::capture(&["BYTETOS_AUTH_MODE", "TOS_AUTH_MODE"]);
+        std::env::set_var("BYTETOS_AUTH_MODE", "zti");
+        std::env::set_var("TOS_AUTH_MODE", "unified");
+        let mut config = ConfigFile::default();
+        let mut profile = Profile::default();
+        profile.tos = Some(Default::default());
+        profile.tos.as_mut().unwrap().auth_mode = Some("aksk".into());
+        config.profiles.insert("default".into(), profile);
+        let mut selected = global();
+        selected.byte_tos_auth_mode = Some("zti".into());
+        let resolved = resolve_byte_tos_auth_mode_from_config(&selected, &config).unwrap();
+        assert_eq!(resolved.mode, ByteTosAuthMode::Zti);
+        assert_eq!(resolved.source, AuthModeSource::CommandLine);
+        selected.byte_tos_auth_mode = None;
+        let resolved = resolve_byte_tos_auth_mode_from_config(&selected, &config).unwrap();
+        assert_eq!(resolved.mode, ByteTosAuthMode::Aksk);
+        assert_eq!(resolved.source, AuthModeSource::Config);
+        config.profiles.clear();
+        assert_eq!(
+            resolve_byte_tos_auth_mode_from_config(&selected, &config)
+                .unwrap()
+                .source,
+            AuthModeSource::Environment
+        );
+        std::env::remove_var("BYTETOS_AUTH_MODE");
+        let resolved = resolve_byte_tos_auth_mode_from_config(&selected, &config).unwrap();
+        assert_eq!(resolved.mode, ByteTosAuthMode::Aksk);
+        assert_eq!(resolved.source, AuthModeSource::CompatibilityDefault);
+        std::env::set_var("BYTETOS_AUTH_MODE", "unified");
+        assert!(resolve_byte_tos_auth_mode_from_config(&selected, &config).is_err());
+    }
+
+    #[test]
+    fn byte_zti_missing_named_profile_uses_cli_network_and_no_aksk() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _restore = EnvironmentRestore::capture(&[
+            TOS_CONFIG_BINARY_ENV,
+            "BYTE_TOS_ACCESS_KEY",
+            "BYTE_TOS_SECRET_KEY",
+        ]);
+        std::env::set_var(TOS_CONFIG_BINARY_ENV, "tos");
+        std::env::set_var("BYTE_TOS_ACCESS_KEY", "ignored-ak");
+        std::env::set_var("BYTE_TOS_SECRET_KEY", "ignored-sk");
+        let directory = test_directory("byte-zti-named");
+        let mut selected = global();
+        selected.profile = "missing".into();
+        selected.byte_tos_auth_mode = Some("zti".into());
+        selected.config_path = Some(directory.join("missing.toml"));
+        write_config(selected.config_path.as_ref().unwrap(), "");
+        selected.credentials_path = Some(directory.join("credentials.toml"));
+        selected.endpoint = Some("http://127.0.0.1:1".into());
+        selected.region = Some("test-region".into());
+        let runtime = build_runtime(&selected).unwrap();
+        assert!(runtime.profile.access_key_id.is_none());
+        assert!(runtime.profile.secret_access_key.is_none());
+        assert_eq!(runtime.profile.endpoint, selected.endpoint);
+        assert!(matches!(
+            runtime.auth_mode,
+            ResolvedRuntimeAuth::Byte(ResolvedByteTosAuthMode {
+                mode: ByteTosAuthMode::Zti,
+                ..
+            })
+        ));
+        assert!(matches!(
+            runtime.client(&selected, "iam"),
+            Err(CliError::ValidationError(_))
+        ));
+        assert!(!selected.credentials_path.as_ref().unwrap().exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn byte_zti_capture_server() -> (String, std::thread::JoinHandle<String>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .unwrap();
+            String::from_utf8(request).unwrap().to_ascii_lowercase()
+        });
+        (endpoint, server)
+    }
+
+    #[tokio::test]
+    async fn byte_zti_runtime_clones_injected_provider_and_sends_token_only() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _restore = EnvironmentRestore::capture(&[TOS_CONFIG_BINARY_ENV]);
+        std::env::set_var(TOS_CONFIG_BINARY_ENV, "tos");
+        let directory = test_directory("byte-zti-wire");
+        let (endpoint, server) = byte_zti_capture_server();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let mut selected = global();
+        selected.byte_tos_auth_mode = Some("zti".into());
+        selected.endpoint = Some(endpoint.clone());
+        selected.region = Some("test-region".into());
+        selected.config_path = Some(directory.join("config.toml"));
+        write_config(selected.config_path.as_ref().unwrap(), "");
+        selected.zti_token_provider = Some(ZtiTokenProvider::new(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { Ok("runtime-token".into()) }
+        }));
+        let cloned = selected.clone();
+        let runtime = build_runtime(&cloned).unwrap();
+        let client = runtime.client(&cloned, "tos").unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        client
+            .send_request(
+                reqwest::Method::GET,
+                &endpoint,
+                "/",
+                BTreeMap::new(),
+                BTreeMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let request = server.join().unwrap();
+        assert!(request.contains("x-tos-ztitoken-with-acp: runtime-token\r\n"));
+        assert!(!request.contains("authorization:"));
+        assert!(!request.contains("x-tos-security-token:"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn byte_zti_runtime_constructs_client_with_builtin_source() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _restore = EnvironmentRestore::capture(&[TOS_CONFIG_BINARY_ENV]);
+        std::env::set_var(TOS_CONFIG_BINARY_ENV, "tos");
+        let directory = test_directory("byte-zti-builtin");
+        let mut selected = global();
+        selected.byte_tos_auth_mode = Some("zti".into());
+        selected.endpoint = Some("http://127.0.0.1:1".into());
+        selected.region = Some("test-region".into());
+        selected.config_path = Some(directory.join("config.toml"));
+        write_config(selected.config_path.as_ref().unwrap(), "");
+
+        let runtime = build_runtime(&selected).unwrap();
+        runtime
+            .client(&selected, "tos")
+            .unwrap_or_else(|error| panic!("built-in ZTI client: {error}"));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn byte_zti_missing_profile_uses_only_non_secret_byte_environment() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _restore = EnvironmentRestore::capture(&[
+            TOS_CONFIG_BINARY_ENV,
+            "BYTE_TOS_ENDPOINT",
+            "BYTE_TOS_REGION",
+            "TOS_ENDPOINT",
+            "TOS_ACCESS_KEY",
+        ]);
+        std::env::set_var(TOS_CONFIG_BINARY_ENV, "tos");
+        std::env::set_var("BYTE_TOS_ENDPOINT", "http://127.0.0.1:1");
+        std::env::set_var("BYTE_TOS_REGION", "byte-region");
+        std::env::set_var("TOS_ENDPOINT", "https://ve.example");
+        std::env::set_var("TOS_ACCESS_KEY", "ve-ak");
+        let directory = test_directory("byte-zti-environment");
+        let mut selected = global();
+        selected.profile = "missing".into();
+        selected.byte_tos_auth_mode = Some("zti".into());
+        selected.config_path = Some(directory.join("config.toml"));
+        write_config(
+            selected.config_path.as_ref().unwrap(),
+            "[other.ve-tos]\nauth_mode = \"unified\"\n",
+        );
+        let profile = build_profile(&selected).unwrap();
+        assert_eq!(profile.endpoint.as_deref(), Some("http://127.0.0.1:1"));
+        assert_eq!(profile.region.as_deref(), Some("byte-region"));
+        assert!(profile.access_key_id.is_none());
+        assert!(profile.secret_access_key.is_none());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn byte_zti_runtime_ignores_broken_credentials_with_builtin_provider() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _restore = EnvironmentRestore::capture(&[
+            TOS_CONFIG_BINARY_ENV,
+            "BYTETOS_AUTH_MODE",
+            "TOS_AUTH_MODE",
+        ]);
+        std::env::set_var(TOS_CONFIG_BINARY_ENV, "tos");
+        std::env::set_var("BYTETOS_AUTH_MODE", "zti");
+        std::env::set_var("TOS_AUTH_MODE", "invalid-ve-mode");
+        let directory = test_directory("byte-zti-runtime");
+        let config_path = directory.join("config.toml");
+        let credentials_path = directory.join("credentials.toml");
+        write_config(&config_path, "[default.tos]\nendpoint = \"http://127.0.0.1:1\"\nregion = \"test-region\"\naccess_key_id = \"ENC:not-valid\"\nsecret_access_key = \"ENC:not-valid\"\n");
+        write_config(&credentials_path, "broken = [");
+        let mut selected = global();
+        selected.config_path = Some(config_path);
+        selected.credentials_path = Some(credentials_path);
+        let runtime = build_runtime(&selected)
+            .unwrap_or_else(|error| panic!("ZTI must skip credentials: {error}"));
+        assert!(runtime.profile.access_key_id.is_none());
+        assert!(runtime.profile.secret_access_key.is_none());
+        runtime
+            .client(&selected, "tos")
+            .unwrap_or_else(|error| panic!("built-in ZTI client: {error}"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn resolve_auth_mode_uses_cli_config_environment_default_precedence() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _restore = EnvironmentRestore::capture(&["TOS_AUTH_MODE"]);
@@ -1644,7 +2013,13 @@ mod tests {
         let runtime = build_runtime(&selected).expect("unified runtime");
         let client = runtime.client(&selected, "tos").expect("dynamic client");
 
-        assert_eq!(runtime.auth_mode.mode, AuthMode::Unified);
+        assert!(matches!(
+            runtime.auth_mode,
+            ResolvedRuntimeAuth::Ve(ResolvedAuthMode {
+                mode: AuthMode::Unified,
+                ..
+            })
+        ));
         assert!(runtime.profile.access_key_id.is_none());
         assert!(runtime.profile.secret_access_key.is_none());
         assert_eq!(

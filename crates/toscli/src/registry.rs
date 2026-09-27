@@ -588,6 +588,36 @@ const SERVE_PARAMS: &[RegistryParameter] = &[
     },
 ];
 
+const DOCTOR_PARAMS: &[RegistryParameter] = &[
+    RegistryParameter {
+        name: "check",
+        required: false,
+        description:
+            "Run one check: auth, config, registry, network (or endpoint), mcp, or completion",
+    },
+    RegistryParameter {
+        name: "live-network",
+        required: false,
+        description: "Probe the configured endpoint during the network check",
+    },
+    RegistryParameter {
+        name: "network-timeout-ms",
+        required: false,
+        description: "Timeout in milliseconds for a live network probe",
+    },
+];
+
+/// Check selectors accepted by ByteTOS doctor, including the endpoint alias.
+pub const DOCTOR_CHECKS: &[&str] = &[
+    "auth",
+    "config",
+    "registry",
+    "network",
+    "endpoint",
+    "mcp",
+    "completion",
+];
+
 pub const CAPABILITIES: &[CapabilityRow] = &[
     row(
         "tos cp",
@@ -599,6 +629,8 @@ pub const CAPABILITIES: &[CapabilityRow] = &[
         true,
         CP_PARAMS,
         &[
+            // [Review Fix #26] Recursive transfer checks bucket shape first.
+            "HeadBucket",
             "ListObjectsType2",
             "HeadObject",
             "GetObject",
@@ -622,6 +654,7 @@ pub const CAPABILITIES: &[CapabilityRow] = &[
         true,
         MV_PARAMS,
         &[
+            "HeadBucket",
             "ListObjectsType2",
             "HeadObject",
             "GetObject",
@@ -646,6 +679,7 @@ pub const CAPABILITIES: &[CapabilityRow] = &[
         true,
         SYNC_PARAMS,
         &[
+            "HeadBucket",
             "ListObjectsType2",
             "HeadObject",
             "GetObject",
@@ -682,6 +716,7 @@ pub const CAPABILITIES: &[CapabilityRow] = &[
         true,
         RM_PARAMS,
         &[
+            "HeadBucket",
             "DeleteObject",
             "ListObjectsType2",
             "ListObjectVersions",
@@ -723,7 +758,7 @@ pub const CAPABILITIES: &[CapabilityRow] = &[
         false,
         true,
         DU_PARAMS,
-        &["ListObjectsType2"],
+        &["HeadBucket", "ListObjectsType2"],
         &["tos-cli du tos://bucket/prefix/ --human-readable"],
     ),
     row(
@@ -772,7 +807,7 @@ pub const CAPABILITIES: &[CapabilityRow] = &[
         "tos presign",
         "presign",
         "high_level",
-        "Generate presigned URL",
+        "Generate presigned URL (AK/SK only; ZTI is not supported)",
         "low",
         false,
         true,
@@ -864,7 +899,7 @@ pub const CAPABILITIES: &[CapabilityRow] = &[
         "low",
         false,
         false,
-        EMPTY_PARAMS,
+        DOCTOR_PARAMS,
         &[],
         &["tos-cli doctor"],
     ),
@@ -937,6 +972,20 @@ pub fn public_tos_command(command: &str) -> String {
         .or_else(|| command.strip_prefix("ve-storage-uni-cli tos "))
         .map(|suffix| format!("{prefix} {suffix}"))
         .unwrap_or_else(|| command.to_string())
+}
+
+/// Resolve a registry-owned shell example for the active CLI entrypoint.
+///
+/// `example` may contain pipeline stages. Returns a display-only shell snippet;
+/// this function does not execute shell text or perform IO and cannot fail.
+pub fn public_tos_example(example: &str) -> String {
+    // [Review Fix #Skill3] A stdin example starts with echo rather than tos;
+    // normalize each stage so unified exports do not require a second binary.
+    example
+        .split(" | ")
+        .map(public_tos_command)
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 #[cfg(test)]

@@ -956,6 +956,8 @@ mod tests {
             confirm: None,
             request_trace: Default::default(),
             ve_tos_auth_mode: None,
+            byte_tos_auth_mode: None,
+            zti_token_provider: None,
             documentation_language: None,
         };
 
@@ -1026,6 +1028,8 @@ mod tests {
             confirm: None,
             request_trace: Default::default(),
             ve_tos_auth_mode: None,
+            byte_tos_auth_mode: None,
+            zti_token_provider: None,
             documentation_language: None,
         };
         let args = BucketCreateArgs {

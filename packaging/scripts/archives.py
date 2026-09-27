@@ -117,7 +117,8 @@ def make_archive(stage_dir: Path, archive_path: Path) -> None:
     if archive_path.name.endswith(".tar.gz"):
         with tarfile.open(archive_path, "w:gz") as tar_file:
             for path in sorted(stage_dir.rglob("*")):
-                tar_file.add(path, arcname=path.relative_to(stage_dir))
+                # [Review Fix #1] rglob already visits children; recursive add duplicated binaries.
+                tar_file.add(path, arcname=path.relative_to(stage_dir), recursive=False)
         return
 
     raise SystemExit(f"unsupported archive format: {archive_path.name}")

@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use crate::agent::error::CliError;
 use crate::infra::config::ConfigFile;
+use crate::infra::zti_credentials::ZtiTokenProvider;
 
 /// Summary of the global options reused in the `ve-tos-cli --help` grouped help text.
 ///
@@ -96,7 +97,8 @@ pub struct GlobalArgs {
     ///
     /// CLI flag only. Supported by the `tos` command surface. When omitted,
     /// `--idc`, `--cluster`, and `--addr-family` do not enable PSM mode by
-    /// themselves.
+    /// themselves. Set TOS_FORCE_PSM=true to skip bucket BNS routing and
+    /// resolve the selected PSM directly through Consul.
     #[arg(long, global = true)]
     pub psm: Option<String>,
 
@@ -193,6 +195,14 @@ pub struct GlobalArgs {
     #[arg(skip)]
     pub ve_tos_auth_mode: Option<String>,
 
+    /// ByteTOS authentication mode copied from its tool-scoped parser.
+    #[arg(skip)]
+    pub byte_tos_auth_mode: Option<String>,
+
+    /// Invocation-owned ZTI token source for ByteTOS requests.
+    #[arg(skip)]
+    pub zti_token_provider: Option<ZtiTokenProvider>,
+
     /// Invocation-scoped documentation language selected by the root parser.
     ///
     /// This internal value is populated only after `--language` has been
@@ -231,6 +241,8 @@ impl Default for GlobalArgs {
             trace_redact: "strict".to_string(),
             request_trace: Arc::new(ServiceRequestTrace::default()),
             ve_tos_auth_mode: None,
+            byte_tos_auth_mode: None,
+            zti_token_provider: None,
             documentation_language: None,
         }
     }
