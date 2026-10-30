@@ -3000,9 +3000,19 @@ fn push_mcp_public_command_path(command: &str, argv: &mut Vec<String>) {
     let Some(first_part) = parts.next() else {
         return;
     };
-    // [Review Fix #26] MCP subprocess execution uses the canonical public
-    // top-level command directly; old `adrive` command paths are unsupported.
-    argv.push(first_part.to_string());
+    let is_direct_adrive_exe = std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+        })
+        .map(|stem| matches!(stem.as_str(), "ve-adrive" | "ve-adrive-cli"))
+        .unwrap_or(false);
+    // The dedicated entry point adds ve-adrive itself; the unified binary needs it.
+    if !(is_direct_adrive_exe && first_part == "ve-adrive") {
+        argv.push(first_part.to_string());
+    }
     argv.extend(parts.map(ToString::to_string));
 }
 
