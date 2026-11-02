@@ -118,7 +118,7 @@ def check_exact_and_query(binary, root, origin):
 
 
 def check_pagination(binary, root, origin):
-    shared = invoke(binary, root, [*share_arguments(origin, "paged"), "--limit", "1", "--marker", "previous"])
+    shared = invoke(binary, root, [*share_arguments(origin, "paged"), "--max-keys", "1", "--marker", "previous"])
     ordinary = invoke(binary, root, ["ls", "adrive://inst/paged/docs/", "--max-keys", "1", "--marker", "previous"])
     assert shared == ordinary and "Total: 1 (next_marker=next)" in shared
 

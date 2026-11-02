@@ -11,6 +11,10 @@
 - For `source/photos/a.jpg` under a recursive source `source/photos/`, a remote destination `.../backup/` receives `backup/a.jpg`, or `backup/photos/a.jpg` with `--include-parent`.
 - Recursive `--include` and `--exclude` match relative paths (including the retained parent segment when used); exclusion wins. Supports `*`; patterns without `*` use substring matching. Do not assume regular expressions or shell glob semantics for `?`. Quote patterns to prevent shell expansion. These filters do not select a single-file transfer.
 
+- Local-directory uploads with `cp --recursive` and `sync` preserve selected directories, including empty directories, by default. `--disable-dir-object` skips explicit directory uploads; it is valid only for local-directory uploads. Files can still create required parents in HNS/ADrive. ADrive preserves directories with its folder API. Both manifest and `--no-manifest` execution preserve the same directory policy. An empty source creates the effective destination folder when a non-root path exists; `--include-parent` retains the source basename. Directory tasks count as items with zero bytes. The switch does not authorize deleting source-present directories during `sync --delete`.
+
+- Directory filters use the same relative path as file filters, without a trailing slash. Selected files imply their parent directories; filtering a directory does not stop file traversal. The effective destination root is a structural container and remains included even when no descendants match.
+
 ### Overwrite, resumability, and performance
 
 - Set `--overwrite-strategy` deliberately: `force` overwrites where supported, `no-clobber` skips existing targets, and `newer` compares source/destination timestamps rather than proving content equality. The profile may change the default. `--force` and `--no-clobber` cannot be combined; prefer one explicit strategy over mixing aliases.

@@ -5393,6 +5393,93 @@ fn test_adrive_describe_without_required_positionals_recovers() {
 }
 
 #[test]
+fn test_describe_command_identity_ignores_same_named_profiles() {
+    for (surface, command) in [
+        ("tos", vec!["cp"]),
+        ("ve-tos", vec!["cp"]),
+        ("ve-adrive", vec!["share", "download"]),
+    ] {
+        for profile in ["tos", "ve-tos", "ve-adrive"] {
+            for options in [
+                vec!["--profile".to_string(), profile.to_string()],
+                vec!["-P".into(), profile.into()],
+                vec![format!("--profile={profile}")],
+                vec![format!("-P{profile}")],
+                vec!["-qP".into(), profile.into()],
+                vec![
+                    "--no-color".into(),
+                    "No".into(),
+                    "--profile".into(),
+                    profile.into(),
+                ],
+            ] {
+                assert_describe_identity_at_option_positions(surface, &command, &options);
+            }
+        }
+    }
+}
+
+fn assert_describe_identity_at_option_positions(
+    surface: &str,
+    command: &[&str],
+    options: &[String],
+) {
+    for position in [0, 1, command.len() + 1] {
+        let mut arguments = vec![surface.to_string()];
+        arguments.extend(command.iter().map(|value| (*value).to_string()));
+        arguments.splice(position..position, options.iter().cloned());
+        arguments.extend(["--describe".into(), "--output".into(), "json".into()]);
+        let borrowed = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        let envelope = successful_cli_json(&borrowed);
+        let expected = format!("{surface} {}", command.join(" "));
+        assert_eq!(envelope["command"], expected, "{arguments:?}: {envelope}");
+        assert_eq!(
+            envelope["data"]["command"], expected,
+            "{arguments:?}: {envelope}"
+        );
+    }
+}
+
+#[test]
+fn test_help_command_identity_ignores_same_named_profiles() {
+    for surface in ["tos", "ve-tos", "ve-adrive"] {
+        for profile in ["tos", "ve-tos", "ve-adrive"] {
+            for options in [
+                vec!["--profile".to_string(), profile.to_string()],
+                vec!["-qP".into(), profile.into()],
+                vec![
+                    "--no-color".into(),
+                    "No".into(),
+                    "--profile".into(),
+                    profile.into(),
+                ],
+            ] {
+                let mut arguments = vec!["--help".to_string()];
+                arguments.extend(options);
+                arguments.extend([surface.into(), "cp".into()]);
+                assert_help_command_identity(&arguments, surface);
+            }
+        }
+    }
+}
+
+fn assert_help_command_identity(arguments: &[String], surface: &str) {
+    for language in ["en", "zh"] {
+        let mut localized = arguments.to_vec();
+        localized.extend(["--language".into(), language.into()]);
+        let borrowed = localized.iter().map(String::as_str).collect::<Vec<_>>();
+        let help = successful_cli_stdout(&borrowed)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            help.contains(&format!("ve-storage-uni-cli {surface} cp ")),
+            "{localized:?}: {help}"
+        );
+    }
+}
+
+#[test]
 fn test_adrive_config_group_describe_matches_capabilities_contract() {
     let output = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"))
         .args(["--output", "json", "--describe", "ve-adrive", "config"])

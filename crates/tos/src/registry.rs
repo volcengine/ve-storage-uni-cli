@@ -650,7 +650,7 @@ pub const CAPABILITIES: &[CapabilityEntry] = &[
         supports_force: true,
         supports_pipe: false,
         supports_output_formats: SUPPORTED_OUTPUT_FORMATS,
-        parameters: TRANSFER_PARAMETERS,
+        parameters: CP_PARAMETERS,
         body_contract: None,
         // Guard wording is aligned with streaming I/O, atomic
         // .tos-partial-<pid> persistence, SHA256 signing, and native x-tos-*
@@ -685,6 +685,7 @@ pub const CAPABILITIES: &[CapabilityEntry] = &[
             "copy phase reuses cp guards: streaming + atomic persist + native x-tos-copy-source-if-match for source ETag (separate from destination if-match)",
             "source delete is issued only after the destination write succeeds",
             "destination is identified by the Cp-discovered ETag; delete propagates that ETag when available",
+            crate::cli::high_level::HNS_FILTERED_MOVE_HELP,
         ],
         examples: &["ve-tos mv tos://bucket/a tos://bucket/b --force --confirm tos://bucket/a"],
         related_commands: &["ve-tos cp", "ve-tos rm"],
@@ -1563,6 +1564,7 @@ fn registry_parameter_schema_type(name: &str) -> &'static str {
         | "size-only"
         | "exact-timestamps"
         | "include-parent"
+        | "disable-dir-object"
         | "parents"
         | "all-versions"
         | "include-uploads"
@@ -1710,6 +1712,12 @@ fn describe_scenario_routing(row: &RegistryCapabilityRow) -> HashMap<String, Str
                 "transfer_matrix".to_string(),
                 "copy phase follows cp behavior; source delete uses DeleteObject after destination confirmation"
                     .to_string(),
+            );
+            // [Review Fix #FilteredHnsDiscovery] Describe uses this static path,
+            // so publish the same HNS source contract as help and execution.
+            routing.insert(
+                "filtered_hns_move".to_string(),
+                crate::cli::high_level::HNS_FILTERED_MOVE_HELP.to_string(),
             );
         }
         "ve-tos sync" => {
@@ -2659,136 +2667,153 @@ const fn group(
     }
 }
 
-const TRANSFER_PARAMETERS: &[RegistryParameter] = &[
-    param(
-        "source",
-        ParameterLocation::Path,
-        true,
-        "Source local path or tos:// URI",
-    ),
-    param(
-        "destination",
-        ParameterLocation::Path,
-        true,
-        "Destination local path or tos:// URI",
-    ),
-    param(
-        "recursive",
-        ParameterLocation::Flag,
-        false,
-        "Enable recursive transfer",
-    ),
-    param(
-        "include-parent",
-        ParameterLocation::Flag,
-        false,
-        "Include the source directory/prefix name under the destination prefix",
-    ),
-    param("include", ParameterLocation::Flag, false, "Include pattern"),
-    param("exclude", ParameterLocation::Flag, false, "Exclude pattern"),
-    param(
-        "checkpoint",
-        ParameterLocation::Flag,
-        false,
-        "Enable resumable checkpoint",
-    ),
-    param(
-        "checkpoint-dir",
-        ParameterLocation::Flag,
-        false,
-        "Checkpoint directory",
-    ),
-    param(
-        "batch-concurrency",
-        ParameterLocation::Flag,
-        false,
-        "Maximum files/items running concurrently in batch execution",
-    ),
-    param(
-        "list-concurrency",
-        ParameterLocation::Flag,
-        false,
-        "Maximum prefixes listed concurrently when recursive listing uses delimiter=\"/\"",
-    ),
-    param(
-        "recursive-list-mode",
-        ParameterLocation::Flag,
-        false,
-        "Recursive listing mode: tos always uses hierarchical delimiter=\"/\"; ve-tos auto uses bucket shape, with flat/hierarchical overrides",
-    ),
-    param(
-        "storage-class",
-        ParameterLocation::Header,
-        false,
-        "Storage class for ve-tos uploads and TOS-to-TOS copies; ByteTOS uploads reject this override",
-    ),
-    param(
-        "acl",
-        ParameterLocation::Header,
-        false,
-        "Target object ACL for TOS uploads/copies",
-    ),
-    param(
-        "meta",
-        ParameterLocation::Header,
-        false,
-        "Custom object metadata as key=value#key2=value2; writes x-tos-meta-* headers",
-    ),
-    param(
-        "report-path",
-        ParameterLocation::Flag,
-        false,
-        "Batch report path",
-    ),
-    param(
-        "report-failures-only",
-        ParameterLocation::Flag,
-        false,
-        "Write only failed items to the batch report",
-    ),
-    param(
-        "manifest-path",
-        ParameterLocation::Flag,
-        false,
-        "Planned transfer manifest path",
-    ),
-    param(
-        "no-manifest",
-        ParameterLocation::Flag,
-        false,
-        "Disable planned manifest output",
-    ),
-    param(
-        "list-echo",
-        ParameterLocation::Flag,
-        false,
-        "Enable listing-phase echo output",
-    ),
-    param(
-        "no-list-echo",
-        ParameterLocation::Flag,
-        false,
-        "Disable listing-phase echo output",
-    ),
-    param(
-        "progress",
-        ParameterLocation::Flag,
-        false,
-        "Enable execution progress output",
-    ),
-    param(
-        "no-progress",
-        ParameterLocation::Flag,
-        false,
-        "Disable execution progress output",
-    ),
-    param(
-        "force",
-        ParameterLocation::Flag,
-        false,
-        "Allow overwrite or destructive behavior",
-    ),
-];
+// [Review Fix #DirectoryDiscovery] Share transfer metadata while keeping the upload-only switch off mv.
+macro_rules! transfer_parameters {
+    ($recursive_help:expr; $($extra:expr),* $(,)?) => {
+        &[
+            param(
+                "source",
+                ParameterLocation::Path,
+                true,
+                "Source local path or tos:// URI",
+            ),
+            param(
+                "destination",
+                ParameterLocation::Path,
+                true,
+                "Destination local path or tos:// URI",
+            ),
+            param(
+                "recursive",
+                ParameterLocation::Flag,
+                false,
+                $recursive_help,
+            ),
+            param(
+                "include-parent",
+                ParameterLocation::Flag,
+                false,
+                "Include the source directory/prefix name under the destination prefix",
+            ),
+            param("include", ParameterLocation::Flag, false, "Include pattern"),
+            param("exclude", ParameterLocation::Flag, false, "Exclude pattern"),
+            param(
+                "checkpoint",
+                ParameterLocation::Flag,
+                false,
+                "Enable resumable checkpoint",
+            ),
+            param(
+                "checkpoint-dir",
+                ParameterLocation::Flag,
+                false,
+                "Checkpoint directory",
+            ),
+            param(
+                "batch-concurrency",
+                ParameterLocation::Flag,
+                false,
+                "Maximum files/items running concurrently in batch execution",
+            ),
+            param(
+                "list-concurrency",
+                ParameterLocation::Flag,
+                false,
+                "Maximum prefixes listed concurrently when recursive listing uses delimiter=\"/\"",
+            ),
+            param(
+                "recursive-list-mode",
+                ParameterLocation::Flag,
+                false,
+                "Recursive listing mode: tos always uses hierarchical delimiter=\"/\"; ve-tos auto uses bucket shape, with flat/hierarchical overrides",
+            ),
+            param(
+                "storage-class",
+                ParameterLocation::Header,
+                false,
+                "Storage class for ve-tos uploads and TOS-to-TOS copies; ByteTOS uploads reject this override",
+            ),
+            param(
+                "acl",
+                ParameterLocation::Header,
+                false,
+                "Target object ACL for TOS uploads/copies",
+            ),
+            param(
+                "meta",
+                ParameterLocation::Header,
+                false,
+                "Custom object metadata as key=value#key2=value2; writes x-tos-meta-* headers",
+            ),
+            param(
+                "report-path",
+                ParameterLocation::Flag,
+                false,
+                "Batch report path",
+            ),
+            param(
+                "report-failures-only",
+                ParameterLocation::Flag,
+                false,
+                "Write only failed items to the batch report",
+            ),
+            param(
+                "manifest-path",
+                ParameterLocation::Flag,
+                false,
+                "Planned transfer manifest path",
+            ),
+            param(
+                "no-manifest",
+                ParameterLocation::Flag,
+                false,
+                "Disable planned manifest output",
+            ),
+            param(
+                "list-echo",
+                ParameterLocation::Flag,
+                false,
+                "Enable listing-phase echo output",
+            ),
+            param(
+                "no-list-echo",
+                ParameterLocation::Flag,
+                false,
+                "Disable listing-phase echo output",
+            ),
+            param(
+                "progress",
+                ParameterLocation::Flag,
+                false,
+                "Enable execution progress output",
+            ),
+            param(
+                "no-progress",
+                ParameterLocation::Flag,
+                false,
+                "Disable execution progress output",
+            ),
+            param(
+                "force",
+                ParameterLocation::Flag,
+                false,
+                "Allow overwrite or destructive behavior",
+            ),
+            $($extra,)*
+        ]
+    };
+}
+
+// [Review Fix #FilteredHnsSkill] Skill export prefers schema descriptions over
+// clap help, so keep mv's source contract here without changing cp semantics.
+const TRANSFER_PARAMETERS: &[RegistryParameter] =
+    transfer_parameters!(crate::cli::high_level::HNS_FILTERED_MOVE_HELP;);
+const CP_PARAMETERS: &[RegistryParameter] = transfer_parameters!("Enable recursive transfer"; param(
+    "disable-dir-object",
+    ParameterLocation::Flag,
+    false,
+    "Skip explicit directory uploads. By default, preserve directories including empty directories. Files may still create required parent directories",
+));
 
 const SYNC_PARAMETERS: &[RegistryParameter] = &[
     param(
@@ -2924,6 +2949,12 @@ const SYNC_PARAMETERS: &[RegistryParameter] = &[
         ParameterLocation::Flag,
         false,
         "Disable execution progress output",
+    ),
+    param(
+        "disable-dir-object",
+        ParameterLocation::Flag,
+        false,
+        "Skip explicit directory uploads. By default, preserve directories including empty directories. Files may still create required parent directories",
     ),
 ];
 

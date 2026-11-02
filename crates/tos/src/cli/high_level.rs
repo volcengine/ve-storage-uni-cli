@@ -16,6 +16,9 @@
 
 use clap::{Args, ValueEnum};
 
+/// Shared help and discovery contract for filtered moves from an HNS source.
+pub(crate) const HNS_FILTERED_MOVE_HELP: &str = "Recursive move for directories or prefixes. For HNS sources, filtered recursive moves select files only and preserve source directories and excluded files when using --include/--exclude. Without filters, whole-directory rename remains available.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ProgressGranularity {
     /// Count completed transfer parts
@@ -84,6 +87,9 @@ pub struct CpArgs {
     /// Include the source directory/prefix name under the destination prefix
     #[arg(long, requires = "recursive")]
     pub include_parent: bool,
+    /// Skip explicit directory uploads. By default, preserve directories including empty directories. Files may still create required parent directories
+    #[arg(long, requires = "recursive")]
+    pub disable_dir_object: bool,
     /// Include pattern
     #[arg(long)]
     pub include: Option<String>,
@@ -175,7 +181,7 @@ pub struct MvArgs {
     pub destination: String,
     /// Recursive move for directories or prefixes
     // [Review Fix #9] `-r` is reserved by global `--region`; keep recursive as long-only.
-    #[arg(long)]
+    #[arg(long, long_help = HNS_FILTERED_MOVE_HELP)]
     pub recursive: bool,
     /// Include the source directory/prefix name under the destination prefix
     #[arg(long, requires = "recursive")]
@@ -275,6 +281,9 @@ pub struct SyncArgs {
     /// Include the source directory/prefix name under the destination prefix
     #[arg(long)]
     pub include_parent: bool,
+    /// Skip explicit directory uploads. By default, preserve directories including empty directories. Files may still create required parent directories
+    #[arg(long)]
+    pub disable_dir_object: bool,
     /// Include pattern
     #[arg(long)]
     pub include: Option<String>,

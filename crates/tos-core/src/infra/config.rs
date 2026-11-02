@@ -265,8 +265,9 @@ pub struct TosTableOverride {
 #[serde(deny_unknown_fields)]
 pub struct AdriveOverride {
     /// Safe share-page origin, independent of the API endpoint.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub share_base_url: Option<String>,
+    // [Review Fix #ShareEndpoint1] Existing profiles remain readable; serialization uses the canonical endpoint key.
+    #[serde(alias = "share_base_url", skip_serializing_if = "Option::is_none")]
+    pub share_endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -715,7 +716,7 @@ impl<T: Clone + Serialize> TracedField<T> {
 pub struct EffectiveProfile {
     /// ADrive-only share-page origin with its configuration source.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub share_base_url: Option<TracedField<String>>,
+    pub share_endpoint: Option<TracedField<String>>,
     pub profile_name: String,
     pub binary: String,
     pub region: TracedField<String>,
@@ -1069,7 +1070,7 @@ impl ConfigFile {
             TracedField::shared(strip_placeholder(profile.security_token.clone()));
 
         let mut auth_endpoint: Option<TracedField<String>> = None;
-        let mut share_base_url: Option<TracedField<String>> = None;
+        let mut share_endpoint: Option<TracedField<String>> = None;
         let mut account_id: Option<TracedField<String>> = None;
         let mut default_instance: Option<TracedField<String>> = None;
         let mut default_space: Option<TracedField<String>> = None;
@@ -1201,9 +1202,9 @@ impl ConfigFile {
                         value: configured_auth_mode,
                     });
                     // [Review Fix #ShareOrigin2] Resolving metadata must not validate a page origin unused by this operation.
-                    share_base_url = Some(TracedField {
-                        value: o.share_base_url.clone(),
-                        source: if o.share_base_url.is_some() {
+                    share_endpoint = Some(TracedField {
+                        value: o.share_endpoint.clone(),
+                        source: if o.share_endpoint.is_some() {
                             FieldSource::BinaryOverride
                         } else {
                             FieldSource::Unset
@@ -1391,7 +1392,7 @@ impl ConfigFile {
             region,
             endpoint,
             auth_endpoint,
-            share_base_url,
+            share_endpoint,
             psm,
             idc,
             cluster,
@@ -1919,9 +1920,9 @@ fn set_tostable_override(o: &mut TosTableOverride, key: &str, value: &str) -> Re
 
 fn set_adrive_override(o: &mut AdriveOverride, key: &str, value: &str) -> Result<(), CliError> {
     match canonical_config_key(key) {
-        "share_base_url" => {
-            validate_share_base_url(value)?;
-            o.share_base_url = Some(value.into());
+        "share_endpoint" | "share_base_url" => {
+            validate_share_endpoint(value)?;
+            o.share_endpoint = Some(value.into());
         }
         "auth_mode" => {
             o.auth_mode = Some(normalize_adrive_auth_mode(value)?);
@@ -2685,9 +2686,9 @@ mod tests {
 
 /// Validate an HTTP(S) share-page origin, preserving its configured scheme and port.
 /// Returns a sanitized validation error without echoing URL credentials or queries.
-pub fn validate_share_base_url(origin: &str) -> Result<(), CliError> {
+pub fn validate_share_endpoint(origin: &str) -> Result<(), CliError> {
     let invalid =
-        || CliError::ValidationError("share_base_url must be a safe HTTP(S) origin".into());
+        || CliError::ValidationError("share_endpoint must be a safe HTTP(S) origin".into());
     let parsed = url::Url::parse(origin).map_err(|_| invalid())?;
     // [Review Fix #ShareProtocol3] Explicit page configuration supports HTTP and HTTPS without a host-specific protocol policy.
     let raw_authority = origin

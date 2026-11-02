@@ -75,6 +75,12 @@ const RECURSIVE_PARAM: RegistryParameter = RegistryParameter {
     description: "Traverse prefixes recursively with delimiter=\"/\"",
 };
 
+const DISABLE_DIR_OBJECT_PARAM: RegistryParameter = RegistryParameter {
+    name: "disable-dir-object",
+    required: false,
+    description: "Skip explicit directory uploads. By default, preserve directories including empty directories. Files may still create required parent directories",
+};
+
 const INCLUDE_PARENT_PARAM: RegistryParameter = RegistryParameter {
     name: "include-parent",
     required: false,
@@ -244,6 +250,7 @@ const CP_PARAMS: &[RegistryParameter] = &[
     DESTINATION_PARAM,
     RECURSIVE_PARAM,
     INCLUDE_PARENT_PARAM,
+    DISABLE_DIR_OBJECT_PARAM,
     INCLUDE_PARAM,
     EXCLUDE_PARAM,
     CHECKPOINT_PARAM,
@@ -322,6 +329,7 @@ const SYNC_PARAMS: &[RegistryParameter] = &[
         description: "Use exact timestamps for comparison",
     },
     INCLUDE_PARENT_PARAM,
+    DISABLE_DIR_OBJECT_PARAM,
     INCLUDE_PARAM,
     EXCLUDE_PARAM,
     CHECKPOINT_DIR_PARAM,

@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// Create one file or folder share; optional zero/false values are sent explicitly.
+/// Create one file/folder share or an entire Space; optional settings retain explicit zero/false values.
 #[derive(Clone, Default, Serialize)]
 pub struct CreateShareLinkInput {
     #[serde(rename = "InstanceID")]
@@ -16,6 +16,9 @@ pub struct CreateShareLinkInput {
     pub space_id: String,
     #[serde(rename = "FilePathList")]
     pub file_path_list: Vec<String>,
+    /// Select the entire Space instead of one path; the path list must then be empty.
+    #[serde(rename = "ShareAllFiles", skip_serializing_if = "is_false")]
+    pub is_share_all_files: bool,
     #[serde(rename = "SharePwd", skip_serializing_if = "Option::is_none")]
     pub share_pwd: Option<String>,
     #[serde(rename = "ExpirationSec", skip_serializing_if = "Option::is_none")]
@@ -39,17 +42,24 @@ pub struct CreateShareLinkInput {
 }
 
 impl CreateShareLinkInput {
-    /// Validate the required identifiers, single root, permission and nonnegative limits.
+    /// Validate identifiers, the exclusive whole-Space/single-path scope, permission and limits.
     /// Returns an input error before any request if the V1 product contract is violated.
     pub fn validate(&self) -> Result<()> {
         validate_required(&self.instance_id, "InstanceID")?;
         validate_required(&self.space_id, "SpaceID")?;
-        if self.file_path_list.len() != 1 {
+        if self.is_share_all_files && !self.file_path_list.is_empty() {
+            return Err(Error::Client(
+                "ShareAllFiles must not be combined with FilePathList entries".into(),
+            ));
+        }
+        if !self.is_share_all_files && self.file_path_list.len() != 1 {
             return Err(Error::Client(
                 "FilePathList must contain exactly one file or folder".into(),
             ));
         }
-        validate_required(&self.file_path_list[0], "FilePathList")?;
+        if !self.is_share_all_files {
+            validate_required(&self.file_path_list[0], "FilePathList")?;
+        }
         validate_permission(self.permission.as_deref())?;
         validate_limits([
             self.expiration_sec,
@@ -58,6 +68,10 @@ impl CreateShareLinkInput {
             self.save_limit,
         ])
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// Update only explicitly selected mutable fields, with optimistic concurrency timestamp.
@@ -201,10 +215,16 @@ pub struct ShareLinkInfo {
     pub response_info: ResponseInfo,
     #[serde(rename = "ShareID", skip_serializing_if = "Option::is_none")]
     pub share_id: Option<String>,
+    /// Service-provided page URL; may include a delivery password query.
+    #[serde(rename = "ShareURL", skip_serializing_if = "Option::is_none")]
+    pub share_url: Option<String>,
     #[serde(rename = "InstanceID", skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
     #[serde(rename = "SpaceID", skip_serializing_if = "Option::is_none")]
     pub space_id: Option<String>,
+    /// May be absent from anonymous metadata; absence must not be treated as false.
+    #[serde(rename = "ShareAllFiles", skip_serializing_if = "Option::is_none")]
+    pub is_share_all_files: Option<bool>,
     #[serde(rename = "Expiration", skip_serializing_if = "Option::is_none")]
     pub expiration: Option<String>,
     #[serde(rename = "Permission", skip_serializing_if = "Option::is_none")]
@@ -483,13 +503,60 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creation_scope_selects_exactly_whole_space_or_one_nonempty_path() {
+        let mut input = CreateShareLinkInput {
+            instance_id: "inst".into(),
+            space_id: "space".into(),
+            is_share_all_files: true,
+            ..Default::default()
+        };
+        input.validate().unwrap();
+        let encoded = serde_json::to_value(&input).unwrap();
+        assert_eq!(encoded["ShareAllFiles"], true);
+        assert_eq!(encoded["FilePathList"], serde_json::json!([]));
+        for path in ["", "a", "docs/"] {
+            input.file_path_list = vec![path.into()];
+            assert!(input.validate().is_err());
+        }
+        input.is_share_all_files = false;
+        for paths in [vec![], vec![""], vec!["a", "b"]] {
+            input.file_path_list = paths.into_iter().map(str::to_owned).collect();
+            assert!(input.validate().is_err());
+        }
+        input.file_path_list = vec!["docs/".into()];
+        input.validate().unwrap();
+        assert!(serde_json::to_value(input)
+            .unwrap()
+            .get("ShareAllFiles")
+            .is_none());
+    }
+
+    #[test]
+    fn metadata_preserves_an_optional_boolean_whole_space_scope() {
+        for flag in [None, Some(false), Some(true)] {
+            let mut encoded = serde_json::json!({"ShareID":"s"});
+            if let Some(flag) = flag {
+                encoded["ShareAllFiles"] = serde_json::json!(flag);
+            }
+            let info: ShareLinkInfo = serde_json::from_value(encoded.clone()).unwrap();
+            assert_eq!(info.is_share_all_files, flag);
+            assert_eq!(serde_json::to_value(info).unwrap(), encoded);
+        }
+    }
     use serde_json::json;
 
     #[test]
     fn share_info_preserves_missing_fields_and_unknown_additions() {
         let info: ShareLinkInfo =
-            serde_json::from_value(json!({"ShareID":"s", "FutureFlag":true})).unwrap();
+            serde_json::from_value(json!({"ShareID":"s", "ShareURL":"http://inst.adriveapp.volces.com/share/s?pwd=delivery-secret", "FutureFlag":true})).unwrap();
         assert_eq!(info.share_id.as_deref(), Some("s"));
+        assert_eq!(
+            info.share_url.as_deref(),
+            Some("http://inst.adriveapp.volces.com/share/s?pwd=delivery-secret")
+        );
+        assert!(!info.additional_fields.contains_key("ShareURL"));
         assert_eq!(info.require_login, None);
         assert_eq!(info.additional_fields.get("FutureFlag"), Some(&json!(true)));
     }
@@ -591,7 +658,7 @@ mod tests {
     #[test]
     fn debug_never_prints_response_password_token_or_extra() {
         let info: ShareLinkInfo =
-            serde_json::from_value(json!({"SharePwd":"password-secret", "Extra":"token-secret"}))
+            serde_json::from_value(json!({"SharePwd":"password-secret", "ShareURL":"https://pages.test/share/s?pwd=url-secret", "Extra":"token-secret"}))
                 .unwrap();
         assert!(!format!("{info:?}").contains("secret"));
         let token = ShareAccessTokenOutput {

@@ -61,6 +61,7 @@ pub struct OAuthTokenManager {
     profile_name: String,
     client_options: ClientOptions,
     source: CredentialSource,
+    is_refresh_allowed: bool,
 }
 
 impl OAuthTokenManager {
@@ -106,7 +107,15 @@ impl OAuthTokenManager {
             profile_name,
             client_options,
             source,
+            is_refresh_allowed: true,
         })
+    }
+
+    /// Disable refresh and its credential/coordination writes for a read-only plan.
+    /// Existing usable credentials still work; refresh-dependent requests return an authentication error.
+    pub(crate) fn without_refresh(mut self) -> Self {
+        self.is_refresh_allowed = false;
+        self
     }
 
     /// Return a usable Access Token, refreshing file credentials when needed.
@@ -143,6 +152,7 @@ impl OAuthTokenManager {
                 if let Some(snapshot) = oauth_credential_snapshot(&stored, apply_refresh_window)? {
                     return Ok(snapshot);
                 }
+                self.validate_refresh_allowed()?;
                 let _guard =
                     RefreshLockGuard::acquire(&self.credentials_path, &self.profile_name).await?;
                 let stored = load_oauth(&self.credentials_path, &self.profile_name)?;
@@ -220,29 +230,6 @@ impl OAuthTokenManager {
         Ok(())
     }
 
-    /// Reject a Resource endpoint that shares the stored Authorization origin.
-    pub fn validate_resource_origin(&self, resource_endpoint: &str) -> Result<(), CliError> {
-        if matches!(self.source, CredentialSource::Environment { .. }) {
-            return Ok(());
-        }
-        let stored = load_oauth(&self.credentials_path, &self.profile_name)?;
-        let Some(auth_endpoint) = stored.auth_endpoint.as_deref() else {
-            return Ok(());
-        };
-        let auth = reqwest::Url::parse(auth_endpoint).map_err(|_| {
-            CliError::ValidationError("stored OAuth auth_endpoint is invalid".to_string())
-        })?;
-        let resource = reqwest::Url::parse(resource_endpoint).map_err(|_| {
-            CliError::ValidationError("ADrive resource endpoint is invalid".to_string())
-        })?;
-        if same_origin(&auth, &resource) {
-            return Err(CliError::ValidationError(
-                "ADrive auth endpoint and resource endpoint must use different origins".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
     /// Return the stable selected credential source label.
     pub fn source(&self) -> &'static str {
         match self.source {
@@ -266,6 +253,7 @@ impl OAuthTokenManager {
     }
 
     async fn refresh_file(&self, rejected_access_token: Option<&str>) -> Result<String, CliError> {
+        self.validate_refresh_allowed()?;
         let _guard = RefreshLockGuard::acquire(&self.credentials_path, &self.profile_name).await?;
         let stored = load_oauth(&self.credentials_path, &self.profile_name)?;
         if let Some(rejected) = rejected_access_token {
@@ -278,6 +266,14 @@ impl OAuthTokenManager {
             return Ok(access_token);
         }
         self.refresh_locked(stored).await
+    }
+
+    fn validate_refresh_allowed(&self) -> Result<(), CliError> {
+        if !self.is_refresh_allowed {
+            // [Review Fix #D02] Rotating/persisting tokens or creating an OAuth lock would violate a read-only download plan.
+            return Err(CliError::AuthFailed("[oauth_refresh_required] read-only dry-run requires a usable OAuth Access Token; allow refresh with a normal share inspect <share-url> --auth-mode oauth using the selected profile, then retry".into()));
+        }
+        Ok(())
     }
 
     async fn refresh_locked(&self, stored: StoredOAuthCredentials) -> Result<String, CliError> {
@@ -482,12 +478,6 @@ fn normalize_user_id(value: Option<String>) -> Option<String> {
         let trimmed = value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     })
-}
-
-fn same_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
-    left.scheme() == right.scheme()
-        && left.host_str() == right.host_str()
-        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 fn expires_at(expires_in: u64) -> Result<String, CliError> {

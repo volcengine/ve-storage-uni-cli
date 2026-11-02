@@ -38,7 +38,7 @@ limitations under the License.
 
 默认执行路径必须避免误操作和不可逆风险。
 
-- 支持 `--dry-run` 的命令必须先生成执行计划，不发真实请求。
+- 支持 `--dry-run` 的命令必须先生成执行计划，不提交资源变更。需要读取远端元数据的预演须明确请求范围，例如 `share download --dry-run`；离线规划不得隐式联网。
 - 删除、覆盖、批量变更等危险操作必须要求显式确认，例如 `--force`。
 - 解析类和原则类测试必须使用 `--dry-run` 或其它隔离机制，禁止误触发真实网络请求或真实资源变更。
 
@@ -65,16 +65,3 @@ CLI 必须能作为 Agent 工具链中的可靠执行单元。
 - 能力发现、命令理解、安全预检、结构化输出和确定性错误必须组合成完整 Agent 工作流。
 - `--describe` 和 `--dry-run` 应足以支持 Agent 在执行前完成规划、风险评估和参数校验。
 - 新增 API 时应补充 Agent 友好的测试矩阵，包括 discover、understand、safe execute、controlled output、deterministic error。
-
-## 当前复核状态
-
-所有 API 新增或变更都必须逐项复核以上六项原则。当前仓库已有的 Core、Bucket Configuration、Advanced 相关测试分别覆盖了部分原则；后续扩展 ADrive 或其它公开 API 时，也必须补齐对应原则测试。
-
-本轮 Advanced Low-Level API 已按以上原则完成复核：
-
-- `Discovery`：8 个 Advanced 分组的 `--describe` 返回完整 action 数和 endpoint rule。
-- `Understanding`：叶子命令 `--help` 暴露关键通用参数，`--describe` 输出 `api`、`parameters`、`risk_level`、`endpoint_kind`。
-- `Safe Execution`：`DELETE` 非交互要求 `--force`；解析测试使用 `--dry-run`。
-- `Controlled Output`：dry-run / describe 支持 `--output json`，真实请求沿用统一 envelope。
-- `Deterministic Errors`：缺少必需参数、缺少 `--config`、缺少 `--force` 均返回稳定 `ValidationError`。
-- `Agent Ecosystem`：测试覆盖 group discovery、leaf help、endpoint dry-run plan、Body 契约、force 保护和 describe metadata。

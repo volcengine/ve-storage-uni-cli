@@ -1,4 +1,4 @@
-//! Bounded remote snapshot and portable, unambiguous local path mapping.
+//! Remote prescan and portable, unambiguous local path mapping.
 use tos_core::agent::error::CliError;
 
 /// Validate a raw relative API/local path; return an error for unsafe or unbounded components.
@@ -48,15 +48,20 @@ mod tests {
     }
 }
 
-use super::{common::map_ids_error, share_receive::ShareReceiver};
-use crate::domain::{share_types::ShareListFilesInput, types::FileInfo};
+use super::share_receive::ShareReceiver;
+use crate::domain::types::FileInfo;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub(crate) const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
-const MAX_ENTRIES: usize = 20_000;
-const MAX_PAGES: usize = 10_000;
+#[path = "share_manifest_mapping.rs"]
+mod mapping;
+#[path = "share_manifest_scan.rs"]
+mod scan;
+use mapping::MappingIndex;
+pub(crate) use mapping::MappingPolicy;
+#[cfg(test)]
+use scan::Snapshot;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,49 +85,42 @@ pub(crate) struct Manifest {
     pub(crate) files: Vec<Entry>,
     pub(crate) directories: Vec<String>,
     pub(crate) remote_directories: Vec<String>,
+    #[serde(default)]
+    pub(crate) policy: MappingPolicy,
 }
 impl Manifest {
-    /// Validate snapshot limits and all remote/local mappings; reject collisions and malformed entries.
+    /// Validate all remote/local mappings; reject collisions and malformed entries.
     pub(crate) fn validate(&self) -> Result<(), CliError> {
-        if self.files.len() + self.directories.len() > MAX_ENTRIES
-            || serde_json::to_vec(self)?.len() > MAX_MANIFEST_BYTES
-        {
-            return Err(invalid("manifest exceeds 20,000 entries or 8 MiB"));
-        }
-        self.validate_roots_and_directories()?;
+        let mapping = MappingIndex::new(&self.roots, &self.policy);
+        self.validate_roots_and_directories(&mapping)?;
+        mapping::validate_directory_policy(self)?;
         let mut remote_paths = BTreeSet::new();
         let mut paths = BTreeMap::new();
         for directory in &self.directories {
             insert_path(&mut paths, directory, true)?;
         }
         for entry in &self.files {
-            validate_relative(&entry.remote.path)?;
+            entry.remote.validate()?;
             if !remote_paths.insert(&entry.remote.path)
-                || map_local(&entry.remote.path, &self.roots)? != entry.local
+                || mapping.local(&entry.remote.path)? != entry.local
             {
                 return Err(invalid("invalid or duplicate manifest remote mapping"));
             }
             insert_path(&mut paths, &entry.local, false)?;
         }
+        self.files.iter().try_fold(0u64, |total, entry| {
+            total
+                .checked_add(entry.remote.size)
+                .ok_or_else(|| invalid("manifest total byte size overflows u64"))
+        })?;
         Ok(())
     }
-    fn validate_roots_and_directories(&self) -> Result<(), CliError> {
+    fn validate_roots_and_directories(&self, mapping: &MappingIndex<'_>) -> Result<(), CliError> {
         // [Review Fix #Download6] Local directories need the same remote-to-local proof as files.
         if self.remote_directories.len() != self.directories.len() {
             return Err(invalid("directory mapping count differs"));
         }
-        let mut seen_roots = BTreeSet::new();
-        for root in &self.roots {
-            validate_relative(root.strip_suffix('/').unwrap_or(root))?;
-            let has_target = if root.ends_with('/') {
-                self.remote_directories.contains(root)
-            } else {
-                self.files.iter().any(|entry| &entry.remote.path == root)
-            };
-            if !seen_roots.insert(root) || !has_target {
-                return Err(invalid("duplicate or unrepresented manifest root"));
-            }
-        }
+        self.validate_roots(mapping)?;
         let mut seen_directories = BTreeSet::new();
         let mut seen_local = BTreeSet::new();
         for (remote, local) in self.remote_directories.iter().zip(&self.directories) {
@@ -133,11 +131,49 @@ impl Manifest {
                 return Err(invalid("invalid or duplicate directory mapping"));
             }
             validate_relative(remote.strip_suffix('/').unwrap_or(remote))?;
-            if map_local(remote, &self.roots)? != *local {
+            if local.is_empty() || mapping.local(remote)? != *local {
                 return Err(invalid("directory mapping differs from remote roots"));
             }
         }
         Ok(())
+    }
+    fn validate_roots(&self, mapping: &MappingIndex<'_>) -> Result<(), CliError> {
+        // [Review Fix #ShareSpaceManifest1] Only the explicit SpaceRoot policy may persist `/`; legacy and ordinary shares retain relative roots.
+        if self.policy.is_space_root() {
+            return if self.roots.as_slice() == ["/"] {
+                Ok(())
+            } else {
+                Err(invalid("Space-root manifest must declare exactly `/`"))
+            };
+        }
+        let mut seen_roots = BTreeSet::new();
+        // [Review Fix #ShareManifestScale1] Root proofs must remain logarithmic when prescans contain many individually shared files.
+        let represented = self
+            .remote_directories
+            .iter()
+            .chain(self.files.iter().map(|entry| &entry.remote.path))
+            .collect::<BTreeSet<_>>();
+        for root in &self.roots {
+            validate_relative(root.strip_suffix('/').unwrap_or(root))?;
+            let local = mapping.local(root)?;
+            let needs_target = matches!(self.policy, MappingPolicy::Legacy)
+                || (!local.is_empty() && self.policy.matches(&local));
+            if !seen_roots.insert(root) || (needs_target && !represented.contains(root)) {
+                return Err(invalid("duplicate or unrepresented manifest root"));
+            }
+        }
+        Ok(())
+    }
+    /// Bind persisted mapping and filtering to immutable download options.
+    /// Legacy snapshots require their historical include-parent mode without filters.
+    pub(crate) fn validate_options(
+        &self,
+        is_include_parent: bool,
+        include: Option<&str>,
+        exclude: Option<&str>,
+    ) -> Result<(), CliError> {
+        self.policy
+            .validate_options(is_include_parent, include, exclude)
     }
     /// Bind a validated snapshot to the immutable selection and recursion policy; reject impossible task shapes.
     pub(crate) fn validate_selection(
@@ -158,22 +194,31 @@ impl Manifest {
         }
         if selection.ends_with('/') {
             if !is_recursive
-                || !self
-                    .remote_directories
-                    .iter()
-                    .any(|directory| directory == selection)
+                || (matches!(self.policy, MappingPolicy::Legacy)
+                    && !self
+                        .remote_directories
+                        .iter()
+                        .any(|directory| directory == selection))
             {
                 return Err(invalid("selected directory is absent or nonrecursive"));
             }
-        } else if self.files.len() != 1
-            || self.files[0].remote.path != selection
-            || !self.directories.is_empty()
-        {
+        } else if !self.is_valid_exact_selection(selection)? {
             return Err(invalid(
                 "exact file selection must contain exactly that file and no directories",
             ));
         }
         Ok(())
+    }
+
+    fn is_valid_exact_selection(&self, selection: &str) -> Result<bool, CliError> {
+        let local = MappingIndex::new(&self.roots, &self.policy).local(selection)?;
+        let expected_count = usize::from(self.policy.matches(&local));
+        Ok(self.directories.is_empty()
+            && self.files.len() == expected_count
+            && self
+                .files
+                .iter()
+                .all(|entry| entry.remote.path == selection))
     }
 }
 fn insert_path(
@@ -200,11 +245,19 @@ fn insert_path(
     Ok(())
 }
 impl RemoteFile {
+    fn validate(&self) -> Result<(), CliError> {
+        validate_relative(&self.path)?;
+        if self.etag.len() > 1024 || self.etag.chars().any(char::is_control) {
+            return Err(invalid("invalid remote ETag"));
+        }
+        Ok(())
+    }
     /// Extract the minimal remote fingerprint from metadata, rejecting unsafe paths or invalid sizes.
     pub(crate) fn from_info(info: FileInfo) -> Result<Self, CliError> {
         validate_relative(&info.file_path)?;
-        let size =
-            u64::try_from(info.size).map_err(|_| invalid("remote file has negative size"))?;
+        let size = u64::try_from(info.size).map_err(|_| {
+            invalid("remote file size is missing or negative; cannot build an exact download plan")
+        })?;
         if info.etag.len() > 1024 || info.etag.chars().any(char::is_control) {
             return Err(invalid("invalid remote ETag"));
         }
@@ -229,231 +282,88 @@ fn directory_path(path: &str) -> Result<String, CliError> {
     Ok(format!("{}/", path.trim_end_matches('/')))
 }
 
-/// Read the selected file/tree through the authorized receiver into a bounded snapshot; fail on inconsistent scope or pagination.
+/// Enumerate a download selection with cp-compatible filtering, mapping and concurrency.
+/// Returns remote metadata, pagination, path-validation or incompatible-policy errors.
+pub(crate) async fn enumerate_with_options(
+    receiver: &mut ShareReceiver,
+    args: &crate::cli::share::ShareDownloadArgs,
+    declared_roots: Option<&[String]>,
+) -> Result<Manifest, CliError> {
+    scan::enumerate(
+        receiver,
+        scan::Options {
+            selection: args.path.clone(),
+            is_recursive: args.is_recursive,
+            concurrency: args.list_concurrency.unwrap_or(4),
+            policy: MappingPolicy::from_args(args),
+        },
+        declared_roots,
+    )
+    .await
+}
 
+/// Enumerate a legacy selection, retaining the historical root-basename mapping.
+/// Accepts one authorized receiver and selection; propagates metadata and path-validation failures.
+#[cfg(test)]
 pub(crate) async fn enumerate(
     receiver: &mut ShareReceiver,
     selection: Option<&str>,
     is_recursive: bool,
     declared_roots: Option<&[String]>,
 ) -> Result<Manifest, CliError> {
-    let mut snapshot = Snapshot::default();
-    if let Some(path) = selection {
-        let info = receiver
-            .ensure_session()
-            .await?
-            .get_file(path)
-            .await
-            .map_err(map_ids_error)?;
-        if !is_folder(&info) {
-            snapshot.add_file(info)?;
-            snapshot.roots.push(path.into());
-            return snapshot.finish();
-        }
-        if !path.ends_with('/') {
-            return Err(invalid("directory selection must end with a slash"));
-        }
-        snapshot.add_directory(path)?;
-        snapshot.roots.push(directory_path(path)?);
-    } else {
-        if let Some(roots) = declared_roots.filter(|roots| !roots.is_empty()) {
-            snapshot.roots = roots.to_vec();
-            for root in roots.iter().filter(|root| root.ends_with('/')) {
-                snapshot.add_directory(root)?;
-            }
-        }
-        snapshot.read_directory(receiver, None).await?;
-        if snapshot.roots.is_empty() {
-            snapshot.roots.extend(snapshot.directories.iter().cloned());
-            snapshot.roots.extend(
-                snapshot
-                    .files
-                    .keys()
-                    .filter(|path| !snapshot.directories.iter().any(|dir| path.starts_with(dir)))
-                    .cloned(),
-            );
-        }
-    }
-    if !snapshot.directories.is_empty() && !is_recursive {
-        return Err(invalid("directory downloads require --recursive"));
-    }
-    while let Some(directory) = snapshot.queue.pop_front() {
-        snapshot.read_directory(receiver, Some(&directory)).await?;
-    }
-    snapshot.finish()
-}
-#[derive(Default)]
-struct Snapshot {
-    roots: Vec<String>,
-    files: BTreeMap<String, RemoteFile>,
-    directories: BTreeSet<String>,
-    queue: VecDeque<String>,
-    pages: usize,
-    encoded_bytes: usize,
-    directory_versions: BTreeMap<String, i64>,
-}
-impl Snapshot {
-    fn check_limit(&self) -> Result<(), CliError> {
-        if self.files.len() + self.directories.len() > MAX_ENTRIES
-            || self.pages > MAX_PAGES
-            || self.encoded_bytes > MAX_MANIFEST_BYTES
-        {
-            return Err(invalid(
-                "enumeration exceeds 20,000 entries, 10,000 pages or 8 MiB",
-            ));
-        }
-        Ok(())
-    }
-    fn add_directory(&mut self, path: &str) -> Result<(), CliError> {
-        let directory = directory_path(path)?;
-        if self.directories.insert(directory.clone()) {
-            self.encoded_bytes += directory.len() + 64;
-            self.queue.push_back(directory);
-        }
-        self.check_limit()
-    }
-    fn add_file(&mut self, info: FileInfo) -> Result<(), CliError> {
-        if is_folder(&info) {
-            self.directory_version(&info.file_path, info.updated_at)?;
-            return self.add_directory(&info.file_path);
-        }
-        let file = RemoteFile::from_info(info)?;
-        if self
-            .files
-            .get(&file.path)
-            .is_some_and(|previous| previous != &file)
-        {
-            return Err(invalid(
-                "remote file changed or conflicting duplicate during enumeration",
-            ));
-        }
-        if !self.files.contains_key(&file.path) {
-            self.encoded_bytes += file.path.len() * 2 + file.etag.len() * 2 + 256;
-        }
-        self.files.insert(file.path.clone(), file);
-        self.check_limit()
-    }
-    fn directory_version(&mut self, path: &str, version: i64) -> Result<(), CliError> {
-        let path = directory_path(path)?;
-        if version == 0 {
-            return Ok(());
-        }
-        if self
-            .directory_versions
-            .get(&path)
-            .is_some_and(|previous| *previous != version)
-        {
-            return Err(invalid("conflicting duplicate directory metadata"));
-        }
-        self.directory_versions.insert(path, version);
-        Ok(())
-    }
-    async fn read_directory(
-        &mut self,
-        receiver: &mut ShareReceiver,
-        prefix: Option<&str>,
-    ) -> Result<(), CliError> {
-        let mut marker = None;
-        let mut markers = BTreeSet::new();
-        loop {
-            self.pages += 1;
-            self.check_limit()?;
-            let page = receiver
-                .ensure_session()
-                .await?
-                .list_files(&ShareListFilesInput {
-                    prefix: prefix.map(str::to_owned),
-                    delimiter: Some("/".into()),
-                    marker: marker.clone(),
-                    limit: Some(1000),
-                    list_root: Some(prefix.is_none()),
-                })
-                .await
-                .map_err(map_ids_error)?;
-            for folder in page.folders {
-                check_scope(&folder.folder, prefix)?;
-                self.directory_version(&folder.folder, folder.updated_at)?;
-                self.add_directory(&folder.folder)?;
-            }
-            for file in page.files {
-                check_scope(&file.file_path, prefix)?;
-                self.add_file(file)?;
-            }
-            if page.next_marker.is_empty() {
-                if page.is_truncated {
-                    return Err(invalid("truncated page is missing NextMarker"));
-                }
-                break;
-            }
-            if page.next_marker.len() > 4096 {
-                return Err(invalid("pagination marker exceeds 4096 bytes"));
-            }
-            if !markers.insert(page.next_marker.clone()) {
-                return Err(invalid("cyclic pagination marker"));
-            }
-            marker = Some(page.next_marker);
-        }
-        Ok(())
-    }
-    fn finish(self) -> Result<Manifest, CliError> {
-        let manifest = Manifest {
-            roots: self.roots.clone(),
-            remote_directories: self.directories.iter().cloned().collect(),
-            files: self
-                .files
-                .into_values()
-                .map(|remote| {
-                    Ok(Entry {
-                        local: map_local(&remote.path, &self.roots)?,
-                        remote,
-                    })
-                })
-                .collect::<Result<_, CliError>>()?,
-            directories: self
-                .directories
-                .iter()
-                .map(|path| map_local(path, &self.roots))
-                .collect::<Result<_, _>>()?,
-        };
-        manifest.validate()?;
-        Ok(manifest)
-    }
-}
-fn check_scope(path: &str, prefix: Option<&str>) -> Result<(), CliError> {
-    if prefix.is_some_and(|scope| !path.starts_with(scope)) {
-        return Err(invalid(
-            "service returned a path outside the selected directory",
-        ));
-    }
-    Ok(())
-}
-fn map_local(path: &str, roots: &[String]) -> Result<String, CliError> {
-    let root = roots
-        .iter()
-        .filter(|root| {
-            path == root.as_str() || (root.ends_with('/') && path.starts_with(root.as_str()))
-        })
-        .min_by_key(|root| root.len())
-        .ok_or_else(|| invalid("path is outside manifest roots"))?;
-    let root_name = root
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .ok_or_else(|| invalid("empty root"))?;
-    let suffix = path.strip_prefix(root).unwrap_or("").trim_end_matches('/');
-    let local = if suffix.is_empty() {
-        root_name.into()
-    } else {
-        format!("{root_name}/{suffix}")
-    };
-    validate_relative(&local)?;
-    Ok(local)
+    scan::enumerate(
+        receiver,
+        scan::Options {
+            selection: selection.map(str::to_owned),
+            is_recursive,
+            concurrency: 1,
+            policy: MappingPolicy::Legacy,
+        },
+        declared_roots,
+    )
+    .await
 }
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
     use crate::domain::share_access::fixture::{reply, Fixture};
     use tos_core::agent::global_args::GlobalArgs;
+    #[test]
+    fn prescan_supports_more_than_twenty_thousand_files_without_artifact_limits() {
+        let mut snapshot = Snapshot::default();
+        snapshot.roots.push("root/".into());
+        snapshot.add_directory("root/").unwrap();
+        for index in 0..20_001 {
+            snapshot
+                .add_file(
+                    serde_json::from_value(serde_json::json!({
+                        "FilePath":format!("root/{index}.txt"),"Size":1,"ETag":"etag",
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        assert_eq!(snapshot.finish().unwrap().files.len(), 20_001);
+    }
+    #[test]
+    fn prescan_supports_snapshots_larger_than_eight_mibibytes() {
+        let mut snapshot = Snapshot::default();
+        snapshot.roots.push("root/".into());
+        snapshot.add_directory("root/").unwrap();
+        for index in 0..8_500 {
+            snapshot
+                .add_file(
+                    serde_json::from_value(serde_json::json!({
+                        "FilePath":format!("root/{index}.txt"),"Size":1,"ETag":"e".repeat(1024),
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let manifest = snapshot.finish().unwrap();
+        assert!(serde_json::to_vec(&manifest).unwrap().len() > 8 * 1024 * 1024);
+        manifest.validate().unwrap();
+    }
     #[test]
     fn rejects_case_normalization_and_ancestor_collisions() {
         for paths in [["A", "a"], ["é", "e\u{301}"], ["a", "a/b"]] {
@@ -473,6 +383,7 @@ mod snapshot_tests {
                     .into(),
                 directories: vec![],
                 remote_directories: vec![],
+                policy: Default::default(),
             };
             assert!(manifest.validate().is_err(), "accepted {paths:?}");
         }
@@ -521,6 +432,59 @@ mod tree_tests {
         ];
         responses.extend(pages.iter().map(|page| reply(200, page)));
         responses
+    }
+    #[tokio::test]
+    async fn download_options_use_contents_mapping_and_filter_local_relative_paths() {
+        let fixture = Fixture::new(responses(&[
+            r#"{"FilePath":"parent/root/","FileType":"folder"}"#,
+            r#"{"Files":[{"FilePath":"parent/root/a.txt","Size":1},{"FilePath":"parent/root/b.log","Size":1}],"Folders":[{"Folder":"parent/root/empty/"}]}"#,
+            r#"{}"#,
+        ]));
+        let args = crate::cli::share::ShareDownloadArgs {
+            path: Some("parent/root/".into()),
+            is_recursive: true,
+            include: Some("*.txt".into()),
+            ..Default::default()
+        };
+        let manifest = enumerate_with_options(&mut receiver(&fixture).await, &args, None)
+            .await
+            .unwrap();
+        assert_eq!(manifest.files.len(), 1);
+        assert_eq!(manifest.files[0].local, "a.txt");
+        assert!(manifest.directories.is_empty());
+        fixture.finish();
+    }
+    #[tokio::test]
+    async fn download_options_prescan_more_than_twenty_thousand_files_across_service_pages() {
+        let mut pages = vec![r#"{"FilePath":"root/","FileType":"folder"}"#.to_owned()];
+        for page in 0..21 {
+            let end = ((page + 1) * 1000).min(20_001);
+            let files = (page * 1000..end)
+                .map(|index| {
+                    serde_json::json!({
+                        "FilePath":format!("root/{index}.txt"),"Size":1,
+                    })
+                })
+                .collect::<Vec<_>>();
+            pages.push(serde_json::json!({"Files":files,"NextMarker":if page<20 {format!("page-{}",page+1)} else {String::new()},"IsTruncated":page<20}).to_string());
+        }
+        let fixture = Fixture::new(responses(
+            &pages.iter().map(String::as_str).collect::<Vec<_>>(),
+        ));
+        let args = crate::cli::share::ShareDownloadArgs {
+            path: Some("root/".into()),
+            is_recursive: true,
+            ..Default::default()
+        };
+        let manifest = enumerate_with_options(&mut receiver(&fixture).await, &args, None)
+            .await
+            .unwrap();
+        assert_eq!(manifest.files.len(), 20_001);
+        assert!(manifest
+            .files
+            .iter()
+            .all(|entry| !entry.local.starts_with("root/")));
+        assert_eq!(fixture.finish().len(), 24);
     }
     #[tokio::test]
     async fn root_tree_retains_empty_folders_pages_and_subtree_duplicates() {

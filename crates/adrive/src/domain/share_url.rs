@@ -27,15 +27,22 @@ impl fmt::Debug for ParsedShareUrl {
 /// Returns an input error for invalid origins, empty/control identifiers or dot segments.
 pub fn build_share_url(share_base_origin: &str, share_id: &str) -> Result<String> {
     let mut url = safe_origin(share_base_origin)?;
-    validate_required(share_id, "ShareID")?;
-    if matches!(share_id, "." | "..") {
-        return Err(invalid_share_url());
-    }
+    validate_share_id_component(share_id)?;
     url.path_segments_mut()
         .map_err(|_| invalid_share_url())?
         .push("share")
         .push(share_id);
     Ok(url.to_string())
+}
+
+/// Validate a response ShareID independently of page-origin configuration.
+/// Returns an input error for empty identifiers, controls or dot segments.
+pub(crate) fn validate_share_id_component(share_id: &str) -> Result<()> {
+    validate_required(share_id, "ShareID")?;
+    if matches!(share_id, "." | "..") {
+        return Err(invalid_share_url());
+    }
+    Ok(())
 }
 
 /// Parse `/share/<id>` with one optional trailing slash, decode once and extract one `pwd`.
@@ -406,6 +413,22 @@ mod tests {
             ))
             .unwrap_err();
             assert!(!error.to_string().contains("fixture-secret"), "{path}");
+        }
+    }
+
+    #[test]
+    fn production_api_origin_builds_delivery_urls_with_instance_once() {
+        for scheme in ["http", "https"] {
+            for api in [
+                format!("{scheme}://idsapi.volces.com:8443"),
+                format!("{scheme}://vtagt3g9n.idsapi.volces.com:8443"),
+            ] {
+                let origin = derive_share_origin(&api, "vtagt3g9n").unwrap();
+                assert_eq!(
+                    build_share_url(&origin, "2T4U8z0lY1n").unwrap(),
+                    format!("{scheme}://vtagt3g9n.idsapp.volces.com:8443/share/2T4U8z0lY1n")
+                );
+            }
         }
     }
 

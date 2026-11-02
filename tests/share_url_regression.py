@@ -69,6 +69,11 @@ def invoke(binary, root, arguments):
     # [Review Fix #ShareTrailingSlash5] Windows's .exe suffix must not make the dedicated entrypoint look like the unified CLI.
     prefix = [] if binary.stem == "ve-adrive-cli" else ["ve-adrive"]
     environment = {key: value for key, value in os.environ.items() if not key.startswith("ADRIVE_")}
+    if arguments[0] == "download":
+        from share_download_regression import transfer_paths
+        arguments = [*arguments, *transfer_paths(root, is_isolated_profile=False)]
+        config = root / "config"
+        config.write_text("")
     result = subprocess.run([str(binary), *prefix, "--config-path", str(root / "config"),
                              "--credentials-path", str(root / "credentials"), "--profile", "default",
                              "--output", "json", "share", *arguments],
@@ -79,7 +84,7 @@ def invoke(binary, root, arguments):
 
 
 def check_dry_runs(binary, root):
-    for action, scheme in ((action, scheme) for action in ("inspect", "files", "download")
+    for action, scheme in ((action, scheme) for action in ("inspect", "files")
                            for scheme in ("http", "https")):
         address = f"{scheme}://vtagt3g9n.idsapp-boe.volces.com/share/2T4U8z0lY1n/"
         extra = [str(root / "dry-download")] if action == "download" else []
@@ -111,12 +116,16 @@ def check_executable_alias(binary, root):
 
 def check_receipt_and_resume(binary, root, origin):
     canonical = f"{origin}/share/s"
+    result, envelope = invoke(binary, root, ["download", canonical + "/?pwd=fixture-password",
+        str(root / "dry-download"), "--path", "docs/report.txt", "--dry-run"])
+    assert result.returncode == 0 and envelope["data"]["selection"]["ShareUrl"] == canonical
+    assert envelope["data"]["selection"]["FileCount"] == 1 and not (root / "dry-download").exists()
     for suffix in ("", "/"):
         address = f"{canonical}{suffix}?pwd=fixture-password"
         result, envelope = invoke(binary, root, ["inspect", address])
         assert result.returncode == 0 and envelope["data"]["ShareUrl"] == canonical
         result, envelope = invoke(binary, root, ["files", address, "--path", "docs/",
-                                                  "--limit", "1", "--marker", "previous"])
+                                                  "--max-keys", "1", "--marker", "previous"])
         assert result.returncode == 0 and envelope["data"]["ShareUrl"] == canonical
         assert envelope["data"]["NextMarker"] == "next" and envelope["pagination"]["next_marker"] == "next"
     destination, checkpoint = root / "download", root / "checkpoint"

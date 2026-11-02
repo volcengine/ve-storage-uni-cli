@@ -1184,6 +1184,15 @@ fn render_csv(value: &Value, columns: Option<&'static [&'static str]>) -> String
     }
 }
 
+// [Review Fix #TabularTrace1] Request-ID diagnostics must not replace summaries
+// or compete with business lists; explicit array queries still render directly.
+fn implicit_business_arrays(fields: &Map<String, Value>) -> impl Iterator<Item = &Vec<Value>> {
+    fields
+        .iter()
+        .filter(|(key, _)| key.as_str() != "service_request_ids")
+        .filter_map(|(_, value)| value.as_array())
+}
+
 /// [Review Fix #FmtUni] 当 payload 形如 `{"<list_key>": [...]}` 时返回内部数组，
 /// 让 list-like 命令的渲染统一走"对象数组 → 表格"路径。`--query` 已显式提取出
 /// 数组时会直接命中 Value::Array 分支，无需此处处理。
@@ -1191,16 +1200,9 @@ fn pick_array_payload(value: &Value) -> Option<&[Value]> {
     match value {
         Value::Array(items) => Some(items.as_slice()),
         Value::Object(map) => {
-            let mut found: Option<&[Value]> = None;
-            for v in map.values() {
-                if let Value::Array(items) = v {
-                    if found.is_some() {
-                        return None;
-                    }
-                    found = Some(items.as_slice());
-                }
-            }
-            found
+            let mut candidates = implicit_business_arrays(map);
+            let selected = candidates.next()?;
+            candidates.next().is_none().then_some(selected.as_slice())
         }
         _ => None,
     }
@@ -1222,10 +1224,7 @@ fn pick_array_payload_for_columns<'a>(
     if let Some(cols) = columns {
         if let Value::Object(map) = value {
             let mut best: Option<(&[Value], i64)> = None;
-            for v in map.values() {
-                let Value::Array(items) = v else {
-                    continue;
-                };
+            for items in implicit_business_arrays(map) {
                 // Score: # of declared columns present in the first object.
                 // Empty arrays score as 0 but are still candidates so that
                 // empty-bucket responses still produce a stable column header
@@ -2458,6 +2457,145 @@ mod tests {
         // Ambiguous payload: pick neither, fall back to generic object rendering.
         let v = json!({"buckets": [], "regions": []});
         assert!(pick_array_payload(&v).is_none());
+    }
+
+    fn traced_tabular_envelope(payload: Value, has_request_ids: bool) -> Value {
+        let invocation = GlobalArgs::default();
+        for request_id in ["first-request", "last-request"] {
+            invocation
+                .request_trace
+                .record_response(has_request_ids.then_some(request_id), true);
+        }
+        let raw = serde_json::to_value(Envelope::success("ve-tos cp", payload))
+            .expect("serialize batch envelope");
+        apply_query(&invocation, ensure_envelope(&invocation, raw)).expect("default query")
+    }
+
+    fn batch_tabular_fields() -> Value {
+        json!({
+            "source": "/source",
+            "destination": "tos://bucket/destination/",
+            "succeeded": 2,
+            "failed": 1,
+            "skipped": 0,
+            "manifest_path": "/reports/cp-manifest.csv",
+            "report_path": "/reports/cp-report.csv",
+        })
+    }
+
+    fn assert_batch_artifacts_visible(rendered: &str) {
+        for expected in [
+            "succeeded",
+            "failed",
+            "skipped",
+            "manifest_path",
+            "/reports/cp-manifest.csv",
+            "report_path",
+            "/reports/cp-report.csv",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_trace_keeps_batch_artifacts_in_table() {
+        let envelope = traced_tabular_envelope(batch_tabular_fields(), true);
+        let rendered = render_table(unwrap_envelope_data(&envelope), None);
+        assert_batch_artifacts_visible(&rendered);
+    }
+
+    #[test]
+    fn service_trace_keeps_batch_artifacts_in_csv() {
+        let envelope = traced_tabular_envelope(batch_tabular_fields(), true);
+        let rendered = render_csv(unwrap_envelope_data(&envelope), None);
+        assert_batch_artifacts_visible(&rendered);
+    }
+
+    #[test]
+    fn service_trace_without_usable_ids_keeps_batch_artifacts() {
+        let envelope = traced_tabular_envelope(batch_tabular_fields(), false);
+        let payload = unwrap_envelope_data(&envelope);
+        assert_eq!(payload["service_request_ids"], json!([]));
+        for rendered in [render_table(payload, None), render_csv(payload, None)] {
+            assert_batch_artifacts_visible(&rendered);
+        }
+    }
+
+    #[test]
+    fn service_trace_keeps_business_object_array_projection() {
+        let entries = json!([{"key": "file.txt", "size": 4}]);
+        let envelope = traced_tabular_envelope(json!({"uploads": entries}), true);
+        let payload = unwrap_envelope_data(&envelope);
+        assert_eq!(render_table(payload, None), render_table(&entries, None));
+        assert_eq!(render_csv(payload, None), render_csv(&entries, None));
+    }
+
+    #[test]
+    fn service_trace_keeps_business_scalar_array_projection() {
+        let labels = json!(["one", "two"]);
+        let envelope = traced_tabular_envelope(json!({"labels": labels}), true);
+        let payload = unwrap_envelope_data(&envelope);
+        assert_eq!(render_table(payload, None), render_table(&labels, None));
+        assert_eq!(render_csv(payload, None), render_csv(&labels, None));
+    }
+
+    #[test]
+    fn service_trace_keeps_empty_business_array_projection() {
+        let entries = json!([]);
+        let envelope = traced_tabular_envelope(json!({"uploads": entries}), true);
+        let payload = unwrap_envelope_data(&envelope);
+        assert_eq!(render_table(payload, None), render_table(&entries, None));
+        assert_eq!(render_csv(payload, None), render_csv(&entries, None));
+    }
+
+    #[test]
+    fn service_trace_keeps_declared_columns_for_business_lists() {
+        let columns: Option<&'static [&'static str]> = Some(&["key", "size"]);
+        for entries in [
+            json!([]),
+            json!([{"key": "file.txt", "size": 4, "extra": 9}]),
+        ] {
+            let envelope = traced_tabular_envelope(json!({"uploads": entries}), true);
+            let payload = unwrap_envelope_data(&envelope);
+            assert_eq!(
+                render_table(payload, columns),
+                render_table(&entries, columns)
+            );
+            assert_eq!(render_csv(payload, columns), render_csv(&entries, columns));
+        }
+    }
+
+    #[test]
+    fn service_trace_remains_available_to_explicit_query() {
+        let envelope = traced_tabular_envelope(batch_tabular_fields(), true);
+        let selected = run_query(envelope, "data.service_request_ids").expect("select trace");
+        let request_ids = json!(["first-request", "last-request"]);
+        assert_eq!(selected, request_ids);
+        assert_eq!(
+            render_table(&selected, None),
+            render_table(&request_ids, None)
+        );
+        assert_eq!(
+            render_csv(&selected, None),
+            "index,value\n0,first-request\n1,last-request"
+        );
+    }
+
+    #[test]
+    fn service_trace_and_batch_artifacts_remain_in_json() {
+        let envelope = traced_tabular_envelope(batch_tabular_fields(), true);
+        let encoded = serde_json::to_string(&envelope).expect("serialize output");
+        let decoded: Value = serde_json::from_str(&encoded).expect("parse output");
+        assert_eq!(
+            decoded["data"]["service_request_ids"],
+            json!(["first-request", "last-request"])
+        );
+        assert_eq!(decoded["data"]["service_request_ids_omitted"], 0);
+        assert_eq!(decoded["data"]["manifest_path"], "/reports/cp-manifest.csv");
+        assert_eq!(decoded["data"]["report_path"], "/reports/cp-report.csv");
     }
 
     // [Review Fix #FmtUni-C1] BucketInfo 序列化必须是 snake_case，否则 table 全空

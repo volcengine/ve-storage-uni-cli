@@ -32,6 +32,9 @@ axum = "0.8"
 clap = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
+# [Review Fix #ReqwestSdkRoots] The credential SDK still uses reqwest 0.12;
+# load system roots there too, alongside the SDK's additive bundled-root feature.
+reqwest-sdk-compat = { package = "reqwest", version = "0.12.28", features = ["rustls-tls-native-roots"], default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = "0.8"

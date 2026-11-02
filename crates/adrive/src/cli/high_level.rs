@@ -93,6 +93,9 @@ pub struct CpArgs {
     /// Include the source directory/prefix name under the destination path
     #[arg(long, requires = "recursive")]
     pub include_parent: bool,
+    /// Skip explicit directory uploads. By default, preserve directories including empty directories. Files may still create required parent directories
+    #[arg(long, requires = "recursive")]
+    pub disable_dir_object: bool,
     /// Include pattern
     #[arg(long)]
     pub include: Option<String>,
@@ -259,6 +262,9 @@ pub struct SyncArgs {
     /// Include the source directory/prefix name under the destination path
     #[arg(long)]
     pub include_parent: bool,
+    /// Skip explicit directory uploads. By default, preserve directories including empty directories. Files may still create required parent directories
+    #[arg(long)]
+    pub disable_dir_object: bool,
     /// Include pattern
     #[arg(long)]
     pub include: Option<String>,

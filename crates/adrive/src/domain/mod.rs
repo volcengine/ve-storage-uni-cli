@@ -19,6 +19,7 @@ pub mod client;
 pub mod oauth;
 pub mod rate_limiter;
 pub mod share_access;
+mod share_metadata_decode;
 pub(crate) mod share_target;
 pub mod share_types;
 pub mod share_url;

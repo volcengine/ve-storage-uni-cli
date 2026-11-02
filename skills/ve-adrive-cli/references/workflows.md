@@ -90,6 +90,8 @@ an authorization or network error is not proof of absence.
 
 ```bash
 ve-adrive-cli share create adrive://instance/space/docs/ --name Docs --expires-in 7d --permission download
+ve-adrive-cli share create adrive://instance/space --permission download
+ve-adrive-cli share create --instance instance --space space --permission download
 ve-adrive-cli share get share-id --instance instance
 ve-adrive-cli share get adrive://instance/share-id
 ve-adrive-cli share list adrive://instance
@@ -97,38 +99,63 @@ ve-adrive-cli share list --instance instance --creator user-id --status active -
 ve-adrive-cli share update share-id --instance instance --require-login false --expires-in 0
 ve-adrive-cli share cancel share-id --instance instance --yes
 ve-adrive-cli share inspect https://instance.example.test/share/share-id
-ve-adrive-cli share files https://instance.example.test/share/share-id --path docs/ --limit 100
+ve-adrive-cli share files https://instance.example.test/share/share-id --path docs/ --max-keys 100
+ve-adrive-cli share files https://instance.example.test/share/share-id --path / --max-keys 100
 ve-adrive-cli share view https://instance.example.test/share/share-id --path docs/report.docx
 ve-adrive-cli share view https://instance.example.test/share/share-id --path readme.txt --raw | less
-ve-adrive-cli share download https://instance.example.test/share/share-id ./downloads --recursive --checkpoint ./share-checkpoint.json
+ve-adrive-cli share download https://instance.example.test/share/share-id ./downloads --recursive --checkpoint
+ve-adrive-cli share download https://instance.example.test/share/share-id ./downloads --path / --recursive
 ```
 
-1. Confirm the exact file or folder scope before create; use `--dry-run` to inspect
-   selectors without acquiring or displaying secrets. Supply a safe page origin
-   with `config set share_base_url https://pages.example.test` when derivation is
-   inappropriate. `config show` reports its source.
-   Standard public/BOE `idsapi` and `idsapp` hosts under `volces.com` map
-   automatically, preserving Instance, scheme and port. Custom receiver APIs use explicit
-   `--endpoint`. Anonymous receipt never loads account configuration; explicit
-   `--auth-mode oauth` uses the selected recipient profile API or `--endpoint`.
-2. Inspect returned `ShareID` and `ShareUrl`. Missing `ShareID` after create means
-   `share_result_unknown`; reconcile with get/list before another create.
+Whole-Space sharing is conditional on backend support. BOE V1 currently rejects
+creation with `InvalidParameter.ShareAllFilesNotAllowed`; local fixture coverage
+does not establish real whole-Space creation, listing or download availability.
+Preserve the service rejection instead of inventing a placeholder path or a
+collection of ordinary shares to bypass it.
+
+1. Confirm the exact file, folder or whole Space scope before create. A Space root
+   URI (optional trailing slash), or `--instance instance --space space`, uses
+   `ShareAllFiles=true` and `FilePathList=[]`; a non-root target remains one path.
+   Explicit empty `--file` values remain invalid. Use `--dry-run` to inspect
+   selectors without acquiring or displaying secrets. Management results use the
+   service's validated `ShareURL` as public `ShareUrl` by default; the API endpoint
+   does not construct a page URL. To override the page origin, use
+   `--share-endpoint` > profile `share_endpoint` > `ADRIVE_SHARE_ENDPOINT` > legacy
+   `ADRIVE_SHARE_BASE_URL`. The override appends `/share/<encoded ShareID>` without
+   adding an Instance label or password. `config show` reports the override source.
+   Receiver-side standard public/BOE `idsapp` pages map to `idsapi` hosts under
+   `volces.com`, preserving Instance, scheme and port. Other hosts, including
+   `adriveapp`, are unchanged. Custom receiver APIs use explicit `--endpoint`.
+   Anonymous receipt never loads account configuration; explicit `--auth-mode oauth`
+   uses the selected recipient profile API or `--endpoint`.
+2. Inspect returned `ShareID` and optional `ShareUrl`. Missing `ShareID` after create
+   means `share_result_unknown`; reconcile with get/list before another create.
+   Missing server URL without an override instead preserves success and `ShareID`,
+   omits `ShareUrl`, and supplies `ShareUrlWarning`. Configure `share_endpoint` or
+   retrieve the existing share again; do not create a duplicate to obtain a URL.
    Manage an existing share through `adrive://instance/share-id` or the compatible
    `share-id --instance instance` form; get/update/cancel all support both.
    Duplicate instances must agree, and `--by-name` resolves the Instance only.
    List shares in an Instance with `adrive://instance` (optional root slash), or
    `--instance instance`; both support the same filters and one-page pagination.
    Omit `--creator` only when OAuth supplies a bound `user_id`.
-   Actual create/get results may include the service-returned `SharePwd` for
-   authorized delivery. Deliver it separately from the safe page URL and exclude
-   it from logs and plans.
+   Actual create/get results may include the service-returned `SharePwd` and
+   retain the server URL's encoded `pwd` query for authorized delivery. Treat the
+   full URL and password as secrets; exclude them from logs and plans. List/update
+   omit passwords and strip all URL queries. Diagnostics omit account tokens and
+   raw response URLs.
 3. For update, omit `--updated-at` to fetch the current concurrency guard, or use
    an explicitly known guard. A conflict requires a fresh read. Preserve explicit
    zero/false/empty settings. Password clearing is not confirmed by the PRD;
    do not promise that an empty input clears a service password.
-4. Anonymous inspect does not require account setup. For files, choose exact paths
-   or trailing-slash folders and consume one page at a time with `--limit` and
-   `--marker` from `NextMarker`, ending at `IsTruncated=false`. Protected shares
+4. <!-- [Review Fix #WholeSpaceWorkflowCap] Keep root selection and files pagination aligned with the live contract. -->
+   Anonymous inspect does not require account setup. For files, choose exact paths
+   or trailing-slash folders. On a whole-Space share, omit `--path` or use `--path /`
+   for the Space root. `--max-keys` caps combined files/folders (default 1000);
+   service pages are fetched automatically. Continue with `--marker` from
+   `NextMarker`, ending at `IsTruncated=false`. Anonymous overview metadata may
+   omit `ShareAllFiles`; only explicit scope denial permits read-only root
+   adaptation, and arbitrary 403 responses preserve service errors. Protected shares
    need the extraction code for every independent call/page; stdin is read to EOF
    and is best supplied by a pipe. Never echo or save it. Login-required receipt
    uses an explicitly selected recipient profile: run `auth login --instance <id>`
@@ -143,24 +170,53 @@ ve-adrive-cli share download https://instance.example.test/share/share-id ./down
    A 404 may mean the deployment does not provide preview.
 6. Downloads resolve the user-selected local root with the OS (including `/tmp`,
    `/var` or configured aliases), then pin it and protect downloaded subpaths.
-   Select recursion/overwrite
-   explicitly and retain the checkpoint for file-level resume. Verify completed,
-   failed and skipped items before reporting a transfer complete.
+   Select recursion explicitly; directory contents map like cp, and --include-parent
+   retains the directory name. For a whole-Space share, omit `--path` or use
+   `--path /` with `--recursive` to retain the full Space-relative hierarchy.
+   The Space root has no basename, so `--include-parent` adds no wrapper; selected
+   subdirectories retain cp layout rules. Force overwrite is the default; use --no-clobber
+   or --overwrite-strategy newer when needed. Keep checkpoint state for verified
+   file/range recovery. Inspect completed, failed, pending and skipped items.
 
 Resume the exact same share download with the same destination and policy:
 
 ```bash
-ve-adrive-cli share download https://instance.example.test/share/share-id ./downloads --recursive --checkpoint ./share-checkpoint.json --resume
+ve-adrive-cli share download https://instance.example.test/share/share-id ./downloads --recursive --checkpoint --resume
 ```
 
 The original manifest is reused; newly added remote files are excluded. Changed
 remote/local files fail validation. Completed files require strong remote ETag or
-CRC64 plus the recorded local SHA-256. Pending files restart in fresh temporary
-files. Inspect `Complete`, `PlanComplete`, `CheckpointAvailable`, `Summary`, and
+CRC64 plus the recorded local SHA-256. Verified partial ranges are restored; unverified or changed ranges are fetched again. Inspect `Complete`, `PlanComplete`, `CheckpointAvailable`, `Summary`, and
 `Files[].Status`; nonzero exit means interruption or failure. If a signed URL's
 issuance outcome is unknown, check server state/quota before explicit resume.
 An explicit download-disabled 403 instead retains `Forbidden.ShareDownloadDisabled`,
 exits 5, and sets `IssuanceOutcomeUnknown=false`; changing local paths or blindly
 resuming does not grant download permission. Checkpoint/lock collision checks and
 resume identity include resolved local aliases.
-Dry-run reports an unknown manifest and file count, with no network or file writes.
+Download --dry-run performs read-only share metadata requests and returns the full
+selection.Manifest, counts, conflicts and expected artifact paths without local
+writes. It issues no download URLs and fetches no file content. Other share dry-runs
+remain offline.
+
+For a retained legacy directory-name layout, keep `--checkpoint FILE`, original
+filters/overwrite policy and `--include-parent` during resume. A bare checkpoint
+flag uses the stable default task path; `--checkpoint-dir` changes its directory.
+Download defaults are 16 files / 4 listings / 4 ranges; concurrency flags override
+them. `--include`/`--exclude` filter relative source paths, and
+`--bandwidth-limit 0` is unlimited. CSV reports/manifests use default paths unless
+overridden; `--no-manifest` disables only the CSV, retaining pre-scan/recovery state.
+Check `data.report_path`, `data.manifest_path`, `data.checkpoint_path`, and each
+report row's operation-specific request_id. Ordinary file failures allow the batch
+to continue; unknown issuance stops new dispatch.
+
+Directory errors appear separately in `DirectoryFailures` (LocalPath/Path/Message)
+and failed `mkdir` report rows; `Summary` continues to count files.
+
+Multiple shared roots can collide when copying their contents. Use
+`--include-parent` to preserve distinct root names; the CLI rejects ambiguous
+mappings and never guesses replacement names.
+
+Share recovery state consists of the checkpoint JSON, `<checkpoint>.completed/`
+completion-ledger directory, and `<checkpoint>.parts/` range state. Retain or move them
+together; the main JSON completed array is not updated after each file and cannot
+replace the completion ledger. Report rows still expose operation-specific request IDs.

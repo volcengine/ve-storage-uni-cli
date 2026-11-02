@@ -129,9 +129,10 @@ def test_share_lifecycle_and_safe_receiver(share_environment, tmp_path: Path):
             checked(runner, [*prefix, "cp", str(tmp_path / relative), target + relative])
         arguments = [*prefix, "share", "create", target, "--name", root,
                      "--password-stdin", "--expires-in", "1h", "--permission", "download"]
-        page_origin = os.environ.get("ADRIVE_E2E_SHARE_BASE_URL")
+        page_origin = (os.environ.get("ADRIVE_E2E_SHARE_ENDPOINT")
+                       or os.environ.get("ADRIVE_E2E_SHARE_BASE_URL"))
         if page_origin:
-            arguments += ["--share-base-url", page_origin]
+            arguments += ["--share-endpoint", page_origin]
         created = checked(runner, arguments, password)
         share_ids.append(created["ShareID"])
         exercise_share(runner, prefix, (instance, root, created["ShareID"], created["ShareUrl"]),

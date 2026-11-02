@@ -16,6 +16,9 @@ PART = 16 * 1024 * 1024
 PAYLOAD = b"0123456789abcdef" * (2 * PART // 16) + b"last-part"
 
 
+from share_download_regression import transfer_paths
+
+
 class RangeFixture(http.server.BaseHTTPRequestHandler):
     mode = "normal"
     payload = PAYLOAD
@@ -135,8 +138,7 @@ def invoke(binary, root, origin, mode, extra=()):
     environment = {key: value for key, value in os.environ.items() if not key.startswith("ADRIVE_")}
     progress_flags = [] if "--progress" in extra else ["--no-progress"]
     result = subprocess.run([str(binary), *prefix, "share", "download", f"{origin}/share/s",
-        str(destination), "--output", "json", *progress_flags, "--config-path", str(root / "absent"),
-        "--credentials-path", str(root / "absent-creds"), *extra],
+        str(destination), "--output", "json", *progress_flags, *transfer_paths(root), *extra],
         capture_output=True, text=True, env=environment, timeout=40)
     for _ in range(100):
         if RangeFixture.active == 0:
@@ -214,7 +216,7 @@ def check_cancellation(binary, root, origin):
     prefix = [] if binary.name == "ve-adrive-cli" else ["ve-adrive"]
     process = subprocess.Popen([str(binary), *prefix, "share", "download", f"{origin}/share/s",
         str(destination), "--output", "json", "--no-progress", "--checkpoint", str(root / "recovery.json"),
-        "--config-path", str(root / "absent"), "--credentials-path", str(root / "absent-creds")],
+        *transfer_paths(root)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         env={key: value for key, value in os.environ.items() if not key.startswith("ADRIVE_")})
     try:

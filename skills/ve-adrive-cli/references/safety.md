@@ -17,7 +17,9 @@
 - Quote paths and A-Drive URIs that contain spaces, wildcards, or user input.
 
 
-- Sharing grants receiver access to one file or folder. Confirm scope and intended
+- Sharing grants receiver access to one file, one folder or a whole Space. A Space
+  root target shares the entire Space (`ShareAllFiles=true`, `FilePathList=[]`).
+  Confirm scope and intended
   view/download permission. Cancellation revokes that share; use global `--yes`
   only when the user has authorized cancellation.
 - Treat URL `pwd`, password stdin, receiver access tokens and signed download URLs
@@ -43,7 +45,7 @@
   back to a different identity or try another password after explicit rejection.
 - Keep file paths unchanged while selecting receiver content. Directory download
   destinations must remain contained, and checkpoint files must contain no
-  passwords, tokens or signed URLs. Resume operates at completed-file granularity.
+  passwords, tokens or signed URLs. Resume revalidates completed files and restores only verified partial ranges.
 
 Share download local operations use anchored Unix directory descriptors or pinned
 Windows capability directory handles. User-selected local root aliases are first
@@ -51,7 +53,7 @@ resolved by the OS; subsequent downloaded components refuse symlinks/reparse
 points. Checkpoint parents and destinations use resolved identities for collision
 checks and resume. Temporary files are exclusively created in the destination parent and
 only verified files are published. Never replace this with check-then-open path
-operations. Checkpoint JSON is versioned, bounded and strict, protected by a
+operations. Checkpoint JSON is versioned and strict, protected by a
 no-follow `.lock` sidecar, and excludes passwords, tokens, signed URLs and arbitrary
 remote metadata. A completed local file is skipped only after both remote
 fingerprint and local SHA-256 validation. Partial/unknown outcomes use one failed
@@ -60,3 +62,13 @@ Definite service rejection, including download-disabled 403, is not an unknown
 issuance outcome: preserve its error code/status and set `IssuanceOutcomeUnknown=false`.
 Transport interruptions, 5xx and invalid successful issuance responses remain
 ambiguous and are never automatically replayed.
+
+Share recovery state consists of the checkpoint JSON, `<checkpoint>.completed/`
+completion-ledger directory, and `<checkpoint>.parts/` range state. Retain or move them
+together; the main JSON completed array is not updated after each file and cannot
+replace the completion ledger. Report rows still expose operation-specific request IDs.
+
+Whole-Space sharing requires service support. Current BOE V1 returns
+`InvalidParameter.ShareAllFilesNotAllowed`; do not claim end-to-end availability
+from the SDK field or local fixtures, and never bypass that policy with invented
+paths or silently expanded ordinary shares.

@@ -1,16 +1,21 @@
 //! Versioned, bounded, secret-free file-level recovery journal.
 use super::{
-    share_local::{resolve_directory, SafeDir, StagedFile},
-    share_manifest::{Manifest, MAX_MANIFEST_BYTES},
+    share_local::{resolve_directory, SafeDir},
+    share_manifest::Manifest,
 };
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::io::Write;
 use std::{
+    cell::RefCell,
     fs::File,
-    io::{Read, Write},
     path::{Path, PathBuf},
 };
 use tos_core::agent::error::CliError;
+
+#[path = "share_completion_ledger.rs"]
+mod completion_ledger;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,6 +27,8 @@ pub(crate) struct Identity {
     pub(crate) is_recursive: bool,
     pub(crate) is_overwrite: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) selection_policy: Option<super::share_transfer_options::SelectionPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) api_origin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) recipient: Option<super::share_receiver_auth::ReceiverContext>,
@@ -29,6 +36,19 @@ pub(crate) struct Identity {
 impl Identity {
     fn matches_expected(&self, expected: &Self) -> Result<bool, CliError> {
         let mut recorded = self.clone();
+        if recorded.selection_policy.is_none() {
+            if let Some(policy) = &expected.selection_policy {
+                // [Review Fix #ShareLegacy1] Include-parent cannot change nonrecursive file-only mappings.
+                if (!recorded.is_recursive || policy.is_include_parent)
+                    && policy.include.is_none()
+                    && policy.exclude.is_none()
+                    // [Review Fix #ShareLegacy2] The historical boolean distinguishes force/no-clobber; it never represented newer.
+                    && policy.overwrite == if recorded.is_overwrite { "force" } else { "no-clobber" }
+                {
+                    recorded.selection_policy = Some(policy.clone());
+                }
+            }
+        }
         // [Review Fix #ShareReceiveResume1] Legacy anonymous journals may migrate only to the URL-derived API; a new/overridden API must be recorded explicitly.
         if recorded.api_origin.is_none()
             && recorded.recipient.is_none()
@@ -69,6 +89,13 @@ impl Journal {
         // [Review Fix #Download6] The checkpoint may not redefine roots or directory shape around an immutable selector.
         self.manifest
             .validate_selection(identity.selection.as_deref(), identity.is_recursive)?;
+        if let Some(policy) = &self.identity.selection_policy {
+            self.manifest.validate_options(
+                policy.is_include_parent,
+                policy.include.as_deref(),
+                policy.exclude.as_deref(),
+            )?;
+        }
         Ok(())
     }
 }
@@ -82,6 +109,7 @@ pub(crate) struct Checkpoint {
     resolved_path: PathBuf,
     _lock: File,
     has_saved: std::cell::Cell<bool>,
+    persistence: RefCell<Option<completion_ledger::State>>,
 }
 impl Checkpoint {
     /// Acquire a no-follow checkpoint sidecar lock and enforce fresh/resume existence policy; propagate conflicts and I/O errors.
@@ -123,6 +151,7 @@ impl Checkpoint {
             name,
             _lock: lock,
             has_saved: std::cell::Cell::new(is_resume),
+            persistence: RefCell::new(None),
         })
     }
     /// Return the resolved local checkpoint identity without following its protected leaf.
@@ -131,36 +160,65 @@ impl Checkpoint {
     }
     /// Read bounded strict JSON and validate it against the requested task identity; return the original journal or an error.
     pub(crate) fn load(&self, identity: &Identity) -> Result<Journal, CliError> {
-        let mut bytes = Vec::new();
-        self.directory
-            .read(&self.name)?
-            .take((MAX_MANIFEST_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > MAX_MANIFEST_BYTES {
-            return Err(invalid("checkpoint exceeds 8 MiB"));
-        }
-        let mut journal: Journal = serde_json::from_slice(&bytes)
-            .map_err(|_| invalid("invalid checkpoint JSON/schema"))?;
-        journal.validate(identity)?;
-        // [Review Fix #ShareReceiveResume1] Persist the explicit API identity after successful legacy validation.
-        journal.identity = identity.clone();
+        let persistence = self.persistence.borrow();
+        let writer = persistence.as_ref().and_then(|state| state.writer.as_ref());
+        let (journal, state) =
+            completion_ledger::load(&self.directory, &self.name, identity, writer)?;
+        drop(persistence);
+        *self.persistence.borrow_mut() = Some(state);
         Ok(journal)
     }
-    /// Atomically persist the validated secret-free journal with file synchronization; reject initial replacement and propagate failures.
+    /// Read and validate a saved journal without creating a directory/lock or modifying the checkpoint.
+    pub(super) fn read_only(path: &Path, identity: &Identity) -> Result<Journal, CliError> {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| invalid("invalid checkpoint filename"))?;
+        super::share_manifest::validate_relative(name)?;
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let resolved = resolve_directory(parent, false)?;
+        let directory = SafeDir::open_resolved(&resolved)?;
+        completion_ledger::load(&directory, name, identity, None).map(|(journal, _)| journal)
+    }
+
+    /// Persist the immutable snapshot once and initialize/repair its synchronized ledger; compatibility calls discover changes linearly.
     pub(crate) fn save(&self, journal: &Journal) -> Result<(), CliError> {
-        journal.validate(&journal.identity)?;
-        let bytes = serde_json::to_vec(journal)?;
-        if bytes.len() > MAX_MANIFEST_BYTES {
-            return Err(invalid("checkpoint exceeds 8 MiB"));
+        let mut persistence = self.persistence.borrow_mut();
+        if persistence.is_none() {
+            *persistence = Some(if self.has_saved.get() {
+                completion_ledger::load(&self.directory, &self.name, &journal.identity, None)?.1
+            } else {
+                completion_ledger::State::fresh(journal)?
+            });
         }
-        let mut staged = StagedFile::new(&self.directory, &self.name)?;
-        staged.file.write_all(&bytes)?;
-        // [Review Fix #Download4] Initial persistence must not overwrite an unrelated concurrently created checkpoint.
-        staged.publish(self.has_saved.get())?;
+        persistence.as_mut().unwrap().save(
+            &self.directory,
+            &self.name,
+            journal,
+            !self.has_saved.get(),
+        )?;
         self.has_saved.set(true);
         Ok(())
     }
+    /// Synchronize one completion in bounded work; reject changed identities, file fingerprints or digests.
+    /// Callers keep snapshot metadata immutable after save/load; this hot path validates the selected entry only.
+    pub(crate) fn save_completion(&self, journal: &Journal, index: usize) -> Result<(), CliError> {
+        if self
+            .persistence
+            .borrow()
+            .as_ref()
+            .is_none_or(|state| state.writer.is_none())
+        {
+            self.save(journal)?;
+        }
+        self.persistence
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .save_completion(journal, index)
+    }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +230,7 @@ mod tests {
             destination: "/dest".into(),
             is_recursive: true,
             is_overwrite: false,
+            selection_policy: None,
             recipient: None,
             api_origin: None,
         }
@@ -239,6 +298,7 @@ mod persistence_tests {
             destination: root.to_string_lossy().into(),
             is_recursive: true,
             is_overwrite: false,
+            selection_policy: None,
             recipient: None,
             api_origin: None,
         }
@@ -288,6 +348,7 @@ mod selection_tests {
                 destination: "/dest".into(),
                 is_recursive,
                 is_overwrite: false,
+                selection_policy: None,
                 recipient: None,
                 api_origin: None,
             },
@@ -354,3 +415,7 @@ mod selection_tests {
         assert!(journal.validate(&journal.identity).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "share_checkpoint_incremental_tests.rs"]
+mod incremental_tests;

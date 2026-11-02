@@ -56,8 +56,8 @@ pub struct LoginArgs {
     #[arg(long, value_name = "INSTANCE_ID")]
     pub instance: Option<String>,
 
-    /// OAuth Authorization Server base URL. Required unless configured in the
-    /// selected profile or ADRIVE_AUTH_ENDPOINT
+    /// OAuth Authorization Server base URL. Overrides profile auth_endpoint and
+    /// ADRIVE_AUTH_ENDPOINT; defaults to the effective endpoint
     #[arg(long, value_name = "URL")]
     pub auth_endpoint: Option<String>,
 
@@ -174,7 +174,7 @@ ADRIVE_DEFAULT_INSTANCE; required if neither fallback is configured"
     }
 
     #[test]
-    fn login_auth_endpoint_help_explains_explicit_sources() {
+    fn login_auth_endpoint_help_explains_overrides_and_endpoint_fallback() {
         let command = TestCli::command();
         let login = command
             .find_subcommand("login")
@@ -188,7 +188,7 @@ ADRIVE_DEFAULT_INSTANCE; required if neither fallback is configured"
             .map(ToString::to_string)
             .unwrap_or_default();
 
-        assert!(help.contains("Required unless configured"));
+        assert!(help.contains("defaults to the effective endpoint"));
         assert!(help.contains("ADRIVE_AUTH_ENDPOINT"));
     }
 }

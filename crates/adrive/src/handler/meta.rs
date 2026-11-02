@@ -104,13 +104,50 @@ const ADRIVE_DEFAULT_BATCH_REPORT_DIR: &str = "~/.tos/reports/ve-adrive";
 
 // Exact owner catalog: identifiers inside each full phrase remain unchanged.
 const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    // [Review Fix #ShareTransferDocs2] Help rendering translates blank-line paragraphs independently.
+    ("The OS resolves user-selected destination and checkpoint directory aliases before the CLI pins them; downloaded subpaths reject traversal, symlinks/reparse points and case/Unicode or file/directory collisions with Conflict (exit 9). Resume compares resolved roots and verifies completed local sizes/digests; changes fail with Conflict. No --path selects all shared roots; a single-file share is selected automatically, while folders require --recursive. Directory contents map like cp by default; --include-parent retains the selected directory name. Multiple roots with colliding contents fail safely; use --include-parent to preserve distinct root names instead of guessing new names. --include and --exclude match cp relative source paths. Default parallelism is 16 files, 4 directory listings and 4 ranges per file; --batch-concurrency, --list-concurrency and --multipart-concurrency override these positive values.", "操作系统先解析用户指定的目标目录及 checkpoint 目录别名，再固定实际根目录；下载子路径拒绝穿越、符号链接/reparse 点、大小写及 Unicode 或文件/目录冲突，返回 Conflict（退出码 9）。恢复时比较解析后的根目录，并验证已完成本地文件大小和摘要；变化时返回 Conflict。不传 --path 时选择全部分享根；单文件自动选中，目录需要 --recursive。默认与 cp 一样复制目录内容；--include-parent 保留选中目录名。整 Space 分享省略 --path 或使用 --path / 时选择整个 Space，且需要 --recursive；保留完整空间相对层级。Space 根没有 basename，因此 --include-parent 不增加包装目录；选中子目录时仍遵循 cp 布局。多个根目录的内容同名时安全拒绝；用 --include-parent 保留不同根目录名，不猜测重命名。--include 和 --exclude 按 cp 的源相对路径匹配。默认并发为 16 个文件、4 个目录列举和每文件 4 个 Range；--batch-concurrency、--list-concurrency 和 --multipart-concurrency 可用正整数覆盖。"),
+    ("Overwrite defaults to force, matching cp. --force and legacy --overwrite select force; --no-clobber skips existing ordinary files, and --overwrite-strategy newer replaces only older destinations. Replacements publish only after verification. --checkpoint [FILE] enables recovery; a bare flag uses a stable task path under ~/.tos/checkpoints/ve-adrive, --checkpoint-dir overrides that directory, and FILE preserves the legacy explicit path. --resume uses the saved selection and policy, revalidates completed files and restores verified partial ranges. Keep selection, filters, layout and overwrite policy unchanged; old checkpoints with the directory-name layout need --include-parent. New remote files are not added during resume. Keep the checkpoint JSON together with its .completed/ completion-ledger directory and .parts/ directory when retaining or moving recovery state; completed entries in the main JSON are not updated after every file.", "覆盖策略默认 force，与 cp 一致。--force 和兼容的 --overwrite 选择 force；--no-clobber 跳过已有普通文件，--overwrite-strategy newer 仅替换较旧目标。校验完成后才发布替换文件。--checkpoint [FILE] 启用恢复；裸参数使用 ~/.tos/checkpoints/ve-adrive 下的稳定任务路径，--checkpoint-dir 覆盖目录，FILE 保留旧显式路径写法。--resume 使用保存的选择和策略，重新验证已完成文件，并恢复已验证的部分 Range。选择、过滤、目录布局和覆盖策略须保持一致；保留目录名布局的旧 checkpoint 需使用 --include-parent。恢复不加入新增远端文件。保存或迁移恢复状态时须同时保留 checkpoint JSON、.completed/ 增量账本目录和 .parts/ 目录；主 JSON 的 completed 不会逐文件实时更新。"),
+    ("Actual downloads create directories, temporary files, default report/manifest CSVs and enabled checkpoint/lock state; preflight may leave empty directories before a later denial. --report-path and --manifest-path override defaults under ~/.tos/reports/ve-adrive; --report-failures-only filters report rows only. --no-manifest disables the manifest CSV while preserving the safety pre-scan and recovery snapshot. Aggregate data includes report_path, manifest_path and checkpoint_path. Report CSV rows retain the request_id of their own operation; artifacts exclude passwords, tokens and signed URLs. The default table shows a cp-style summary of total/succeeded/failed/skipped/pending; Summary.Skipped includes verified resumed files and overwrite-policy skips, is included in Summary.Completed, and succeeded=Completed-Skipped. Files.Status may be completed, failed, pending or skipped; JSON and explicit queries retain details.", "实际下载创建目录、临时文件、默认 report/manifest CSV，以及启用的 checkpoint/锁状态；预检查可能在后续服务拒绝前留下空目录。--report-path 和 --manifest-path 覆盖 ~/.tos/reports/ve-adrive 下的默认路径；--report-failures-only 只过滤报告行。--no-manifest 关闭 manifest CSV，仍保留安全预扫描和恢复快照。聚合 data 包含 report_path、manifest_path、checkpoint_path。报告 CSV 行保留自身操作的 request_id；产物不含密码、token 或签名 URL。默认表格显示 total/succeeded/failed/skipped/pending；Summary.Skipped 包括校验后复用的恢复文件和覆盖策略跳过项，包含在 Summary.Completed 中，succeeded=Completed-Skipped。Files.Status 可为 completed、failed、pending 或 skipped；JSON 和显式 query 保留详情。"),
+    ("Files at least 20MB with a strong ETag or CRC64 automatically use parallel 16MiB ranges without requiring checkpoint; --checkpoint-threshold changes the threshold. Files lacking both identities use one streamed GET. Content retries reuse the issued URL. Ordinary file failures allow other files to continue. DirectoryFailures lists directory errors separately, with failed mkdir report rows; Summary counts files. An unknown URL-issuance outcome stops new dispatch and is never automatically replayed. Issuance may consume download-count quota even when content fails. Explicit service denials such as 403 retain the service code/status/request ID and set IssuanceOutcomeUnknown=false. Forbidden.ShareDownloadDisabled can mean downloads are forbidden or the quota is exhausted; ask the owner to check both.", "有强 ETag 或 CRC64 且大于等于 20MB 的文件自动使用并发 16MiB Range，无需 checkpoint；--checkpoint-threshold 调整阈值。缺少两种标识时使用单次流式 GET。内容重试复用已签发 URL。普通文件失败后继续其他文件。DirectoryFailures 单列目录错误，并写入失败 mkdir 报告行；Summary 仅统计文件。URL 签发结果未知时停止新派发，绝不自动重签。即使内容失败，签发仍可能消耗下载次数配额。403 等明确拒绝保留服务端错误码、状态和 request ID，并设置 IssuanceOutcomeUnknown=false。Forbidden.ShareDownloadDisabled 可能表示禁止下载或次数耗尽，请分享者检查两者。"),
+    ("Listing echo and file-count progress use stderr and default to TTY. --list-echo/--no-list-echo control listing echo; --progress/--no-progress control progress; --quiet disables both. Opposing echo/progress flags conflict. --progress-granularity part (default) or byte selects transfer progress units. --bandwidth-limit applies one bytes-per-second limit across all files/ranges; 0 is unlimited. Local transfer settings use CLI > selected profile adrive/shared transfer fields > ADRIVE environment > defaults, without loading account credentials or changing receiver authentication.", "列举回显和按文件计数的传输进度写入 stderr，默认在 TTY 开启。--list-echo/--no-list-echo 控制列举回显；--progress/--no-progress 控制进度；--quiet 关闭两者。同组相反参数互斥。--progress-granularity part（默认）或 byte 选择传输进度单位。--bandwidth-limit 对全部文件和 Range 共享每秒字节限速；0 不限速。本地传输设置优先级为 CLI > 所选 profile 的 adrive/shared 传输字段 > ADRIVE 环境变量 > 默认值；不加载账户凭据，也不改变接收鉴权。"),
+    // [Review Fix #ShareTransferDocs1] Both entrypoints expose the same cp-compatible receiver controls.
+    ("Include the source directory/prefix name under the destination path", "在目标路径下保留源目录/前缀名称"),
+    ("Include pattern, matching cp relative source paths", "包含模式，按 cp 的源相对路径匹配"),
+    ("Exclude pattern, matching cp relative source paths", "排除模式，按 cp 的源相对路径匹配"),
+    ("Legacy alias for force overwrite (the default strategy)", "强制覆盖的兼容参数（默认策略）"),
+    ("Force overwrite, matching cp's default strategy", "强制覆盖，与 cp 默认策略一致"),
+    ("Do not overwrite existing files", "不覆盖现有文件"),
+    ("Enable recovery with a stable task checkpoint; optionally supply an explicit FILE", "使用稳定任务 checkpoint 启用恢复；可选显式 FILE 路径"),
+    ("Directory for automatic task checkpoints (default ~/.tos/checkpoints/ve-adrive)", "自动任务 checkpoint 的目录（默认 ~/.tos/checkpoints/ve-adrive）"),
+    ("Maximum files/items running concurrently (default 16)", "同时执行的最大文件/条目数（默认 16）"),
+    ("Maximum directory prefixes listed concurrently (default 4)", "同时列举的最大目录前缀数（默认 4）"),
+    ("Progress granularity: part (default) or byte", "进度粒度：part（默认）或 byte"),
+    ("Shared bytes-per-second limit for all files and ranges (for example 100MB; 0 is unlimited)", "全部文件和 Range 共享的每秒字节限速（例如 100MB；0 不限速）"),
+    ("Write batch success/failure report to this path", "批量成功/失败报告写入此路径"),
+    ("Write planned transfer manifest to this path", "计划传输清单写入此路径"),
+    ("Disable the manifest CSV; preserve the safety pre-scan and recovery snapshot", "关闭 manifest CSV；保留安全预扫描和恢复快照"),
+    ("Enable listing echo even when stderr is not a TTY", "即使 stderr 不是 TTY 也启用列举回显"),
+    ("Disable listing echo", "关闭列举回显"),
+    ("Human-readable sizes", "使用易读大小单位"),
+    ("Sort field: key/name, size, or last-modified/mtime", "排序字段：key/name、size 或 last-modified/mtime"),
+    ("Select columns for table/csv output (comma-separated)", "选择 table/csv 输出列（逗号分隔）"),
+    ("Write listing manifest to this path. No manifest is written unless this is set.", "列表清单写入此路径；未设置时不写清单"),
+    ("Validated resumed files and overwrite-policy skips; included in Completed; table succeeded equals Completed minus Skipped", "校验后恢复复用的文件及覆盖策略跳过项；包含在 Completed 中；表格 succeeded=Completed-Skipped"),
+    ("Skip explicit directory uploads. By default, preserve directories including empty directories. Files may still create required parent directories", "跳过显式目录上传。默认保留目录，包括空目录。文件仍可能创建所需的父目录"),
     ("Path to config TOML", "配置 TOML 路径"),
     ("Path to credentials TOML", "凭据 TOML 路径"),
     ("Confirm share cancellation", "确认分享取消操作"),
     ("Share Links:", "分享链接："),
 
+    // [Review Fix #ShareReviewDocs] Translate the planning/input contract instead of falling back to English.
+    (crate::cli::share::SHARE_DRY_RUN_HELP, "Download --dry-run 仅通过只读分享 info/token/list/get 元数据请求，枚举全部选中分页和递归目录，或验证保存的恢复快照及已完成本地文件摘要。返回 selection.Manifest、PlanComplete=true、FileCount、DirectoryCount、TotalBytes、SkippedCount、Conflicts，以及预计 report_path、manifest_path、checkpoint_path。完整计划有本地冲突时退出 9，并保留计划。DownloadsIssued=0、LocalWrites=false：不签发下载 URL、不取内容、不创建目录或临时文件，不写 checkpoint、锁、report 或 manifest。MetadataResponses 统计收到的元数据响应；未统计网络尝试次数，因此 NetworkRequests=null。SnapshotGuaranteed=false：检查后远端内容和本地路径仍可能变化。文件大小缺失或为负数时校验失败（退出码 6）；显式 0 是有效空文件。OAuth 预演禁用自动刷新，避免凭据及认证锁写入。token 已过期、距到期 60 秒内或收到 401 时，先正常执行 ve-adrive --profile <profile> share inspect <share-url> --auth-mode oauth 刷新，再重试。规划不获取 checkpoint 锁；已有普通锁文件可能正被使用。实际执行会重新检查并加锁。"),
+    (crate::cli::share::SHARE_PASSWORD_HELP, "显式 --password-stdin 在移除末尾一个 LF 或 CRLF 后必须为非空密码；仅 EOF、LF 或 CRLF 的输入校验失败（退出码 6）。有意义的空格会保留。update 省略该参数时保留现有密码。create/update --dry-run 也读取并校验显式 stdin；--describe 和 --help 从不读取 stdin。"),
+    (crate::cli::share::SHARE_OFFLINE_HELP, "--describe 和 --help 不加载配置、不访问网络、不读取 stdin。分享命令的 --dry-run 除下载元数据规划外均离线执行。create/update 在 dry-run 时仍读取并校验显式 --password-stdin。"),
     (crate::cli::share::SHARE_RECEIVER_HELP, "inspect/files/view/download 默认匿名，即使 profile 配置了 OAuth。显式 --auth-mode oauth 通过 auth login/status 复用 --profile 和现有 token 刷新机制；不会自动登录或回退到其他身份。OAuth 用于分享概况及 token 交换；文件 API 仅使用 x-share-token，内容下载不携带账户凭据。服务端验证登录和分享权限；设置了提取码时仍须提供。公开 URL 支持 /share/<id> 和 /share/<id>/，末尾一个斜杠会被规范化移除。目录前缀通过 --path 指定，不追加到 URL 路径。"),
-    (crate::cli::share::SHARE_FILES_HELP, "files 返回一页目录：--limit 设置条数，--marker 使用上一页的 NextMarker；IsTruncated=false 时结束。精确文件路径选择一个文件；目录路径以 / 结尾。设置了提取码时每次调用均需提供：stdin > URL pwd > 普通终端隐藏提示。--password-stdin 读取到 EOF（使用管道）；不会保存密码。Download 自动枚举各页。files 的默认 table/CSV 与 ls 使用相同的 file_path、size、file_type、updated_at、is_folder 列，目录在前。表格 Total 为展示行数；JSON 和显式 --query 保留服务原始数组。"),
+    // [Review Fix #ShareFilesMaxKeysZh] Translate the combined result cap and normalized pagination contract.
+    (crate::cli::share::SHARE_FILES_HELP, "files 与 ls 一样列举当前目录层级。--max-keys（默认 1000）限制文件和目录的合计条目数；自动获取服务分页，直到达到上限或列举结束。使用 --marker 传入上一次的 NextMarker 继续；IsTruncated=false 表示列举结束。不支持 --limit。精确文件路径选择一个文件；目录路径以 / 结尾。整 Space 分享省略 --path 或使用 --path / 时列举 Space 根。设置了提取码时每次调用均需提供：stdin > URL pwd > 普通终端隐藏提示。--password-stdin 读取到 EOF（使用管道）；不会保存密码。默认 table/CSV 与 ls 使用相同的 file_path、size、file_type、updated_at、is_folder 列，目录在前。--human-readable（-H）格式化 table/CSV 大小，--columns 选择显示列。显式 --sort key/name|size|last-modified/mtime 对本次上限内的结果在所有格式及显式 query 中排序，保留原始元数据值及分页 marker。仅显式 --manifest-path 写出列表 CSV；files 默认不写 manifest。所有输出模式均规范化目录标记、自身目录标记及重复项；Total 和 pagination.total_returned 统计相同的逻辑条目。JSON 和显式 --query 保留聚合且规范化后的 Files/Folders 元数据。"),
+    // [Review Fix #ShareDownloadSelectionZh] Download keeps its own selection/password guidance after the files help split.
+    (crate::cli::share::SHARE_DOWNLOAD_SELECTION_HELP, "下载自动枚举全部选中服务分页。精确文件路径选择一个文件；目录路径以 / 结尾，并需要 --recursive。密码优先级为 stdin > URL pwd > 普通终端隐藏提示；--password-stdin 读取到 EOF（使用管道），不会保存密码。"),
     ("Manage and receive share links", "管理和接收分享链接"),
     ("Create a share link", "创建分享链接"),
     ("Get a share link", "获取分享链接"),
@@ -138,8 +175,11 @@ const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Require receiver login; accepts explicit true or false", "要求接收者登录；显式接受 true 或 false"),
     ("Maximum preview count; 0 means unlimited", "最大预览次数；0 表示无限制"),
     ("Maximum download count; 0 means unlimited", "最大下载次数；0 表示无限制"),
-    ("ADrive file or folder target", "ADrive 文件或文件夹目标"),
-    ("Share page origin override", "分享页面源地址覆盖值"),
+    // [Review Fix #WholeSpaceZh] Root scope and absent scope fields need the same bilingual contract.
+    (crate::cli::share::SHARE_CREATE_HELP, "create 可分享一个文件、一个目录或整个 Space。adrive://instance/space（末尾可带一个斜杠）选择整个 Space，使用 ShareAllFiles=true 和 FilePathList=[]；--instance instance --space space 选择同一个根。非根文件/目录请求省略 ShareAllFiles（默认 false），并保留单项 FilePathList。显式空 --file 仍无效。"),
+    ("Whether the share covers the whole Space; omitted when not returned by the service", "分享是否覆盖整个 Space；服务端未返回时省略"),
+    ("ADrive file, folder or Space root target", "ADrive 文件、文件夹或 Space 根目标"),
+    ("Share page origin override; otherwise use server ShareURL", "分享页面源地址覆盖值；未配置时使用服务端 ShareURL"),
     ("Share identifier", "分享标识符"),
     ("Share identifier or adrive://instance/share-id", "分享标识符或 adrive://instance/share-id"),
     ("Treat the share target instance as a name and resolve it to an ID", "将分享目标中的实例视为名称并解析为 ID"),
@@ -166,6 +206,9 @@ const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Resume using the checkpoint file", "使用 checkpoint 文件续传"),
     ("Share password supplied through child stdin", "通过子进程标准输入提供的分享密码"),
     ("Share password returned for authorized delivery", "为授权交付返回的分享密码"),
+    // [Review Fix #ShareServerURLSchemaZh] Localize optional service URL and missing-URL output guidance.
+    ("Server ShareURL or a URL built from the configured share-endpoint; omitted when unavailable", "服务端 ShareURL 或按配置的 share-endpoint 拼接的 URL；不可用时省略"),
+    ("Successful share result has no usable URL; retain ShareID and configure share-endpoint or retrieve the share again", "分享操作成功但缺少可用 URL；请保留 ShareID，配置 share-endpoint 或重新获取分享"),
     ("Share settings are mutable; the shared target cannot change.", "分享设置可修改；分享目标不可更改。"),
     ("Anonymous receiver access never loads account credentials.", "匿名接收访问不加载账户凭据。"),
 
@@ -305,7 +348,7 @@ const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Per-invocation override: --auth-mode <MODE>; supported values are aksk, oauth, or unified. ADRIVE_AUTH_MODE supplies the environment value", "单次调用覆盖：--auth-mode <MODE>；支持值为 aksk、oauth 或 unified。环境变量由 ADRIVE_AUTH_MODE 提供"),
     ("Authentication action: status (default), login, or logout", "鉴权操作：status（默认）、login 或 logout"),
     ("OAuth login Instance; required unless the selected profile or ADRIVE_DEFAULT_INSTANCE supplies it", "OAuth 登录 Instance；除非所选 profile 或 ADRIVE_DEFAULT_INSTANCE 已提供，否则必填"),
-    ("OAuth Authorization Server for login; required unless the selected profile or ADRIVE_AUTH_ENDPOINT supplies it", "OAuth 登录授权服务器；除非所选 profile 或 ADRIVE_AUTH_ENDPOINT 已提供，否则必填"),
+    ("OAuth Authorization Server for login; defaults to the effective endpoint after command/profile/environment Auth overrides", "OAuth 登录授权服务器；优先使用命令行、profile 和认证环境变量，未设置时回退到有效 endpoint"),
     ("Human-readable device name shown during OAuth authorization", "OAuth 授权期间显示的人类可读设备名称"),
     ("Unified uses the same-name external profile, ignores local AK/SK and OAuth credentials, and delegates login/logout to `ve login` / `ve logout`", "Unified 使用同名外部 profile，忽略本地 AK/SK 和 OAuth 凭证，并将登录/登出交由 `ve login` / `ve logout`"),
     ("Execute the CLI command; false returns a plan only", "执行 CLI 命令；false 时仅返回计划"),
@@ -374,12 +417,13 @@ const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     // [Review Fix #Rebase3] Sharing semantics are public discovery prose and
     // require the same bilingual coverage as the existing high-level domains.
     ("create/get/list/update/cancel use the V1 share management APIs with the selected account authentication", "create/get/list/update/cancel 使用 V1 分享管理 API 和所选账户鉴权"),
-    ("delivery URLs use the share page origin plus /share/<encoded ShareID> for both files and folders", "文件和文件夹的交付 URL 均由分享页面域名和 /share/<编码后的 ShareID> 拼接"),
+    ("delivery ShareUrl uses server ShareURL by default; a configured share-endpoint appends /share/<encoded ShareID> for both files and folders", "交付 ShareUrl 默认使用服务端 ShareURL；配置 share-endpoint 时，文件和文件夹均拼接 /share/<编码后的 ShareID>"),
     ("inspect/files/view/download receive a public share URL anonymously by default; explicit --auth-mode oauth uses the recipient profile for info/token exchange, then file APIs use only x-share-token", "inspect/files/view/download 默认匿名接收公开分享 URL；显式 --auth-mode oauth 使用接收者 profile 获取概况及交换 token，后续文件 API 仅携带 x-share-token"),
-    ("files supports a single file or one directory page; recursive downloads build a bounded manifest and support file-level checkpoint resume", "files 支持单个文件或一页目录列表；递归下载构建有界清单，并支持文件级 checkpoint 恢复"),
+    // [Review Fix #ShareFilesMaxKeysRouting] Routing discovery describes a logical result cap rather than a single service page.
+    ("files shares ls display and explicit listing manifests; recursive downloads use cp transfer controls, safety snapshots, file and verified range checkpoint recovery", "files 共用 ls 显示和显式列表清单；递归下载使用 cp 传输控制、安全快照以及文件和已验证 Range 的 checkpoint 恢复"),
     // [Review Fix #LiveDocs1] Share Describe/export uses this independent translation catalog.
-    (crate::cli::share::SHARE_CONNECTION_HELP, "标准 IDS 域名在 volces.com 下按 idsapi/idsapp、idsapi-boe/idsapp-boe 对应，保留实例前缀、协议和端口。分享页面、接收 API 及下载地址支持 HTTP 和 HTTPS，不自动升级协议。自定义页面使用 --share-base-url，接收 API 使用 --endpoint。匿名接收从页面 URL 推导 API，不读取账户配置；显式 OAuth 使用所选 profile 的 API 或 --endpoint。"),
-    (crate::cli::share::SHARE_DOWNLOAD_HELP, "用户指定的目标目录及 checkpoint 目录别名由操作系统解析后固定；下载内容的子路径仍拒绝符号链接/reparse 点。恢复时比较解析后的根目录。403 等明确服务端拒绝保留错误码，IssuanceOutcomeUnknown=false；结果不明确的下载 URL 签发不会自动重试。不传 --path 时选择全部分享根；单文件自动选中，目录需要 --recursive。预检查可能先创建目录结构，后续下载被拒绝时会留下空目录。默认下载表格显示与 cp 类似的汇总（total/succeeded/failed/skipped/pending），空结果也显示；JSON 和显式 query 保留文件明细。Summary.Skipped 统计恢复时复用的已验证完成文件，并包含在 Summary.Completed 中。有强 ETag 或 CRC64 且大于等于 20MB 的文件自动使用并发的 16MiB Range，无需 checkpoint；缺少这两种版本校验信息时使用单次流式 GET，避免混合版本；--checkpoint-threshold 调整阈值，--multipart-concurrency 调整默认 4 路并发。分片重试复用已签发 URL；checkpoint 仍只恢复已完成文件。扫描、按文件计数和当前文件分片进度写入 stderr，TTY 默认开启；--progress 强制开启，--no-progress 或 --quiet 关闭。--progress 与 --no-progress 互斥。Forbidden.ShareDownloadDisabled 需要分享者开启 --permission download。"),
+    (crate::cli::share::SHARE_CONNECTION_HELP, "管理结果的 ShareUrl 默认使用服务端 ShareURL；配置 share-endpoint 时覆盖。优先级：--share-endpoint > 所选 profile 的 share_endpoint > ADRIVE_SHARE_ENDPOINT > 旧变量 ADRIVE_SHARE_BASE_URL；覆盖值后拼接 /share/<编码后的 ShareID>，不添加实例前缀或密码。服务端 URL 和覆盖值均缺失时，保留成功的 ShareID，省略 ShareUrl，并以 ShareUrlWarning 提示缺失；不使用 API endpoint 推导页面 URL。create/get 可保留服务端 URL 的 pwd 查询参数供授权交付；list/update 移除全部查询参数且不返回密码。接收端标准 IDS 域名在 volces.com 下按 idsapp/idsapi、idsapp-boe/idsapi-boe 对应，保留实例前缀、协议和端口。分享页面、接收 API 及下载地址支持 HTTP 和 HTTPS，不自动升级协议。自定义接收 API 使用 --endpoint。匿名接收从页面 URL 推导 API，不读取账户配置；显式 OAuth 使用所选 profile 的 API 或 --endpoint。"),
+    (crate::cli::share::SHARE_DOWNLOAD_HELP, "操作系统先解析用户指定的目标目录及 checkpoint 目录别名，再固定实际根目录；下载子路径拒绝穿越、符号链接/reparse 点、大小写及 Unicode 或文件/目录冲突，返回 Conflict（退出码 9）。恢复时比较解析后的根目录，并验证已完成本地文件大小和摘要；变化时返回 Conflict。不传 --path 时选择全部分享根；单文件自动选中，目录需要 --recursive。默认与 cp 一样复制目录内容；--include-parent 保留选中目录名。整 Space 分享省略 --path 或使用 --path / 时选择整个 Space，且需要 --recursive；保留完整空间相对层级。Space 根没有 basename，因此 --include-parent 不增加包装目录；选中子目录时仍遵循 cp 布局。多个根目录的内容同名时安全拒绝；用 --include-parent 保留不同根目录名，不猜测重命名。--include 和 --exclude 按 cp 的源相对路径匹配。默认并发为 16 个文件、4 个目录列举和每文件 4 个 Range；--batch-concurrency、--list-concurrency 和 --multipart-concurrency 可用正整数覆盖。\n\n覆盖策略默认 force，与 cp 一致。--force 和兼容的 --overwrite 选择 force；--no-clobber 跳过已有普通文件，--overwrite-strategy newer 仅替换较旧目标。校验完成后才发布替换文件。--checkpoint [FILE] 启用恢复；裸参数使用 ~/.tos/checkpoints/ve-adrive 下的稳定任务路径，--checkpoint-dir 覆盖目录，FILE 保留旧显式路径写法。--resume 使用保存的选择和策略，重新验证已完成文件，并恢复已验证的部分 Range。选择、过滤、目录布局和覆盖策略须保持一致；保留目录名布局的旧 checkpoint 需使用 --include-parent。恢复不加入新增远端文件。保存或迁移恢复状态时须同时保留 checkpoint JSON、.completed/ 增量账本目录和 .parts/ 目录；主 JSON 的 completed 不会逐文件实时更新。\n\n实际下载创建目录、临时文件、默认 report/manifest CSV，以及启用的 checkpoint/锁状态；预检查可能在后续服务拒绝前留下空目录。--report-path 和 --manifest-path 覆盖 ~/.tos/reports/ve-adrive 下的默认路径；--report-failures-only 只过滤报告行。--no-manifest 关闭 manifest CSV，仍保留安全预扫描和恢复快照。聚合 data 包含 report_path、manifest_path、checkpoint_path。报告 CSV 行保留自身操作的 request_id；产物不含密码、token 或签名 URL。默认表格显示 total/succeeded/failed/skipped/pending；Summary.Skipped 包括校验后复用的恢复文件和覆盖策略跳过项，包含在 Summary.Completed 中，succeeded=Completed-Skipped。Files.Status 可为 completed、failed、pending 或 skipped；JSON 和显式 query 保留详情。\n\n有强 ETag 或 CRC64 且大于等于 20MB 的文件自动使用并发 16MiB Range，无需 checkpoint；--checkpoint-threshold 调整阈值。缺少两种标识时使用单次流式 GET。内容重试复用已签发 URL。普通文件失败后继续其他文件。DirectoryFailures 单列目录错误，并写入失败 mkdir 报告行；Summary 仅统计文件。URL 签发结果未知时停止新派发，绝不自动重签。即使内容失败，签发仍可能消耗下载次数配额。403 等明确拒绝保留服务端错误码、状态和 request ID，并设置 IssuanceOutcomeUnknown=false。Forbidden.ShareDownloadDisabled 可能表示禁止下载或次数耗尽，请分享者检查两者。\n\n列举回显和按文件计数的传输进度写入 stderr，默认在 TTY 开启。--list-echo/--no-list-echo 控制列举回显；--progress/--no-progress 控制进度；--quiet 关闭两者。同组相反参数互斥。--progress-granularity part（默认）或 byte 选择传输进度单位。--bandwidth-limit 对全部文件和 Range 共享每秒字节限速；0 不限速。本地传输设置优先级为 CLI > 所选 profile 的 adrive/shared 传输字段 > ADRIVE 环境变量 > 默认值；不加载账户凭据，也不改变接收鉴权。"),
 ];
 
 const ADRIVE_HIGH_LEVEL_SEMANTICS: &[(&str, &[&str])] = &[
@@ -467,13 +511,16 @@ const ADRIVE_HIGH_LEVEL_SEMANTICS: &[(&str, &[&str])] = &[
         "share",
         &[
             "create/get/list/update/cancel use the V1 share management APIs with the selected account authentication",
-            "delivery URLs use the share page origin plus /share/<encoded ShareID> for both files and folders",
+            "delivery ShareUrl uses server ShareURL by default; a configured share-endpoint appends /share/<encoded ShareID> for both files and folders",
             "inspect/files/view/download receive a public share URL anonymously by default; explicit --auth-mode oauth uses the recipient profile for info/token exchange, then file APIs use only x-share-token",
-            "files supports a single file or one directory page; recursive downloads build a bounded manifest and support file-level checkpoint resume",
+            // [Review Fix #ShareFilesMaxKeysRouting] Keep the routing phrase aligned with files help and Describe.
+            "files shares ls display and explicit listing manifests; recursive downloads use cp transfer controls, safety snapshots, file and verified range checkpoint recovery",
             crate::cli::share::SHARE_CONNECTION_HELP,
             crate::cli::share::SHARE_DOWNLOAD_HELP,
+            crate::cli::share::SHARE_DOWNLOAD_SELECTION_HELP,
             crate::cli::share::SHARE_SELECTOR_HELP,
             crate::cli::share::SHARE_LIST_HELP,
+            crate::cli::share::SHARE_CREATE_HELP,
             crate::cli::share::SHARE_SETTINGS_HELP,
             crate::cli::share::SHARE_RECEIVER_HELP,
             crate::cli::share::SHARE_FILES_HELP,
@@ -1369,6 +1416,7 @@ fn is_boolean_parameter(name: &str) -> bool {
             | "by-name"
             | "recursive"
             | "include-parent"
+            | "disable-dir-object"
             | "include-uploads"
             | "index-enabled"
             | "parents"
@@ -1663,6 +1711,33 @@ mod share_export_tests {
     use super::*;
 
     #[test]
+    fn whole_space_mcp_advertises_existing_typed_selectors() {
+        for action in ["create", "files", "download"] {
+            let command = format!("ve-adrive share {action}");
+            let skill = skill_definitions()
+                .into_iter()
+                .find(|skill| skill.internal_command == command)
+                .unwrap();
+            let description = mcp_tool_description(&skill);
+            let properties = &skill.input_schema["properties"];
+            assert!(properties.get("share-all-files").is_none());
+            if action == "create" {
+                assert!(description.contains("ShareAllFiles=true"));
+                assert_eq!(properties["target"]["type"], "string");
+                assert_eq!(properties["file"]["type"], "string");
+            } else {
+                assert!(description.contains("--path /"));
+                assert_eq!(properties["path"]["type"], "string");
+                if action == "download" {
+                    assert!(description.contains("full Space-relative hierarchy"));
+                    assert_eq!(properties["recursive"]["type"], "boolean");
+                    assert_eq!(properties["include-parent"]["type"], "boolean");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn exported_share_skills_include_localized_describe_semantics() {
         let root = tos_core::agent::skill_markdown::command_tree::<crate::cli::ADriveCommand>();
         let shares = skill_definitions()
@@ -1818,8 +1893,8 @@ pub async fn handle_config_command(
                         if let Some(ref f) = eff.auth_mode {
                             push_traced_row(&mut rows, eff, "auth_mode", f);
                         }
-                        if let Some(ref f) = eff.share_base_url {
-                            push_traced_row(&mut rows, eff, "share_base_url", f);
+                        if let Some(ref f) = eff.share_endpoint {
+                            push_traced_row(&mut rows, eff, "share_endpoint", f);
                         }
                         if let Some(ref f) = eff.auth_endpoint {
                             push_traced_row(&mut rows, eff, "auth_endpoint", f);
@@ -1906,6 +1981,8 @@ pub async fn handle_config_command(
             Ok(0)
         }
         ConfigAction::Set { key, value } => {
+            let canonical_key = canonical_adrive_config_key(key);
+            let key = &canonical_key;
             if is_sensitive_adrive_config_key(key) {
                 return handle_adrive_credential_set(global, key, value);
             }
@@ -2108,6 +2185,8 @@ fn handle_config_dry_run(global: &GlobalArgs, action: &ConfigAction) -> Result<i
             }
         }
         ConfigAction::Set { key, value } => {
+            let canonical_key = canonical_adrive_config_key(key);
+            let key = &canonical_key;
             let segments = adrive_config_key_segments(global, key)?;
             let segment_refs = segments.iter().map(String::as_str).collect::<Vec<_>>();
             let mut validation_config = ConfigFile::default();
@@ -2181,6 +2260,21 @@ fn handle_config_dry_run(global: &GlobalArgs, action: &ConfigAction) -> Result<i
         &Envelope::success(config_action_command(action), dry_run),
     )?;
     Ok(0)
+}
+
+fn canonical_adrive_config_key(key: &str) -> String {
+    // [Review Fix #ShareEndpoint4] Legacy input must generate canonical plans and saved-field messages without changing other namespaces.
+    let mut segments = key.split('.').collect::<Vec<_>>();
+    match segments.as_mut_slice() {
+        [field] if *field == "share_base_url" => *field = "share_endpoint",
+        [_, namespace, field]
+            if Binary::parse(namespace) == Some(Binary::Adrive) && *field == "share_base_url" =>
+        {
+            *field = "share_endpoint";
+        }
+        _ => {}
+    }
+    segments.join(".")
 }
 
 fn adrive_config_key_segments(global: &GlobalArgs, key: &str) -> Result<Vec<String>, CliError> {
@@ -2541,20 +2635,20 @@ fn validate_selected_share_origin(config: &ConfigFile, profile_name: &str) -> Re
         .profiles
         .get(profile_name)
         .and_then(|profile| profile.adrive.as_ref())
-        .and_then(|settings| settings.share_base_url.as_deref())
+        .and_then(|settings| settings.share_endpoint.as_deref())
     {
-        tos_core::infra::config::validate_share_base_url(origin)?;
+        tos_core::infra::config::validate_share_endpoint(origin)?;
     }
     Ok(())
 }
 
 fn redact_invalid_share_origin(effective: &mut EffectiveProfile) {
     // [Review Fix #ShareOrigin2] Displaying another profile must not disclose credentials embedded in an invalid origin.
-    if let Some(field) = &mut effective.share_base_url {
+    if let Some(field) = &mut effective.share_endpoint {
         if field
             .value
             .as_deref()
-            .is_some_and(|origin| tos_core::infra::config::validate_share_base_url(origin).is_err())
+            .is_some_and(|origin| tos_core::infra::config::validate_share_endpoint(origin).is_err())
         {
             field.value = Some("[invalid share page origin]".into());
         }
@@ -2765,20 +2859,11 @@ async fn run_mcp_sse(global: &GlobalArgs, port: u16) -> Result<(), CliError> {
 
 fn build_mcp_server(global: &GlobalArgs) -> Result<tos_core::mcp::TosMcpServer, CliError> {
     use std::sync::Arc;
-    use tos_core::mcp::{
-        ToolDispatcher, ToolEntry, ToolInvocation, ToolInvocationResult, TosMcpServer,
-    };
+    use tos_core::mcp::{ToolDispatcher, ToolInvocation, ToolInvocationResult, TosMcpServer};
 
     let entries = skill_definitions()
         .into_iter()
-        .map(|skill| {
-            ToolEntry::from_parts(
-                skill.name,
-                skill.description,
-                skill.input_schema,
-                matches!(skill.risk_level.as_str(), "high" | "critical"),
-            )
-        })
+        .map(mcp_tool_entry)
         .collect::<Vec<_>>();
 
     struct ADriveDispatcher {
@@ -2808,6 +2893,49 @@ fn build_mcp_server(global: &GlobalArgs) -> Result<tos_core::mcp::TosMcpServer, 
         entries,
         dispatcher,
     ))
+}
+
+fn mcp_tool_entry(skill: SkillDefinition) -> tos_core::mcp::ToolEntry {
+    let can_write_locally = matches!(
+        skill.internal_command.as_str(),
+        "ve-adrive share download" | "ve-adrive share files"
+    );
+    let description = mcp_tool_description(&skill);
+    let mut entry = tos_core::mcp::ToolEntry::from_parts(
+        skill.name,
+        description,
+        skill.input_schema,
+        matches!(skill.risk_level.as_str(), "high" | "critical"),
+    );
+    if can_write_locally {
+        // [Review Fix #ShareFilesMcpWrite1] Explicit listing manifests also write locally, so files cannot promise read-only execution.
+        // [Review Fix #D02Docs] Keep annotation construction separate from server startup; non-destructive downloads still write files.
+        entry
+            .tool
+            .annotations
+            .get_or_insert_with(Default::default)
+            .read_only_hint = Some(false);
+    }
+    entry
+}
+
+fn mcp_tool_description(skill: &SkillDefinition) -> String {
+    // [Review Fix #WholeSpaceMcp] Advertise the broader root scope before callers plan existing typed selectors.
+    if skill.internal_command == "ve-adrive share create" {
+        return format!(
+            "{} {}",
+            skill.description,
+            crate::cli::share::SHARE_CREATE_HELP
+        );
+    }
+    if skill.internal_command == "ve-adrive share files" {
+        return format!("{} Plans argv without I/O by default. For a whole-Space share, omitting path or using --path / lists the Space root. With execute=true, --manifest-path writes a local listing CSV only when explicitly supplied; otherwise no listing manifest is created.", skill.description);
+    }
+    if skill.internal_command == "ve-adrive share download" {
+        // [Review Fix #D02Docs] Expose network planning and local writes before an MCP caller decides whether to execute.
+        return format!("{} Plans argv without I/O by default. For a whole-Space share, omitting path or using --path / requires recursive=true and preserves the full Space-relative hierarchy; include-parent adds no wrapper because the Space root has no basename. With execute=true and dry_run=true, query share metadata and return a read-only download plan and expected artifact paths. With execute=true and no dry_run, create local directories/temp files/report and manifest CSVs plus enabled checkpoint locks; overwrite defaults to force like cp, and URL issuance may consume download quota. Checkpoint accepts true for an automatic path, a nonempty filename string, or false to disable it. Use describe=true with execute=true for the full contract.", skill.description);
+    }
+    skill.description.clone()
 }
 
 async fn mcp_invoke_tool(
@@ -2967,6 +3095,15 @@ fn build_mcp_prepared_argv(
     command: &str,
     arguments: &serde_json::Map<String, Value>,
 ) -> Result<Vec<String>, CliError> {
+    // [Review Fix #DirectoryMcpType] Reject malformed opt-outs instead of silently enabling directory writes.
+    if arguments
+        .get("disable-dir-object")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(CliError::ValidationError(
+            "disable-dir-object must be boolean".into(),
+        ));
+    }
     let row = find_capability(command).ok_or_else(|| {
         CliError::ValidationError(format!("unknown typed MCP command '{}'", command))
     })?;
@@ -3100,27 +3237,36 @@ fn push_mcp_command_args(
         let Some(value) = arguments.get(parameter.name) else {
             continue;
         };
-        let flag = format!("--{}", parameter.name.replace('_', "-"));
-        if row.command.starts_with("ve-adrive share ") && parameter.name == "require-login" {
-            let is_enabled = value
-                .as_bool()
-                .ok_or_else(|| CliError::ValidationError("require-login must be boolean".into()))?;
-            argv.push(flag);
-            argv.push(is_enabled.to_string());
-            continue;
-        }
-        // [Review Fix #ShareMcpCheckpoint1] Share download takes a checkpoint filename; cp retains its boolean switch.
-        if is_boolean_parameter(parameter.name)
-            && !(row.command == "ve-adrive share download" && parameter.name == "checkpoint")
-        {
-            if value.as_bool().unwrap_or(false) {
-                argv.push(flag);
-            }
-            continue;
-        }
-        push_mcp_argument_value(argv, Some(&flag), value)?;
+        push_mcp_named_argument(row.command, parameter.name, value, argv)?;
     }
     Ok(())
+}
+
+fn push_mcp_named_argument(
+    command: &str,
+    name: &str,
+    value: &Value,
+    argv: &mut Vec<String>,
+) -> Result<(), CliError> {
+    let flag = format!("--{}", name.replace('_', "-"));
+    if command.starts_with("ve-adrive share ") && name == "require-login" {
+        let is_enabled = value
+            .as_bool()
+            .ok_or_else(|| CliError::ValidationError("require-login must be boolean".into()))?;
+        argv.extend([flag, is_enabled.to_string()]);
+        return Ok(());
+    }
+    // [Review Fix #ShareMcpCheckpoint2] Boolean checkpoint values control the flag; only explicit strings can be filenames.
+    if command == "ve-adrive share download" && name == "checkpoint" && value.is_string() {
+        return push_mcp_argument_value(argv, Some(&flag), value);
+    }
+    if is_boolean_parameter(name) {
+        if value.as_bool().unwrap_or(false) {
+            argv.push(flag);
+        }
+        return Ok(());
+    }
+    push_mcp_argument_value(argv, Some(&flag), value)
 }
 
 fn validate_mcp_argument_names(
@@ -3180,8 +3326,32 @@ fn validate_mcp_argument_names(
 }
 fn validate_share_mcp_parameter(command: &str, name: &str, value: &Value) -> Result<(), CliError> {
     let schema = crate::share_metadata::parameter_schema(command, name);
+    if !share_parameter_accepts(&schema, value) {
+        return Err(CliError::ValidationError(format!(
+            "invalid typed share MCP argument: {name}"
+        )));
+    }
+    Ok(())
+}
+
+fn share_parameter_accepts(schema: &Value, value: &Value) -> bool {
+    if let Some(choices) = schema["oneOf"].as_array() {
+        return choices
+            .iter()
+            .filter(|choice| share_parameter_accepts(choice, value))
+            .count()
+            == 1;
+    }
     let is_valid = match schema["type"].as_str() {
-        Some("string") => value.is_string(),
+        Some("string") => value.as_str().is_some_and(|text| {
+            let length = text.chars().count() as u64;
+            schema["minLength"]
+                .as_u64()
+                .is_none_or(|minimum| length >= minimum)
+                && schema["maxLength"]
+                    .as_u64()
+                    .is_none_or(|maximum| length <= maximum)
+        }),
         Some("boolean") => value.is_boolean(),
         Some("integer") => value.as_i64().is_some_and(|number| {
             // [Review Fix #ShareTypedMaximum1] Planned MCP arguments must satisfy the same upper bounds as Clap execution.
@@ -3197,12 +3367,11 @@ fn validate_share_mcp_parameter(command: &str, name: &str, value: &Value) -> Res
             .is_some_and(|items| items.iter().all(Value::is_string)),
         _ => false,
     };
-    if !is_valid {
-        return Err(CliError::ValidationError(format!(
-            "invalid typed share MCP argument: {name}"
-        )));
-    }
-    Ok(())
+    // [Review Fix #ShareMcpChoices1] Planning must reject invalid choices instead of deferring them to child execution.
+    is_valid
+        && schema["enum"]
+            .as_array()
+            .is_none_or(|choices| choices.contains(value))
 }
 
 fn is_positional_parameter(command: &str, name: &str) -> bool {
@@ -3269,6 +3438,7 @@ async fn run_mcp_typed_argv(
     password: Option<String>,
 ) -> Result<McpCommandExecution, CliError> {
     let exe = std::env::current_exe()?;
+    let argv = mcp_process_argv(command, argv, &adrive_example_prefix())?;
     let timeout_seconds = if command.contains("share download") {
         3600
     } else {
@@ -3315,6 +3485,36 @@ async fn run_mcp_typed_argv(
         stdout,
         stderr,
     })
+}
+
+fn mcp_process_argv(
+    command: &str,
+    mut argv: Vec<String>,
+    prefix: &str,
+) -> Result<Vec<String>, CliError> {
+    if prefix != "ve-adrive-cli" {
+        return Ok(argv);
+    }
+    let command_parts = command.split_whitespace().collect::<Vec<_>>();
+    if command_parts.len() < 2 || command_parts[0] != "ve-adrive" {
+        return Err(CliError::ValidationError(
+            "invalid MCP ADrive command path".into(),
+        ));
+    }
+    let command_index = argv
+        .windows(command_parts.len())
+        .position(|parts| {
+            parts
+                .iter()
+                .map(String::as_str)
+                .eq(command_parts.iter().copied())
+        })
+        .ok_or_else(|| {
+            CliError::ValidationError("MCP command path is missing from prepared arguments".into())
+        })?;
+    // [Review Fix #D02Mcp] The direct entrypoint inserts its own ve-adrive prefix; match the full command so a same-named profile/path is not removed.
+    argv.remove(command_index);
+    Ok(argv)
 }
 
 fn string_field<'a>(object: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a str> {
@@ -4096,8 +4296,100 @@ fn completion_check() -> DoctorCheck {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn directory_mcp_rejects_non_boolean_opt_out() {
+        for value in [json!("true"), json!(1), Value::Null] {
+            let arguments = json!({"source":"./src", "destination":"adrive://i/s/prefix/", "recursive":true,
+                                   "disable-dir-object":value});
+            let error = build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                "ve-adrive cp",
+                arguments.as_object().unwrap(),
+            )
+            .expect_err("invalid directory opt-out");
+            assert!(
+                error
+                    .to_string()
+                    .contains("disable-dir-object must be boolean"),
+                "{error}"
+            );
+        }
+    }
+
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn legacy_share_config_keys_canonicalize_only_the_adrive_namespace() {
+        for (source, expected) in [
+            ("share_base_url", "share_endpoint"),
+            (
+                "chosen.adrive.share_base_url",
+                "chosen.adrive.share_endpoint",
+            ),
+            ("chosen.tos.share_base_url", "chosen.tos.share_base_url"),
+            ("chosen.share_base_url", "chosen.share_base_url"),
+            ("chosen.adrive.endpoint", "chosen.adrive.endpoint"),
+        ] {
+            assert_eq!(canonical_adrive_config_key(source), expected);
+        }
+    }
+
+    #[test]
+    fn share_files_mcp_schema_and_argv_use_bounded_max_keys() {
+        let command = "ve-adrive share files";
+        let schema = skill_input_schema(find_capability(command).unwrap());
+        assert_eq!(schema["properties"]["max-keys"]["type"], "integer");
+        assert_eq!(schema["properties"]["max-keys"]["default"], 1000);
+        assert_eq!(schema["properties"]["max-keys"]["minimum"], 1);
+        assert_eq!(schema["properties"]["max-keys"]["maximum"], i32::MAX);
+        assert!(schema["properties"].get("limit").is_none());
+        for max_keys in [1, i32::MAX] {
+            let arguments = json!({"share-url":"https://x.test/share/s","max-keys":max_keys});
+            let argv = build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                command,
+                arguments.as_object().unwrap(),
+            )
+            .unwrap();
+            assert!(argv
+                .windows(2)
+                .any(|pair| pair == ["--max-keys", &max_keys.to_string()]));
+        }
+    }
+
+    #[test]
+    fn share_files_mcp_rejects_invalid_caps_and_legacy_limit() {
+        for max_keys in [
+            json!(0),
+            json!(-1),
+            json!(i64::from(i32::MAX) + 1),
+            json!("5"),
+        ] {
+            let arguments = json!({"share-url":"https://x.test/share/s","max-keys":max_keys});
+            assert!(build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                "ve-adrive share files",
+                arguments.as_object().unwrap(),
+            )
+            .is_err());
+        }
+        let arguments = json!({"share-url":"https://x.test/share/s","limit":1});
+        assert!(build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            "ve-adrive share files",
+            arguments.as_object().unwrap(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn share_download_mcp_has_no_listing_pagination_flags() {
+        let schema = skill_input_schema(find_capability("ve-adrive share download").unwrap());
+        for name in ["max-keys", "marker", "limit"] {
+            assert!(schema["properties"].get(name).is_none());
+        }
+    }
 
     #[test]
     fn share_mcp_management_uri_omits_instance_and_rejects_conflicts() {
@@ -4237,13 +4529,111 @@ mod tests {
     }
 
     #[test]
-    fn share_mcp_schema_preserves_array_integer_boolean_and_file_checkpoint() {
+    fn share_mcp_schema_preserves_array_integer_boolean_and_optional_checkpoint() {
         let list = skill_input_schema(find_capability("ve-adrive share list").unwrap());
         assert_eq!(list["properties"]["creator"]["type"], "array");
         assert_eq!(list["properties"]["limit"]["type"], "integer");
         let download = skill_input_schema(find_capability("ve-adrive share download").unwrap());
-        assert_eq!(download["properties"]["checkpoint"]["type"], "string");
+        assert_eq!(
+            download["properties"]["checkpoint"]["oneOf"],
+            json!([{"type":"boolean"},{"type":"string","minLength":1}])
+        );
         assert_eq!(download["properties"]["password"]["writeOnly"], true);
+    }
+
+    #[test]
+    fn share_download_mcp_checkpoint_preserves_boolean_and_file_forms() {
+        let command = "ve-adrive share download";
+        for checkpoint in [json!(true), json!(false), json!("./legacy.json")] {
+            let arguments = json!({"share-url":"https://example.test/share/s", "destination-dir":"./out", "checkpoint":checkpoint});
+            let argv = build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                command,
+                arguments.as_object().unwrap(),
+            )
+            .unwrap();
+            assert!(!argv.iter().any(|value| value == "true" || value == "false"));
+            assert_eq!(
+                argv.iter().any(|value| value == "--checkpoint"),
+                checkpoint != json!(false)
+            );
+            if checkpoint.is_string() {
+                assert!(argv
+                    .windows(2)
+                    .any(|pair| pair == ["--checkpoint", "./legacy.json"]));
+            }
+        }
+        for checkpoint in [json!(""), json!(3), json!([])] {
+            let arguments = json!({"share-url":"https://example.test/share/s", "destination-dir":"./out", "checkpoint":checkpoint});
+            assert!(build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                command,
+                arguments.as_object().unwrap()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn share_files_manifest_writes_are_disclosed_in_mcp_annotations() {
+        let skill = skill_definitions()
+            .into_iter()
+            .find(|skill| skill.internal_command == "ve-adrive share files")
+            .unwrap();
+        let entry = mcp_tool_entry(skill);
+        assert_eq!(
+            entry
+                .tool
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.read_only_hint),
+            Some(false)
+        );
+        assert!(entry
+            .tool
+            .description
+            .as_ref()
+            .unwrap()
+            .contains("manifest-path"));
+        let description =
+            crate::share_metadata::describe_share_command("ve-adrive share files").unwrap();
+        assert!(description["side_effects"]
+            .to_string()
+            .contains("--manifest-path"));
+    }
+
+    #[test]
+    fn share_download_mcp_validates_transfer_choices_and_positive_concurrency() {
+        let command = "ve-adrive share download";
+        let mut arguments = json!({"share-url":"https://example.test/share/s", "destination-dir":"./out", "batch-concurrency":16, "list-concurrency":4, "multipart-concurrency":4, "progress-granularity":"byte", "overwrite-strategy":"newer", "include-parent":true, "report-failures-only":false});
+        let argv = build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            command,
+            arguments.as_object().unwrap(),
+        )
+        .unwrap();
+        assert!(argv.iter().any(|value| value == "--include-parent"));
+        assert!(!argv.iter().any(|value| value == "--report-failures-only"));
+        for (name, value) in [
+            ("batch-concurrency", json!(0)),
+            ("list-concurrency", json!(-1)),
+            ("multipart-concurrency", json!("4")),
+            ("progress-granularity", json!("unknown")),
+            ("overwrite-strategy", json!("unknown")),
+        ] {
+            let previous = arguments[name].clone();
+            arguments[name] = value;
+            assert!(
+                build_mcp_typed_argv(
+                    &GlobalArgs::default(),
+                    command,
+                    arguments.as_object().unwrap()
+                )
+                .is_err(),
+                "accepted {name}"
+            );
+            arguments[name] = previous;
+        }
     }
     #[test]
     fn share_mcp_keeps_explicit_false_and_removes_url_pwd() {
@@ -4289,6 +4679,38 @@ mod tests {
             .is_err());
         }
     }
+    #[test]
+    fn mcp_execution_adapts_direct_entrypoint_without_removing_same_named_profile() {
+        let argv = [
+            "--profile",
+            "ve-adrive",
+            "--output",
+            "json",
+            "ve-adrive",
+            "share",
+            "download",
+            "http://page.test/share/s",
+            "./out",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            mcp_process_argv(
+                "ve-adrive share download",
+                argv.clone(),
+                "ve-storage-uni-cli ve-adrive"
+            )
+            .unwrap(),
+            argv
+        );
+        let direct =
+            mcp_process_argv("ve-adrive share download", argv.clone(), "ve-adrive-cli").unwrap();
+        assert_eq!(&direct[..4], &argv[..4]);
+        assert_eq!(&direct[4..], &argv[5..]);
+        assert!(mcp_process_argv("", argv.clone(), "ve-adrive-cli").is_err());
+        assert!(mcp_process_argv("ve-adrive files", argv, "ve-adrive-cli").is_err());
+    }
+
     #[test]
     fn cp_mcp_checkpoint_remains_a_boolean_switch() {
         let arguments =
@@ -4347,7 +4769,7 @@ mod tests {
         let config_path = directory.join("config.toml");
         std::fs::write(
             &config_path,
-            "[default.adrive]\nshare_base_url='https://user:must-not-echo@bad.test'\n",
+            "[default.adrive]\nshare_endpoint='https://user:must-not-echo@bad.test'\n",
         )
         .unwrap();
         let global = GlobalArgs {
@@ -4374,7 +4796,7 @@ mod tests {
         let path = directory.join("config.toml");
         std::fs::write(
             &path,
-            "[other.adrive]\nshare_base_url='https://user:must-not-echo@bad.test'\n",
+            "[other.adrive]\nshare_endpoint='https://user:must-not-echo@bad.test'\n",
         )
         .unwrap();
         let config = ConfigFile::load_from(&path).unwrap();
