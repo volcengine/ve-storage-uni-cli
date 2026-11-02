@@ -14,6 +14,9 @@ import threading
 from urllib.parse import parse_qs, urlsplit
 
 
+from share_download_regression import transfer_paths
+
+
 class DownloadScenario(http.server.BaseHTTPRequestHandler):
     mode = "denied"
     requests = []
@@ -89,7 +92,7 @@ def invoke(binary, root, origin, mode, presentation=("table", None)):
     destination = root / f"{mode}-{output}-{bool(query)}"
     result = subprocess.run([str(binary), *prefix, "share", "download", f"{origin}/share/s",
         str(destination), *selector, "--output", output, *expression,
-        "--config-path", str(root / "missing-config"), "--credentials-path", str(root / "missing-credentials")],
+        *transfer_paths(root)],
         env=environment, text=True, capture_output=True, timeout=15)
     assert "fixture-access-token" not in result.stdout + result.stderr
     return result, destination
@@ -97,7 +100,7 @@ def invoke(binary, root, origin, mode, presentation=("table", None)):
 
 def check_empty_and_single(binary, root, origin):
     empty, destination = invoke(binary, root, origin, "empty")
-    assert empty.returncode == 0 and (destination / "tree/sub").is_dir()
+    assert empty.returncode == 0 and (destination / "sub").is_dir()
     assert "complete" in empty.stdout and "summary.total" in empty.stdout, "empty download hid its summary"
     single, destination = invoke(binary, root, origin, "single")
     assert single.returncode == 0 and (destination / "a.txt").read_bytes() == b"abc"
@@ -114,10 +117,10 @@ def check_denial(binary, root, origin):
     envelope = json.loads(result.stdout)
     assert envelope["ec"] == "Forbidden.ShareDownloadDisabled" and envelope["status_code"] == 403
     assert envelope["request_id"] == "fixture-denial-id" and envelope["data"]["IssuanceOutcomeUnknown"] is False
-    assert envelope["data"]["Summary"] == {"Total": 41, "Completed": 0, "Failed": 1, "Pending": 40, "Skipped": 0}
+    assert envelope["data"]["Summary"] == {"Total": 41, "Completed": 0, "Failed": 41, "Pending": 0, "Skipped": 0}
     assert "share owner" in envelope["error"]["suggested_action"] and "--permission download" in envelope["error"]["suggested_action"]
     assert "refresh credentials" not in envelope["error"]["suggested_action"]
-    assert "download is disabled" in envelope["error"]["message"]
+    assert "permission" in envelope["error"]["message"] and "quota" in envelope["error"]["message"]
     selected, _destination = invoke(binary, root, origin, "denied", ("table", "data.Files[].{name:Path,result:Status}"))
     assert "name" in selected.stdout and "result" in selected.stdout and "data.Summary" not in selected.stdout
 

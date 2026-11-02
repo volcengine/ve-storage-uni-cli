@@ -144,14 +144,26 @@ WinGet publishing from macOS uses generated YAML manifests plus a GitHub pull
 request to `microsoft/winget-pkgs`. Authenticate `gh` with a GitHub account that
 can push to your `winget-pkgs` fork before opening the PR.
 
-| Stage                 | Required tools                                  | Notes                                                                                                                                                              |
-|-----------------------|-------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Archives and Cargo    | Rust toolchain, `cargo`, requested Rust targets | Install extra targets with `rustup target add <triple>` when cross-building. `release.py archives` selects the required backend tool for each target.             |
-| GitHub Release assets | GitHub CLI (`gh`)                               | `github-release --execute` runs `gh release create`, `gh release upload`, and in auto mode `gh release view`. Authenticate with `gh auth login` or `GITHUB_TOKEN`. |
-| npm packages          | Node.js, `npm`                                  | `npm --execute-publish` requires npm registry auth.                                                                                                                |
-| PyPI wheels           | Python 3, `build`, `twine`, `setuptools`, `wheel` | Install with `python3 -m pip install --upgrade build twine setuptools wheel`; upload uses Twine credentials or `TWINE_*` env vars.                                  |
-| Homebrew Formulae     | `git`, access to the source repository checkout | The generator writes Ruby formulae into `Formula/`; use `--tap-dir .` for this repository, and only add commit/push flags when this checkout should publish directly. |
-| WinGet manifests      | Python 3, `git`, GitHub CLI (`gh`)              | Manifest generation writes `dist/winget` and can run on macOS; publish by copying those files into a `winget-pkgs` fork and opening a PR.                         |
+| Stage                 | Required tools                                    | Notes                                                                                                                                                                 |
+|-----------------------|---------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Archives and Cargo    | Rust toolchain, `cargo`, requested Rust targets   | Install extra targets with `rustup target add <triple>` when cross-building. `release.py archives` selects the required backend tool for each target.                 |
+| GitHub Release assets | GitHub CLI (`gh`)                                 | `github-release --execute` runs `gh release create`, `gh release upload`, and in auto mode `gh release view`. Authenticate with `gh auth login` or `GITHUB_TOKEN`.    |
+| npm packages          | Node.js, `npm`                                    | `npm --execute-publish` requires npm registry auth.                                                                                                                   |
+| PyPI wheels           | Python 3, `build`, `twine`, `setuptools`, `wheel` | Install with `python3 -m pip install --upgrade build twine setuptools wheel`; upload uses Twine credentials or `TWINE_*` env vars.                                    |
+| Homebrew Formulae     | `git`, access to the source repository checkout   | The generator writes Ruby formulae into `Formula/`; use `--tap-dir .` for this repository, and only add commit/push flags when this checkout should publish directly. |
+| WinGet manifests      | Python 3, `git`, GitHub CLI (`gh`)                | Manifest generation writes `dist/winget` and can run on macOS; publish by copying those files into a `winget-pkgs` fork and opening a PR.                             |
+
+Source builds use reqwest 0.13 with Rustls/AWS-LC and require the target's native C
+build toolchain in addition to Rust; some AWS-LC configurations also require
+CMake. Cross-build runners must provide the matching native toolchain. Release
+binaries validate HTTPS through platform certificate facilities; Linux images
+must include their system CA bundle (usually the `ca-certificates` package).
+
+For TLS regression checks, run `cargo test -p tos-core --test test_tls`. After
+building the unified and three dedicated debug binaries into `target/debug`,
+run `python3 tests/http_tls_regression.py` to check untrusted-CA rejection on all
+six command surfaces. An opt-in, credential-free system-trust probe is available:
+`VE_STORAGE_TLS_TEST_URL=https://example.com cargo test -p tos-core --test test_tls platform_and_sdk_clients_accept_system_trusted_https -- --ignored --exact`.
 
 For local smoke runs, omit execute/upload flags and the script prints the
 registry commands without publishing. For `all --publish`, the runner needs all
@@ -231,6 +243,20 @@ the artifact directory mapping.
 Use repeated `--binary-dir <dir>` instead of `--target` only when the binaries
 come from non-standard directories.
 
+For publish homebrew formulae, execute the following command:
+
+```bash
+python3 packaging/scripts/release.py homebrew --version <version> --checksums dist/SHA256SUMS --tap-dir .
+```
+
+The command above writes `Formula/*.rb` into the current source checkout. If
+your local checkout is synchronized to the public GitHub repository by another
+process, let that process publish the Formula files. If this checkout pushes
+directly to GitHub, add `--commit --push`.
+
+For local or single-architecture tap validation, add `--target <triple>` to
+limit formula generation to one macOS archive target.
+
 Generate WinGet manifests after Windows archive checksums exist:
 
 ```bash
@@ -304,19 +330,7 @@ Publish Homebrew Formulae into the source repository after `SHA256SUMS` exists.
 Homebrew formulae are macOS-only, so the generator reads only the
 `aarch64-apple-darwin` and `x86_64-apple-darwin` archive checksums. This uses
 `volcengine/ve-storage-uni-cli` itself as a custom tap by keeping formula files
-under the repository root `Formula/` directory:
-
-```bash
-python3 packaging/scripts/release.py homebrew --version <version> --checksums dist/SHA256SUMS --tap-dir .
-```
-
-The command above writes `Formula/*.rb` into the current source checkout. If
-your local checkout is synchronized to the public GitHub repository by another
-process, let that process publish the Formula files. If this checkout pushes
-directly to GitHub, add `--commit --push`.
-
-For local or single-architecture tap validation, add `--target <triple>` to
-limit formula generation to one macOS archive target.
+under the repository root `Formula/` directory, which is already done in "Build package wrappers" section.
 
 Users install through an explicit tap URL once, then install by formula name:
 

@@ -15,6 +15,9 @@ from urllib.parse import urlsplit
 from share_download_display_regression import DownloadScenario
 
 
+from share_download_regression import transfer_paths
+
+
 class ProgressScenario(DownloadScenario):
     content_started = threading.Event()
     can_finish = threading.Event()
@@ -59,8 +62,7 @@ def download_arguments(binary, root, origin, mode):
     prefix = [] if binary.stem == "ve-adrive-cli" else ["ve-adrive"]
     selector = [] if mode in ("single", "interrupt") else ["--path", "tree/", "--recursive"]
     return [str(binary), *prefix, "share", "download", f"{origin}/share/s", str(root / "out"),
-        *selector, "--checkpoint", str(root / "checkpoint"), "--config-path", str(root / "missing-config"),
-        "--credentials-path", str(root / "missing-credentials")]
+        *selector, "--checkpoint", str(root / "checkpoint"), *transfer_paths(root)]
 
 
 def drain_terminal(master, captured):
@@ -117,20 +119,35 @@ def invoke(binary, root, origin, case):
 
 
 def check_controls(binary, root, origin):
-    cases = [([], True, True), (["--no-progress"], True, False), (["--quiet"], True, False),
-             ([], False, False), (["--progress"], False, True)]
-    for index, (flags, is_terminal, is_visible) in enumerate(cases):
+    cases = [([], True, True, True), (["--no-progress"], True, False, True),
+             (["--quiet"], True, False, False), ([], False, False, False),
+             (["--progress"], False, True, False),
+             (["--list-echo", "--no-progress"], False, False, True),
+             (["--no-list-echo"], True, True, False),
+             (["--list-echo", "--quiet"], False, False, False),
+             (["--list-echo", "--dry-run"], False, False, True),
+             (["--no-list-echo", "--dry-run"], False, False, False),
+             (["--list-echo", "--quiet", "--dry-run"], False, False, False),
+             (["--list-echo", "--progress", "--dry-run"], False, False, True)]
+    for index, (flags, is_terminal, is_transfer_visible, is_scan_visible) in enumerate(cases):
         selected = root / f"control-{index}"
         selected.mkdir()
         code, output, errors = invoke(binary, selected, origin, ("single", ["--output", "json", *flags], is_terminal))
         assert code == 0, (output, errors)
-        assert ("ve-adrive share download" in errors) == is_visible, "missing or unexpected stderr progress"
+        has_transfer = "0/1" in errors or "1/1" in errors
+        has_scan = "ve-adrive share download plan" in errors
+        assert has_transfer == is_transfer_visible, ("unexpected transfer progress", flags, errors)
+        assert has_scan == is_scan_visible, ("unexpected listing echo", flags, errors)
         assert "fixture-access-token" not in output + errors and "\x1b" not in output
-        if output:
-            envelope = json.loads(output)
+        envelope = json.loads(output)
+        if "--dry-run" in flags:
+            assert envelope["data"]["selection"]["DownloadsIssued"] == 0
+            assert not any("get_download_url" in path or urlsplit(path).path == "/content" for path in ProgressScenario.requests)
+            assert not (selected / "out").exists()
+            assert not (selected / "report.csv").exists() and not (selected / "manifest.csv").exists()
+        else:
             assert envelope["data"]["Summary"] == {"Total": 1, "Completed": 1, "Failed": 0, "Pending": 0, "Skipped": 0}
         if index == 0:
-            assert "0/1" in errors or "1/1" in errors, "scanning appeared without transfer progress"
             paths = [urlsplit(path).path for path in ProgressScenario.requests]
             assert paths == ["/v1/share_link/get_by_anonymous", "/v1/share_link/get_access_token",
                              "/v1/share_file/list", "/v1/share_file/get_download_url", "/content"], paths
@@ -172,8 +189,8 @@ def check_recursive_success(binary, root, origin):
     selected.mkdir()
     code, output, errors = invoke(binary, selected, origin, ("tree-success", ["--output", "table"], True))
     assert code == 0 and table_values(output)["summary.succeeded"] == "2"
-    assert (selected / "out/tree/a.txt").read_bytes() == b"abc"
-    assert (selected / "out/tree/sub/b.txt").read_bytes() == b"abc"
+    assert (selected / "out/a.txt").read_bytes() == b"abc"
+    assert (selected / "out/sub/b.txt").read_bytes() == b"abc"
     assert "0/2" in errors or "1/2" in errors, "recursive transfer progress was missing"
 
 
@@ -183,21 +200,25 @@ def check_invalid_resume(binary, root, origin):
     code, _output, _errors = invoke(binary, selected, origin, ("single", ["--output", "json"], False))
     assert code == 0
     checkpoint = (selected / "checkpoint").read_bytes()
+    ledger_path = selected / "checkpoint.completed/ledger.bin"
+    ledger = ledger_path.read_bytes()
     destination = selected / "out/a.txt"
     destination.write_bytes(b"xyz")
     code, output, _errors = invoke(binary, selected, origin, ("single", ["--resume", "--output", "table"], True))
     fields = table_values(output)
     assert code != 0 and fields["data.summary.succeeded"] == fields["data.summary.skipped"] == "0"
     assert fields["data.summary.failed"] == "1"
-    assert (selected / "checkpoint").read_bytes() == checkpoint
+    assert (selected / "checkpoint").read_bytes() == checkpoint and ledger_path.read_bytes() == ledger
     assert not any("get_download_url" in path for path in ProgressScenario.requests)
     destination.unlink()
     destination.symlink_to(selected / "missing-target")
     code, output, _errors = invoke(binary, selected, origin, ("single", ["--resume", "--output", "table"], True))
     fields = table_values(output)
     assert code != 0 and fields["data.summary.succeeded"] == fields["data.summary.skipped"] == "0"
-    assert fields["data.summary.pending"] == "1"
-    assert (selected / "checkpoint").read_bytes() == checkpoint
+    assert code == 9 and fields["ec"] == "Conflict"
+    assert fields["data.summary.failed"] == "1" and fields["data.summary.pending"] == "0", fields
+    assert destination.is_symlink() and not (selected / "missing-target").exists()
+    assert (selected / "checkpoint").read_bytes() == checkpoint and ledger_path.read_bytes() == ledger
     assert not any("share_file/get" in path for path in ProgressScenario.requests)
 
 

@@ -5,6 +5,8 @@ All credentials below are synthetic test values; no user profile or cloud servic
 """
 import datetime
 import http.server
+import hashlib
+import shutil
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,9 @@ import sys
 import tempfile
 import threading
 from urllib.parse import parse_qs, urlsplit
+
+
+from share_download_regression import transfer_paths
 
 
 class Receipt(http.server.BaseHTTPRequestHandler):
@@ -111,9 +116,10 @@ def invoke(binary, prefix, root, arguments, password=None):
     # A configured/environment default must not silently opt a receiver into OAuth.
     environment["ADRIVE_AUTH_MODE"] = "oauth"
     profile = [] if "--profile" in arguments else ["--profile", "receiver"]
+    artifacts = transfer_paths(root, False) if arguments[:2] == ["share", "download"] else []
     result = subprocess.run(
         [str(binary), *prefix, "--config-path", str(root / "config"), "--credentials-path",
-         str(root / "credentials"), *profile, "--output", "json", *arguments],
+         str(root / "credentials"), *profile, "--output", "json", *arguments, *artifacts],
         input=password, text=True, capture_output=True, timeout=15, env=environment)
     for secret in ("fixture-account", "fixture-new-account", "fixture-password", "fixture-share-token", "fixture-signature"):
         assert secret not in result.stdout + result.stderr, "secret leaked from receipt"
@@ -140,7 +146,7 @@ def check_modes(binary, prefix, root, url, endpoint):
 
 
 def check_pages(binary, prefix, root, url):
-    arguments = ["share", "files", url, "--auth-mode", "oauth", "--password-stdin", "--path", "docs/", "--limit", "1"]
+    arguments = ["share", "files", url, "--auth-mode", "oauth", "--password-stdin", "--path", "docs/", "--max-keys", "1"]
     for marker in (None, "second-page"):
         result, envelope = invoke(binary, prefix, root, arguments + (["--marker", marker] if marker else []), "fixture-password\n")
         assert result.returncode == 0
@@ -173,6 +179,27 @@ def check_download(binary, prefix, root, url):
     result, envelope = invoke(binary, prefix, root, arguments + ["--resume", "--profile", "other"], "fixture-password\n")
     assert result.returncode != 0 and not envelope["success"]
     assert signed_count() == before + 1
+
+
+def check_read_only_plan(binary, prefix, root, url):
+    arguments = ["share", "download", url, str(root / "planned-out"), "--auth-mode", "oauth",
+                 "--password-stdin", "--path", "a.txt", "--dry-run"]
+    saved = (root / "credentials").read_bytes()
+    entries = set(root.iterdir())
+    before = signed_count()
+    result, envelope = invoke(binary, prefix, root, arguments, "fixture-password\n")
+    assert result.returncode == 0 and envelope["data"]["selection"]["FileCount"] == 1, envelope
+    assert signed_count() == before and set(root.iterdir()) == entries
+    assert (root / "credentials").read_bytes() == saved
+    expired = saved.decode().replace("expires_at='", "expires_at='2000-01-01T00:00:00Z' # ")
+    (root / "credentials").write_text(expired)
+    start = len(Receipt.requests)
+    try:
+        result, envelope = invoke(binary, prefix, root, arguments, "fixture-password\n")
+        assert result.returncode != 0 and len(Receipt.requests) == start, envelope
+        assert (root / "credentials").read_text() == expired and set(root.iterdir()) == entries
+    finally:
+        (root / "credentials").write_bytes(saved)
 
 
 def check_refresh(binary, prefix, root, url):
@@ -248,11 +275,20 @@ def check_legacy_api(binary, prefix, root, endpoint):
     assert result.returncode == 0
     journal = json.loads((root / "legacy-journal").read_text())
     journal["identity"].pop("api_origin")
+    journal["identity"].pop("selection_policy", None)
+    journal["manifest"].pop("policy", None)
+    journal.pop("completion_ledger", None)
+    journal["completed"] = [hashlib.sha256((root / "legacy" / entry["local"]).read_bytes()).hexdigest()
+                            for entry in journal["manifest"]["files"]]
+    # A genuine pre-ledger snapshot embeds its verified completions in the JSON.
+    shutil.rmtree(root / "legacy-journal.completed")
     (root / "legacy-journal").write_text(json.dumps(journal))
     before = signed_count()
-    result, _envelope = invoke(binary, prefix, root, arguments + ["--resume"], "fixture-password\n")
-    assert result.returncode == 0 and signed_count() == before
-    assert json.loads((root / "legacy-journal").read_text())["identity"]["api_origin"] == endpoint
+    result, envelope = invoke(binary, prefix, root, arguments + ["--resume"], "fixture-password\n")
+    assert result.returncode == 0 and signed_count() == before, envelope
+    assert json.loads((root / "legacy-journal").read_text())["identity"].get("api_origin") == endpoint
+    result, envelope = invoke(binary, prefix, root, arguments + ["--resume"], "fixture-password\n")
+    assert result.returncode == 0 and signed_count() == before, envelope
 
 
 def check_no_io(binary, prefix, root, url):
@@ -261,7 +297,9 @@ def check_no_io(binary, prefix, root, url):
     start = len(Receipt.requests)
     for action in ("inspect", "files", "download"):
         arguments = ["share", action, url] + ([str(root / "dry-out")] if action == "download" else [])
-        for flag in ("--dry-run", "--describe"):
+        # [Review Fix #D02] Download planning now resolves the explicitly selected OAuth profile and performs metadata I/O.
+        flags = ("--describe",) if action == "download" else ("--dry-run", "--describe")
+        for flag in flags:
             result, _envelope = invoke(binary, prefix, root, arguments + ["--auth-mode", "oauth", flag])
             assert result.returncode == 0 and len(Receipt.requests) == start
     assert not (root / "dry-out").exists()
@@ -292,6 +330,7 @@ def check_binary(binary, prefix, endpoint, auth_endpoint):
         check_modes(binary, prefix, root, url, endpoint)
         check_pages(binary, prefix, root, url)
         check_download(binary, prefix, root, url)
+        check_read_only_plan(binary, prefix, root, url)
         check_applied_subject(binary, prefix, root, url)
         check_instance_snapshot(binary,prefix,root)
         check_refresh(binary, prefix, root, url)

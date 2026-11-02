@@ -726,7 +726,8 @@ impl TosClient {
     pub fn object_request_path(&self, bucket: &str, key: &str) -> Result<String, CliError> {
         validate_bucket_name(bucket)?;
         if self.sign_algorithm == TosSignAlgorithm::ByteTosV1 {
-            return Ok(format!("/{}/{}", bucket, encoded_object_key_path(key)));
+            // [Review Fix #TosV1RawPath] Go V1 signs URL.Path; escaping belongs only to the HTTP URL.
+            return Ok(format!("/{}/{}", bucket, key));
         }
         let is_path_style = self
             .endpoint
@@ -1293,8 +1294,11 @@ impl TosClient {
         };
         let bucket = bucket_from_bytetos_request_path(path)?;
         let addr = resolver.resolve_addr(&bucket).await?;
+        // [Review Fix #TosV1PsmPath] Resolve the host without rebuilding the wire URL from the raw signing path.
+        let parsed_url = url::Url::parse(url)
+            .map_err(|error| CliError::ValidationError(format!("Invalid URL: {error}")))?;
         Ok(ResolvedRequestTarget {
-            url: bytetos_psm_url(addr, path),
+            url: bytetos_psm_url(addr, parsed_url.path()),
             psm_selection: Some(PsmSelection { bucket, addr }),
         })
     }
@@ -2553,13 +2557,40 @@ mod tests {
     }
 
     #[test]
-    fn bytetos_v1_signs_the_encoded_wire_path() {
+    fn bytetos_v1_signs_the_raw_object_path() {
         let client = endpoint_test_client(TosSignAlgorithm::ByteTosV1);
+        for key in ["dir/%DLQ%", "literal-%25/a%2Fb", "中文/空 格+?#.txt"] {
+            assert_eq!(
+                client
+                    .object_request_path("bucket", key)
+                    .expect("object path"),
+                format!("/bucket/{key}")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bytetos_v1_psm_preserves_encoded_url_separately_from_raw_signing_path() {
+        let profile = Profile {
+            region: Some("cn-boe".to_string()),
+            access_key_id: Some("ak".to_string()),
+            secret_access_key: Some("sk".to_string()),
+            psm: Some("tos.example.service".to_string()),
+            ..Default::default()
+        };
+        let client = with_test_tosapi_addr(Some("127.0.0.1:1".to_string()), || {
+            TosClient::new_with_sign_algorithm(&profile, "tos", TosSignAlgorithm::ByteTosV1)
+                .expect("client")
+        });
+        let key = "中文/空 格+%25%2F?#.txt/";
+        let endpoint = client.object_endpoint("bucket", key).expect("endpoint");
+        let target = client
+            .resolve_request_target(&endpoint, &format!("/bucket/{key}"))
+            .await
+            .expect("resolved URL");
         assert_eq!(
-            client
-                .object_request_path("bucket", "dir/%DLQ%")
-                .expect("object path"),
-            "/bucket/dir/%25DLQ%25"
+            target.url,
+            "http://127.0.0.1:1/bucket/%E4%B8%AD%E6%96%87/%E7%A9%BA%20%E6%A0%BC%2B%2525%252F%3F%23.txt/"
         );
     }
 

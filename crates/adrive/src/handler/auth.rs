@@ -28,7 +28,7 @@ use tos_core::infra::credentials::{CredentialsFile, StoredOAuthCredentials};
 use crate::cli::auth::{AuthAction, AuthCommand, LoginArgs};
 use crate::cli::ADriveAuthArgs;
 use crate::domain::auth::{resolve_oauth_client_id, AuthMode, ResolvedAuthMode, OAUTH_SCOPE};
-use crate::domain::client::{normalize_endpoint_scheme, ClientOptions};
+use crate::domain::client::ClientOptions;
 use crate::domain::oauth::{
     DeviceAuthorizationRequest, DeviceAuthorizationResponse, DeviceTokenOutcome, OAuthClient,
     OAuthClientError, OAuthFailure, TokenResponse,
@@ -45,7 +45,6 @@ struct LoginSettings {
     client_id: String,
     instance_id: String,
     device_name: String,
-    resource_endpoint: Option<String>,
     client_options: ClientOptions,
 }
 
@@ -232,7 +231,6 @@ async fn handle_login(
         std::sync::Arc::clone(&global.request_trace),
     )
     .map_err(map_oauth_client_error)?;
-    reject_matching_resource_origin(&oauth_client, settings.resource_endpoint.as_deref())?;
     if global.dry_run {
         return output_login_dry_run(global, &settings, oauth_client.endpoint().as_str());
     }
@@ -379,20 +377,20 @@ fn resolve_login_settings(
         // error contract recommends the login command instead of config init.
         CliError::ConfigMissing("[oauth_instance_required] ADrive OAuth instance is required; use --instance, profile default_instance, or ADRIVE_DEFAULT_INSTANCE".to_string())
     })?;
+    let resource_endpoint = resolve_resource_endpoint(global, adrive);
     let auth_endpoint = resolve_login_auth_endpoint_value(
         args.auth_endpoint.clone(),
         adrive.and_then(|settings| settings.auth_endpoint.clone()),
         std::env::var("ADRIVE_AUTH_ENDPOINT").ok(),
+        resource_endpoint,
     )?;
     let device_name = validate_device_name(resolve_device_name(args.device_name.clone()))?;
-    let resource_endpoint = resolve_resource_endpoint(global, adrive);
     let client_options = oauth_client_options(profile, adrive);
     Ok((
         LoginSettings {
             client_id: resolve_oauth_client_id(),
             instance_id,
             device_name,
-            resource_endpoint,
             client_options,
         },
         auth_endpoint,
@@ -403,10 +401,12 @@ fn resolve_login_auth_endpoint_value(
     command_line_value: Option<String>,
     config_value: Option<String>,
     environment_value: Option<String>,
+    resource_endpoint: Option<String>,
 ) -> Result<String, CliError> {
-    first_nonempty([command_line_value, config_value, environment_value]).ok_or_else(|| {
+    // [Review Fix #OAuthEndpoint1] Explicit Auth sources override the effective Resource endpoint fallback.
+    first_nonempty([command_line_value, config_value, environment_value, resource_endpoint]).ok_or_else(|| {
         CliError::ConfigMissing(
-            "[oauth_auth_endpoint_required] ADrive OAuth auth endpoint is required; use --auth-endpoint, [profile.adrive].auth_endpoint, or ADRIVE_AUTH_ENDPOINT"
+            "[oauth_auth_endpoint_required] ADrive OAuth endpoint is required; configure endpoint or use --auth-endpoint, [profile.adrive].auth_endpoint, or ADRIVE_AUTH_ENDPOINT"
                 .to_string(),
         )
     })
@@ -423,10 +423,13 @@ pub(crate) fn has_configured_login_auth_endpoint(global: &GlobalArgs) -> Result<
             config_path.display()
         )));
     }
-    let config_value = profile
-        .and_then(|profile| profile.adrive.as_ref())
-        .and_then(|settings| settings.auth_endpoint.clone());
-    Ok(first_nonempty([config_value, std::env::var("ADRIVE_AUTH_ENDPOINT").ok()]).is_some())
+    let adrive = profile.and_then(|profile| profile.adrive.as_ref());
+    Ok(first_nonempty([
+        adrive.and_then(|settings| settings.auth_endpoint.clone()),
+        std::env::var("ADRIVE_AUTH_ENDPOINT").ok(),
+        resolve_resource_endpoint(global, adrive),
+    ])
+    .is_some())
 }
 
 fn resolve_resource_endpoint(
@@ -508,15 +511,11 @@ fn validate_device_authorization(
 fn validate_verification_url(value: &str) -> Result<(), CliError> {
     let url = reqwest::Url::parse(value)
         .map_err(|_| invalid_oauth_response("verification URI must be an absolute URL"))?;
-    let is_loopback = url.host().is_some_and(|host| match host {
-        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
-        url::Host::Ipv4(address) => address.is_loopback(),
-        url::Host::Ipv6(address) => address.is_loopback(),
-    });
-    let is_safe_scheme = url.scheme() == "https" || (url.scheme() == "http" && is_loopback);
+    // [Review Fix #OAuthEndpoint2] Preserve service-provided HTTP(S) verification routes for HTTP deployments.
+    let is_safe_scheme = matches!(url.scheme(), "http" | "https") && url.host_str().is_some();
     if !is_safe_scheme || !url.username().is_empty() || url.password().is_some() {
         return Err(invalid_oauth_response(
-            "verification URI must use HTTPS without userinfo",
+            "verification URI must use HTTP or HTTPS without userinfo",
         ));
     }
     Ok(())
@@ -720,31 +719,6 @@ fn require_oauth_mode(mode: AuthMode, action: &str) -> Result<(), CliError> {
     )))
 }
 
-fn reject_matching_resource_origin(
-    auth_client: &OAuthClient,
-    resource_endpoint: Option<&str>,
-) -> Result<(), CliError> {
-    let Some(resource_endpoint) = resource_endpoint else {
-        return Ok(());
-    };
-    let resource_endpoint = normalize_endpoint_scheme(resource_endpoint);
-    let resource = reqwest::Url::parse(&resource_endpoint).map_err(|_| {
-        CliError::ValidationError("ADrive resource endpoint must be an absolute URL".to_string())
-    })?;
-    if same_origin(auth_client.endpoint(), &resource) {
-        return Err(CliError::ValidationError(
-            "ADrive auth endpoint and resource endpoint must use different origins".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn same_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
-    left.scheme() == right.scheme()
-        && left.host_str() == right.host_str()
-        && left.port_or_known_default() == right.port_or_known_default()
-}
-
 fn map_oauth_client_error(error: OAuthClientError) -> CliError {
     match error {
         OAuthClientError::OAuth(failure) => map_oauth_failure(failure),
@@ -799,28 +773,18 @@ mod tests {
     use tos_core::infra::credentials::CredentialsFile;
 
     use super::{
-        handle_auth_command, login_instruction_lines, reject_matching_resource_origin,
-        validate_device_authorization, validated_login, LoginSettings, PollingSchedule,
+        handle_auth_command, login_instruction_lines, validate_device_authorization,
+        validated_login, LoginSettings, PollingSchedule,
     };
     use crate::cli::auth::{AuthAction, AuthCommand, LoginArgs};
     use crate::cli::ADriveAuthArgs;
     use crate::domain::auth::AuthMode;
     use crate::domain::client::ClientOptions;
-    use crate::domain::oauth::OAuthClient;
     use crate::domain::oauth::{DeviceAuthorizationResponse, TokenResponse};
 
     #[test]
-    fn bare_resource_endpoint_is_normalized_for_origin_validation() {
-        let auth_client = OAuthClient::new(
-            "https://idsauth.volces.com".to_string(),
-            ClientOptions::default(),
-        )
-        .expect("auth endpoint should be valid");
-
-        let error = reject_matching_resource_origin(&auth_client, Some("idsauth.volces.com"))
-            .expect_err("bare resource endpoint should resolve to the same HTTPS origin");
-
-        assert!(error.to_string().contains("must use different origins"));
+    fn verification_url_accepts_explicit_public_http() {
+        assert!(super::validate_verification_url("http://login.example.test/authorize").is_ok());
     }
 
     #[test]
@@ -941,8 +905,8 @@ mod tests {
     }
 
     #[test]
-    fn login_auth_endpoint_requires_an_explicit_source() {
-        let error = super::resolve_login_auth_endpoint_value(None, None, None).unwrap_err();
+    fn login_auth_endpoint_requires_auth_or_resource_source() {
+        let error = super::resolve_login_auth_endpoint_value(None, None, None, None).unwrap_err();
 
         assert!(error.to_string().contains("oauth_auth_endpoint_required"));
         assert!(error.to_string().contains("ADRIVE_AUTH_ENDPOINT"));
@@ -955,6 +919,7 @@ mod tests {
                 Some("https://cli.example.com".to_string()),
                 Some("https://config.example.com".to_string()),
                 Some("https://env.example.com".to_string()),
+                Some("https://resource.example.com".to_string()),
             )
             .unwrap(),
             "https://cli.example.com"
@@ -967,7 +932,6 @@ mod tests {
             client_id: "client-1".to_string(),
             instance_id: "inst-1".to_string(),
             device_name: "test-device".to_string(),
-            resource_endpoint: None,
             client_options: ClientOptions::default(),
         };
         let endpoint = reqwest::Url::parse("https://auth.example.com").unwrap();
@@ -993,7 +957,6 @@ mod tests {
             client_id: "client-1".to_string(),
             instance_id: "inst-1".to_string(),
             device_name: "test-device".to_string(),
-            resource_endpoint: None,
             client_options: ClientOptions::default(),
         };
         let endpoint = reqwest::Url::parse("https://auth.example.com").unwrap();

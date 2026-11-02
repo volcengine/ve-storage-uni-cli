@@ -86,7 +86,11 @@ mod tests {
                 share_url,
                 path: Some("docs/".into()),
                 marker: Some("previous-page".into()),
-                limit: Some(2),
+                max_keys: 2,
+                human_readable: false,
+                sort: None,
+                columns: None,
+                manifest_path: None,
                 is_password_stdin: false,
             })),
         }
@@ -102,11 +106,14 @@ mod tests {
                 is_overwrite: false,
                 is_password_stdin: false,
                 checkpoint: Some(directory.join("journal.json").to_string_lossy().into()),
+                report_path: Some(directory.join("report.csv").to_string_lossy().into()),
+                manifest_path: Some(directory.join("manifest.csv").to_string_lossy().into()),
                 is_resume: false,
                 checkpoint_threshold: None,
                 multipart_concurrency: None,
                 is_progress: false,
                 is_no_progress: false,
+                ..Default::default()
             })),
         }
     }
@@ -254,10 +261,7 @@ mod tests {
                 200,
                 r#"{"AccessToken":"receiver-share-token","ExpiresIn":60}"#,
             ),
-            reply(
-                200,
-                r#"{"Files":[],"Folders":[],"NextMarker":"next-page","IsTruncated":true}"#,
-            ),
+            reply(200, r#"{"Files":[],"Folders":[],"IsTruncated":false}"#),
         ]);
         let (global, directory) = oauth_config(&fixture.endpoint);
         let result = super::super::share::handle_share_command(

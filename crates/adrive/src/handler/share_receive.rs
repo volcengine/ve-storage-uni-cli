@@ -1,29 +1,20 @@
 //! Public share receiver runtime with explicit OAuth opt-in.
-use super::common::{map_ids_error, output_result, output_result_with_columns};
-use super::high_level::{
-    adrive_ls_file_entry, adrive_ls_folder_entry, normalize_ls_files_and_folders,
-    FILE_TABLE_COLUMNS,
-};
+use super::common::{map_ids_error, output_result};
 use crate::cli::share::*;
 use crate::cli::ADriveAuthArgs;
 use crate::domain::{
-    client::ClientOptions,
+    client::{ClientOptions, Error},
     share_access::{ShareClient, ShareSession},
     share_types::{GetShareAccessTokenInput, ShareLinkInfo, ShareListFilesInput},
     share_url::{derive_share_api_origin, parse_share_url, ParsedShareUrl},
-    types::ListFilesOutput,
 };
 use serde_json::{json, Value};
 use std::fmt;
 use std::time::{Duration, Instant};
-use tos_core::agent::{
-    envelope::{Envelope, PaginationInfo},
-    error::CliError,
-    global_args::GlobalArgs,
-    output::OutputFormat,
-};
+use tos_core::agent::{envelope::Envelope, error::CliError, global_args::GlobalArgs};
 
 /// Receiver state keeps its selected client, a bounded secret and an expiring share session.
+#[derive(Clone)]
 pub(crate) struct ShareReceiver {
     pub(crate) identity: ParsedShareUrl,
     pub(crate) client: ShareClient,
@@ -31,6 +22,9 @@ pub(crate) struct ShareReceiver {
     pub(crate) expires_at: Option<Instant>,
     password: Option<String>,
     pub(crate) auth_context: Option<super::share_receiver_auth::ReceiverContext>,
+    is_share_all_files: Option<bool>,
+    has_space_root: bool,
+    has_probed_space_root: bool,
 }
 impl fmt::Debug for ShareReceiver {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -61,6 +55,9 @@ impl ShareReceiver {
             expires_at: None,
             password: None,
             auth_context: None,
+            is_share_all_files: None,
+            has_space_root: false,
+            has_probed_space_root: false,
         })
     }
 
@@ -111,6 +108,8 @@ impl ShareReceiver {
         info: &ShareLinkInfo,
         is_password_stdin: bool,
     ) -> Result<(), CliError> {
+        self.is_share_all_files = info.is_share_all_files;
+        self.has_space_root = info.is_share_all_files == Some(true);
         self.password = if is_password_stdin {
             Some(super::share_password::read_password_stdin().await?)
         } else if let Some(password) = &self.identity.password {
@@ -175,12 +174,65 @@ impl ShareReceiver {
             .clone()
             .ok_or_else(|| CliError::ValidationError("share receiver is not authorized".into()))
     }
+
+    /// List one authenticated page, using `/` for a confirmed whole-Space root.
+    /// Only an exact virtual-root scope denial with absent metadata permits one read-only probe.
+    /// Preserves service errors, session renewal and the caller's cursor/limit.
+    pub(crate) async fn list_page(
+        &mut self,
+        mut input: ShareListFilesInput,
+    ) -> Result<crate::domain::types::ListFilesOutput, CliError> {
+        let is_virtual_root = input.list_root == Some(true) && input.prefix.is_none();
+        if is_virtual_root && self.has_space_root {
+            input.prefix = Some("/".into());
+            input.list_root = Some(false);
+        }
+        let session = self.ensure_session().await?;
+        let result = session.list_files(&input).await;
+        if let Err(error) = &result {
+            // [Review Fix #ShareSpaceScope1] Only the documented 403 scope code can probe a missing whole-Space flag; other authorization failures stay final.
+            if is_virtual_root
+                && input.prefix.is_none()
+                && self.is_share_all_files.is_none()
+                && !self.has_probed_space_root
+                && is_virtual_root_scope_denial(error)
+            {
+                self.has_probed_space_root = true;
+                input.prefix = Some("/".into());
+                input.list_root = Some(false);
+                // [Review Fix #ShareSpaceSession1] A slow scope denial can outlive its token; renew before the distinct root-prefix read.
+                let page = self
+                    .ensure_session()
+                    .await?
+                    .list_files(&input)
+                    .await
+                    .map_err(map_ids_error)?;
+                self.has_space_root = true;
+                return Ok(page);
+            }
+        }
+        let page = result.map_err(map_ids_error)?;
+        if input.prefix.as_deref() == Some("/") {
+            self.has_space_root = true;
+        }
+        Ok(page)
+    }
+
+    /// Return whether metadata or a successful root-prefix read established Space-root mapping.
+    pub(crate) fn has_space_root(&self) -> bool {
+        self.has_space_root
+    }
     fn safe_value(&self, mut value: Value) -> Value {
         super::share::redact_share_payload(&mut value);
         // [Review Fix #ShareSecret3] Business identifiers may equal a password; redact designated secret fields without changing paths or IDs.
         value["ShareUrl"] = json!(self.identity.safe_url);
         value
     }
+}
+
+fn is_virtual_root_scope_denial(error: &Error) -> bool {
+    matches!(error, Error::Server(error) if error.status_code == Some(403)
+        && matches!(error.code.as_str(), "ShareFileOutOfScope" | "Forbidden.ShareFileOutOfScope"))
 }
 
 #[cfg(test)]
@@ -259,31 +311,22 @@ async fn files_value_with_auth(
     auth: &ADriveAuthArgs,
     args: &ShareFilesArgs,
 ) -> Result<Value, CliError> {
+    super::share_listing::validate_arguments(args)?;
+    super::high_level::validate_ls_sort(args.sort.as_deref())?;
     super::share::validate_selection(args.path.as_deref())?;
     let mut receiver = ShareReceiver::for_command(global, auth, &args.share_url)?;
     let info = receiver.info().await?;
     receiver
         .authorize(global, &info, args.is_password_stdin)
         .await?;
-    let session = receiver.ensure_session().await?;
     let mut value = if let Some(path) = args.path.as_deref().filter(|path| !path.ends_with('/')) {
+        let session = receiver.ensure_session().await?;
         json!({"Files":[session.get_file(path).await.map_err(map_ids_error)?],"Folders":[],"IsTruncated":false})
     } else {
-        serde_json::to_value(
-            session
-                .list_files(&ShareListFilesInput {
-                    prefix: args.path.clone(),
-                    delimiter: Some("/".into()),
-                    marker: args.marker.clone(),
-                    limit: args.limit,
-                    list_root: Some(args.path.is_none()),
-                })
-                .await
-                .map_err(map_ids_error)?,
-        )?
+        serde_json::to_value(super::share_listing::list_files(&mut receiver, args).await?)?
     };
     value["ShareInfo"] = serde_json::to_value(info)?;
-    value["Selection"] = json!({"Path":args.path,"Marker":args.marker,"Limit":args.limit});
+    value["Selection"] = json!({"Path":args.path,"Marker":args.marker,"MaxKeys":args.max_keys});
     Ok(receiver.safe_value(value))
 }
 /// Print basic public info without token/password I/O.
@@ -301,64 +344,14 @@ pub(crate) async fn inspect(
     )?;
     Ok(0)
 }
-/// Print one receiver page or one exact file, preserving marker pagination.
+/// Print a bounded current-level listing or one exact file, preserving its continuation marker.
 pub(crate) async fn files(
     global: &GlobalArgs,
     auth: &ADriveAuthArgs,
     args: &ShareFilesArgs,
 ) -> Result<i32, CliError> {
-    let mut value = files_value_with_auth(global, auth, args).await?;
-    let next_marker = value
-        .get("NextMarker")
-        .and_then(Value::as_str)
-        .filter(|marker| !marker.is_empty())
-        .map(str::to_owned);
-    let is_default_table = is_default_files_table(global);
-    let total_returned = if is_default_table {
-        add_files_display_entries(&mut value, args.path.as_deref())?
-    } else {
-        ["Files", "Folders"]
-            .iter()
-            .map(|key| value.get(key).and_then(Value::as_array).map_or(0, Vec::len) as u64)
-            .sum()
-    };
-    let envelope =
-        Envelope::success("ve-adrive share files", value).with_pagination(PaginationInfo {
-            next_token: None,
-            next_marker,
-            total_returned,
-        });
-    output_result_with_columns(
-        global,
-        &envelope,
-        is_default_table.then_some(FILE_TABLE_COLUMNS),
-    )?;
-    Ok(0)
-}
-
-fn is_default_files_table(global: &GlobalArgs) -> bool {
-    matches!(
-        global.output.unwrap_or_else(OutputFormat::auto_detect),
-        OutputFormat::Table | OutputFormat::Csv
-    ) && !global
-        .query
-        .as_deref()
-        .is_some_and(|query| !query.trim().is_empty())
-}
-
-fn add_files_display_entries(value: &mut Value, selection: Option<&str>) -> Result<u64, CliError> {
-    let listed: ListFilesOutput = serde_json::from_value(value.clone())?;
-    // [Review Fix #ShareFilesRows1] Reuse ls's normalization and row mapping so file/folder markers cannot diverge between the two tables.
-    let (files, folders) =
-        normalize_ls_files_and_folders(listed.files, listed.folders, selection.unwrap_or(""));
-    let entries = folders
-        .iter()
-        .map(|folder| adrive_ls_folder_entry(folder, false))
-        .chain(files.iter().map(|file| adrive_ls_file_entry(file, false)))
-        .collect::<Vec<_>>();
-    let total_returned = entries.len() as u64;
-    value["entries"] = json!(entries);
-    Ok(total_returned)
+    let value = files_value_with_auth(global, auth, args).await?;
+    super::share_files_options::output_files(global, args, value)
 }
 #[cfg(test)]
 async fn inspect_value(global: &GlobalArgs, url: &str) -> Result<Value, CliError> {
@@ -407,7 +400,11 @@ mod tests {
                 share_url: format!("{}/share/s", fixture.endpoint),
                 path: Some("requested".into()),
                 marker: None,
-                limit: None,
+                max_keys: 1000,
+                human_readable: false,
+                sort: None,
+                columns: None,
+                manifest_path: None,
                 is_password_stdin: false,
             };
             let error = files_value(&GlobalArgs::default(), &args)
@@ -445,7 +442,11 @@ mod tests {
             share_url: format!("{}/share/requested", fixture.endpoint),
             path: None,
             marker: None,
-            limit: None,
+            max_keys: 1000,
+            human_readable: false,
+            sort: None,
+            columns: None,
+            manifest_path: None,
             is_password_stdin: false,
         };
         assert!(files_value(&GlobalArgs::default(), &args).await.is_err());
@@ -476,7 +477,11 @@ mod tests {
             share_url: format!("{}/share/s?pwd=secret", fixture.endpoint),
             path: Some("a.txt".into()),
             marker: None,
-            limit: None,
+            max_keys: 1000,
+            human_readable: false,
+            sort: None,
+            columns: None,
+            manifest_path: None,
             is_password_stdin: false,
         };
         let result = files_value(&GlobalArgs::default(), &args).await.unwrap();
@@ -499,7 +504,11 @@ mod tests {
             share_url: format!("{}/share/s", fixture.endpoint),
             path: None,
             marker: None,
-            limit: Some(1),
+            max_keys: 1,
+            human_readable: false,
+            sort: None,
+            columns: None,
+            manifest_path: None,
             is_password_stdin: false,
         };
         let result = files_value(&GlobalArgs::default(), &args).await.unwrap();
@@ -523,7 +532,11 @@ mod tests {
             share_url: format!("{}/share/a?pwd=a", fixture.endpoint),
             path: Some("a.txt".into()),
             marker: None,
-            limit: None,
+            max_keys: 1000,
+            human_readable: false,
+            sort: None,
+            columns: None,
+            manifest_path: None,
             is_password_stdin: false,
         };
         let result = files_value(&GlobalArgs::default(), &args).await.unwrap();
@@ -539,7 +552,11 @@ mod tests {
             share_url: format!("{}/share/s", fixture.endpoint),
             path: None,
             marker: None,
-            limit: None,
+            max_keys: 1000,
+            human_readable: false,
+            sort: None,
+            columns: None,
+            manifest_path: None,
             is_password_stdin: false,
         };
         let error = files_value(&GlobalArgs::default(), &args)

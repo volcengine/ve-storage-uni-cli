@@ -500,14 +500,10 @@ fn normalize_auth_endpoint(endpoint: &str) -> Result<reqwest::Url, OAuthClientEr
             "auth endpoint cannot contain userinfo, query, or fragment".to_string(),
         ));
     }
-    let is_loopback = url.host().is_some_and(|host| match host {
-        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
-        url::Host::Ipv4(address) => address.is_loopback(),
-        url::Host::Ipv6(address) => address.is_loopback(),
-    });
-    if url.scheme() != "https" && !(url.scheme() == "http" && is_loopback) {
+    // [Review Fix #OAuthEndpoint4] Explicit HTTP(S) endpoints retain their configured protocol; bare hosts still default to HTTPS.
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err(OAuthClientError::Response(
-            "auth endpoint must use HTTPS; HTTP is allowed only for loopback tests".to_string(),
+            "auth endpoint must use HTTP or HTTPS and include a host".to_string(),
         ));
     }
     if !url.path().ends_with('/') {
@@ -538,6 +534,16 @@ mod tests {
     }
 
     #[test]
+    fn auth_endpoint_accepts_explicit_public_http_without_upgrade() {
+        let client = OAuthClient::new(
+            "http://auth.example.test:9080".into(),
+            ClientOptions::default(),
+        )
+        .expect("explicit HTTP is a deployment setting");
+        assert_eq!(client.endpoint().as_str(), "http://auth.example.test:9080/");
+    }
+
+    #[test]
     fn auth_endpoint_rejects_non_http_scheme() {
         let error = OAuthClient::new(
             "ftp://idsauth.volces.com".to_string(),
@@ -546,7 +552,7 @@ mod tests {
         .err()
         .expect("non-HTTP auth endpoint must be rejected");
 
-        assert!(error.to_string().contains("must use HTTPS"));
+        assert!(error.to_string().contains("must use HTTP or HTTPS"));
     }
 
     #[test]
@@ -555,7 +561,7 @@ mod tests {
             .err()
             .expect("explicit file scheme must be rejected");
 
-        assert!(error.to_string().contains("must use HTTPS"));
+        assert!(error.to_string().contains("must use HTTP or HTTPS"));
     }
 
     #[test]

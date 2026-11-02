@@ -44,6 +44,8 @@ use crate::registry::{
 
 const TOS_CONFIG_BINARY_ENV: &str = "VE_STORAGE_UNI_TOS_CONFIG_BINARY";
 const TOS_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    // [Review Fix #DirectoryLocalization] ByteTOS metadata has a separate catalog from shared CLI help.
+    ("Skip explicit directory uploads. By default, preserve directories including empty directories. Files may still create required parent directories", "跳过显式目录上传。默认保留目录，包括空目录。文件仍可能创建所需的父目录"),
     ("Run one check: auth, config, registry, network (or endpoint), mcp, or completion", "运行一项检查：auth、config、registry、network（或 endpoint）、mcp 或 completion"),
     ("Probe the configured endpoint during the network check", "在网络检查中探测已配置的 endpoint"),
     ("Timeout in milliseconds for a live network probe", "实时网络探测的超时时间（毫秒）"),
@@ -1473,6 +1475,7 @@ fn is_boolean_parameter(name: &str) -> bool {
             | "force"
             | "checkpoint"
             | "include_parent"
+            | "disable_dir_object"
             | "include_uploads"
             | "all_versions"
             | "size_only"

@@ -878,6 +878,11 @@ fn build_oauth_auth_provider(global: &GlobalArgs) -> Result<OAuthAuthProvider, C
         global.profile.clone(),
         client_options.clone(),
     )?;
+    let token_manager = if global.dry_run {
+        token_manager.without_refresh()
+    } else {
+        token_manager
+    };
     Ok(OAuthAuthProvider {
         token_manager,
         endpoint,
@@ -1004,29 +1009,48 @@ fn build_ids_client_from_provider(
         })
 }
 
+/// Convert `err` to the CLI error contract, retaining structured server status/code/request identity.
+/// Credential CLI errors pass through unchanged; non-service errors retain their native classification.
 pub(crate) fn map_ids_error(err: IdsError) -> CliError {
     let err = match err {
         IdsError::Cli(error) | IdsError::UnifiedCredential(error) => return error,
         other => other,
     };
+    let message = ids_error_message(&err);
     match &err {
         IdsError::Server(server) => match server.status_code {
-            Some(401) => CliError::AuthFailed(err.to_string()),
-            Some(403) => CliError::PermissionDenied(err.to_string()),
-            Some(404) => CliError::ResourceNotFound(err.to_string()),
-            Some(409) | Some(412) => CliError::Conflict(err.to_string()),
-            Some(429) | Some(503) => CliError::RateLimited(err.to_string()),
-            Some(500..=599) | Some(408) => CliError::TransferFailed(err.to_string()),
-            _ => CliError::Unknown(err.to_string()),
+            Some(401) => CliError::AuthFailed(message),
+            Some(403) => CliError::PermissionDenied(message),
+            Some(404) => CliError::ResourceNotFound(message),
+            Some(409) | Some(412) => CliError::Conflict(message),
+            Some(429) | Some(503) => CliError::RateLimited(message),
+            Some(500..=599) | Some(408) => CliError::TransferFailed(message),
+            _ => CliError::Unknown(message),
         },
-        IdsError::Http(_) | IdsError::HttpBody(_) => CliError::TransferFailed(err.to_string()),
+        IdsError::Http(_) | IdsError::HttpBody(_) => CliError::TransferFailed(message),
         IdsError::Json(_) | IdsError::Client(_) | IdsError::InvalidResponse(_) => {
-            CliError::ValidationError(err.to_string())
+            CliError::ValidationError(message)
         }
         IdsError::Cli(_) | IdsError::UnifiedCredential(_) => {
             unreachable!("credential error returned above")
         }
     }
+}
+
+fn ids_error_message(error: &IdsError) -> String {
+    let IdsError::Server(server) = error else {
+        return error.to_string();
+    };
+    let Some(status) = server.status_code else {
+        return error.to_string();
+    };
+    // [Review Fix #D06] Feed the known status to the envelope parser; explicit absence prevents stale process-wide request-ID fallback.
+    let request_id_absence = if server.request_id.is_none() {
+        " (RequestId: )"
+    } else {
+        ""
+    };
+    format!("HTTP {status} {error}{request_id_absence}")
 }
 
 /// Actionable remediation fields for one ADrive runtime error.
@@ -1623,6 +1647,9 @@ fn render_share_download_table(value: &Value) -> Option<String> {
         return None;
     }
     let transfer = value.get("data")?;
+    if transfer.get("dry_run") == Some(&Value::Bool(true)) {
+        return render_share_download_plan_table(value);
+    }
     transfer.get("Files")?.as_array()?;
     let completed = transfer["Summary"]["Completed"].as_u64().unwrap_or(0);
     let skipped = transfer["Summary"]["Skipped"]
@@ -1630,15 +1657,23 @@ fn render_share_download_table(value: &Value) -> Option<String> {
         .unwrap_or(0)
         .min(completed);
     // [Review Fix #ShareProgress3] Match cp's default summary instead of printing the entire manifest; preserve file details in JSON and explicit projections.
-    let summary_fields = serde_json::json!({
+    let mut summary_fields = serde_json::json!({
         "operation":"download",
         "status":if transfer["Complete"] == true {"succeeded"} else if completed > 0 {"partial_failure"} else {"failed"},
         "complete":transfer["Complete"], "plan_complete":transfer["PlanComplete"],
         "checkpoint_available":transfer["CheckpointAvailable"],
+        "report_path":transfer["report_path"], "manifest_path":transfer["manifest_path"],
+        "checkpoint_path":transfer["checkpoint_path"], "checkpoint_cleanup_warning":transfer["CheckpointCleanupWarning"],
         "issuance_outcome_unknown":transfer["IssuanceOutcomeUnknown"],
         "summary":{"total":transfer["Summary"]["Total"], "succeeded":completed-skipped,
             "failed":transfer["Summary"]["Failed"], "skipped":skipped, "pending":transfer["Summary"]["Pending"]}
     });
+    if let Some(failures) = transfer["DirectoryFailures"]
+        .as_array()
+        .filter(|failures| !failures.is_empty())
+    {
+        summary_fields["summary"]["failed_directories"] = serde_json::json!(failures.len());
+    }
     // [Review Fix #ShareDownloadDisplay4] Copy envelope metadata without duplicating the potentially large file list before replacing its payload.
     let summary_metadata = value
         .as_object()?
@@ -1647,6 +1682,32 @@ fn render_share_download_table(value: &Value) -> Option<String> {
         .map(|(key, field)| (key.clone(), field.clone()))
         .collect();
     let mut summary = Value::Object(summary_metadata);
+    summary["data"] = summary_fields;
+    Some(render_table(tabular_payload(&summary), None))
+}
+
+fn render_share_download_plan_table(value: &Value) -> Option<String> {
+    let plan = value.get("data")?;
+    let selection = plan.get("selection")?;
+    let conflicts = selection.get("Conflicts")?.as_array()?;
+    let summary_fields = serde_json::json!({
+        "operation":"download_plan","execution_status":plan["execution_status"],
+        "plan_complete":selection["PlanComplete"],"destination":selection["DestinationDir"],
+        "path":selection["Path"],"file_count":selection["FileCount"],
+        "directory_count":selection["DirectoryCount"],"total_bytes":selection["TotalBytes"],
+        "skipped":selection["SkippedCount"],"conflict_count":conflicts.len(),
+        "conflicts":serde_json::to_string(&conflicts.iter().take(10).collect::<Vec<_>>()).ok()?,
+        "checkpoint":selection["Checkpoint"],"local_writes":false,
+        "details":"Use --output json or --query for the full plan; at most 10 conflicts are shown here"
+    });
+    // [Review Fix #D02] A large preview must retain counts/conflicts without expanding thousands of manifest entries in the default table.
+    let metadata = value
+        .as_object()?
+        .iter()
+        .filter(|(key, _)| key.as_str() != "data")
+        .map(|(key, field)| (key.clone(), field.clone()))
+        .collect();
+    let mut summary = Value::Object(metadata);
     summary["data"] = summary_fields;
     Some(render_table(tabular_payload(&summary), None))
 }
@@ -1784,6 +1845,17 @@ fn render_csv(value: &Value, columns: Option<&'static [&'static str]>) -> String
     }
 }
 
+// [Review Fix #TabularTrace1] Request-ID diagnostics must not replace summaries
+// or compete with business lists; explicit array queries still render directly.
+fn implicit_business_arrays(
+    fields: &serde_json::Map<String, Value>,
+) -> impl Iterator<Item = &Vec<Value>> {
+    fields
+        .iter()
+        .filter(|(key, _)| key.as_str() != "service_request_ids")
+        .filter_map(|(_, value)| value.as_array())
+}
+
 fn pick_array_payload<'a>(
     value: &'a Value,
     columns: Option<&'static [&'static str]>,
@@ -1800,7 +1872,7 @@ fn pick_array_payload<'a>(
     }
     if let Some(columns) = columns {
         let mut empty_candidate = None;
-        for candidate in map.values().filter_map(Value::as_array) {
+        for candidate in implicit_business_arrays(map) {
             if candidate.iter().any(|item| {
                 item.as_object()
                     .map(|obj| columns.iter().any(|column| obj.contains_key(*column)))
@@ -1817,7 +1889,7 @@ fn pick_array_payload<'a>(
         }
     }
     let mut found = None;
-    for candidate in map.values().filter_map(Value::as_array) {
+    for candidate in implicit_business_arrays(map) {
         if found.is_some() {
             return None;
         }
@@ -1901,6 +1973,36 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tos_core::infra::credentials::StoredOAuthCredentials;
+
+    #[test]
+    fn ids_server_error_mapping_retains_structured_status_code_and_request_id() {
+        use tos_core::agent::error::ExitCode;
+        for (status, expected) in [
+            (Some(401), ExitCode::AuthFailed),
+            (Some(403), ExitCode::PermissionDenied),
+            (Some(404), ExitCode::ResourceNotFound),
+            (Some(409), ExitCode::Conflict),
+            (Some(412), ExitCode::Conflict),
+            (Some(429), ExitCode::RateLimited),
+            (Some(503), ExitCode::RateLimited),
+            (Some(500), ExitCode::TransferFailed),
+            (Some(408), ExitCode::TransferFailed),
+            (None, ExitCode::Unknown),
+        ] {
+            let error = map_ids_error(IdsError::Server(crate::domain::client::IdsError {
+                code: "RemoteFailure".into(),
+                message: "fixture service failure".into(),
+                request_id: Some("fixture-request-id".into()),
+                status_code: status,
+                response_headers: None,
+            }));
+            assert_eq!(error.exit_code(), expected);
+            let semantics = error.agent_semantics();
+            assert_eq!(semantics.status_code, status);
+            assert_eq!(semantics.code, "RemoteFailure");
+            assert_eq!(semantics.request_id.as_deref(), Some("fixture-request-id"));
+        }
+    }
 
     #[test]
     fn unified_mode_ignores_local_secrets_and_keeps_resource_settings() {
@@ -2249,6 +2351,147 @@ auth_mode = "aksk"
         let out = ensure_envelope(&global, envelope);
 
         assert_eq!(out["request_id"], "ids-service-id");
+    }
+
+    fn traced_tabular_envelope(payload: Value, has_request_ids: bool) -> Value {
+        let invocation = GlobalArgs::default();
+        for request_id in ["first-request", "last-request"] {
+            invocation
+                .request_trace
+                .record_response(has_request_ids.then_some(request_id), true);
+        }
+        let raw = serde_json::to_value(Envelope::success("ve-adrive cp", payload))
+            .expect("serialize batch envelope");
+        apply_query(&invocation, ensure_envelope(&invocation, raw)).expect("default query")
+    }
+
+    fn batch_tabular_fields() -> Value {
+        json!({
+            "source": "/source",
+            "destination": "adrive://instance/space/destination/",
+            "summary": {"total": 3, "succeeded": 2, "failed": 1, "skipped": 0},
+            "manifest_path": "/reports/cp-manifest.csv",
+            "report_path": "/reports/cp-report.csv",
+        })
+    }
+
+    fn assert_batch_artifacts_visible(rendered: &str) {
+        for expected in [
+            "summary.succeeded",
+            "summary.failed",
+            "summary.skipped",
+            "manifest_path",
+            "/reports/cp-manifest.csv",
+            "report_path",
+            "/reports/cp-report.csv",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_trace_keeps_batch_artifacts_in_table() {
+        let envelope = traced_tabular_envelope(batch_tabular_fields(), true);
+        let rendered = render_table_for_output(&GlobalArgs::default(), &envelope, None);
+        assert_batch_artifacts_visible(&rendered);
+    }
+
+    #[test]
+    fn service_trace_keeps_batch_artifacts_in_csv() {
+        let envelope = traced_tabular_envelope(batch_tabular_fields(), true);
+        let rendered = render_csv(tabular_payload(&envelope), None);
+        assert_batch_artifacts_visible(&rendered);
+    }
+
+    #[test]
+    fn service_trace_without_usable_ids_keeps_batch_artifacts() {
+        let envelope = traced_tabular_envelope(batch_tabular_fields(), false);
+        let payload = tabular_payload(&envelope);
+        assert_eq!(payload["service_request_ids"], json!([]));
+        for rendered in [render_table(payload, None), render_csv(payload, None)] {
+            assert_batch_artifacts_visible(&rendered);
+        }
+    }
+
+    #[test]
+    fn service_trace_keeps_business_object_array_projection() {
+        let entries = json!([{"key": "file.txt", "size": 4}]);
+        let envelope = traced_tabular_envelope(json!({"uploads": entries}), true);
+        let payload = tabular_payload(&envelope);
+        assert_eq!(render_table(payload, None), render_table(&entries, None));
+        assert_eq!(render_csv(payload, None), render_csv(&entries, None));
+    }
+
+    #[test]
+    fn service_trace_keeps_business_scalar_array_projection() {
+        let labels = json!(["one", "two"]);
+        let envelope = traced_tabular_envelope(json!({"labels": labels}), true);
+        let payload = tabular_payload(&envelope);
+        assert_eq!(render_table(payload, None), render_table(&labels, None));
+        assert_eq!(render_csv(payload, None), render_csv(&labels, None));
+    }
+
+    #[test]
+    fn service_trace_keeps_empty_business_array_projection() {
+        let entries = json!([]);
+        let envelope = traced_tabular_envelope(json!({"uploads": entries}), true);
+        let payload = tabular_payload(&envelope);
+        assert_eq!(render_table(payload, None), render_table(&entries, None));
+        assert_eq!(render_csv(payload, None), render_csv(&entries, None));
+    }
+
+    #[test]
+    fn service_trace_keeps_declared_columns_for_business_lists() {
+        let columns: Option<&'static [&'static str]> = Some(&["key", "size"]);
+        for entries in [
+            json!([]),
+            json!([{"key": "file.txt", "size": 4, "extra": 9}]),
+        ] {
+            let envelope = traced_tabular_envelope(json!({"uploads": entries}), true);
+            let payload = tabular_payload(&envelope);
+            assert_eq!(
+                render_table(payload, columns),
+                render_table(&entries, columns)
+            );
+            assert_eq!(render_csv(payload, columns), render_csv(&entries, columns));
+        }
+    }
+
+    #[test]
+    fn service_trace_remains_available_to_explicit_query() {
+        let envelope = traced_tabular_envelope(batch_tabular_fields(), true);
+        let invocation = GlobalArgs {
+            query: Some("data.service_request_ids".into()),
+            ..GlobalArgs::default()
+        };
+        let selected = apply_query(&invocation, envelope).expect("select trace");
+        let request_ids = json!(["first-request", "last-request"]);
+        assert_eq!(selected, request_ids);
+        assert_eq!(
+            render_table_for_output(&invocation, &selected, None),
+            render_table(&request_ids, None)
+        );
+        assert_eq!(
+            render_csv(&selected, None),
+            "index,value\n0,first-request\n1,last-request"
+        );
+    }
+
+    #[test]
+    fn service_trace_and_batch_artifacts_remain_in_json() {
+        let envelope = traced_tabular_envelope(batch_tabular_fields(), true);
+        let encoded = serde_json::to_string(&envelope).expect("serialize output");
+        let decoded: Value = serde_json::from_str(&encoded).expect("parse output");
+        assert_eq!(
+            decoded["data"]["service_request_ids"],
+            json!(["first-request", "last-request"])
+        );
+        assert_eq!(decoded["data"]["service_request_ids_omitted"], 0);
+        assert_eq!(decoded["data"]["manifest_path"], "/reports/cp-manifest.csv");
+        assert_eq!(decoded["data"]["report_path"], "/reports/cp-report.csv");
     }
 
     #[test]
@@ -2748,6 +2991,25 @@ auth_mode = "aksk"
         assert_eq!(tabular_payload(&envelope), &envelope["data"]);
         let selected = json!([{"Name":"a"}]);
         assert_eq!(tabular_payload(&selected), &selected);
+    }
+
+    #[test]
+    fn default_download_plan_table_shows_counts_and_bounds_manifest_expansion() {
+        let files = (0..100)
+            .map(|index| json!({"LocalPath":format!("item-{index}"),"Size":3}))
+            .collect::<Vec<_>>();
+        let envelope = json!({"command":"ve-adrive share download","status":"success","success":true,
+            "data":{"dry_run":true,"execution_status":"planned_not_executed","selection":{
+                "PlanComplete":true,"FileCount":100,"DirectoryCount":0,"TotalBytes":300,"SkippedCount":0,
+                "DestinationDir":"/destination","Conflicts":[],"Manifest":{"Files":files}}}});
+        let rendered = render_table_for_output(&GlobalArgs::default(), &envelope, None);
+        assert!(rendered.contains("file_count") && rendered.contains("total_bytes"));
+        assert!(!rendered.contains("item-99") && rendered.len() < 12000);
+        let explicit = GlobalArgs {
+            query: Some("@".into()),
+            ..GlobalArgs::default()
+        };
+        assert!(render_table_for_output(&explicit, &envelope, None).contains("item-99"));
     }
 
     #[test]

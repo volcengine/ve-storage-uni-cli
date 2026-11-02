@@ -485,7 +485,9 @@ impl ShareSession {
                 Some(self),
             )
             .await?;
-        let mut output: ListFilesOutput = response.decode(&[self.access_token.clone()])?;
+        let metadata: super::share_metadata_decode::ShareListMetadata =
+            response.decode(&[self.access_token.clone()])?;
+        let mut output = metadata.into_output();
         output.response_info = response.info();
         Ok(output)
     }
@@ -504,11 +506,12 @@ impl ShareSession {
             "/v1/share_file/get",
             vec![("file_path".into(), file_path.into())],
         );
-        let file: FileInfo = self
+        let metadata: super::share_metadata_decode::ShareFileMetadata = self
             .client
             .send(request, Some(self))
             .await?
             .decode(&[self.access_token.clone()])?;
+        let file = metadata.into_info();
         // [Review Fix #ShareFileIdentity1] An exact read must never substitute another file or a missing identity.
         if file.file_path.is_empty() || file.file_path != file_path {
             return Err(Error::InvalidResponse(

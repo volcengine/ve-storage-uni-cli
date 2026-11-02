@@ -110,7 +110,7 @@ pub enum SkillAction {
 #[command(
     about = "Inspect and modify A-Drive CLI configuration",
     long_about = "Inspect and modify A-Drive CLI configuration stored in ~/.tos/config.toml.",
-    after_help = "Examples:\n  ve-adrive-cli config init\n  ve-adrive-cli config show\n  ve-adrive-cli config set auth_mode unified\n  ve-adrive-cli config set region cn-beijing\n  ve-adrive-cli config set default.adrive.endpoint https://ids-cn-beijing.volces.com\n  ve-adrive-cli config set max_retry_count 3\n  ve-adrive-cli config set share_base_url https://pages.example.test\n  ve-adrive-cli config set requesttimeout 300"
+    after_help = "Examples:\n  ve-adrive-cli config init\n  ve-adrive-cli config show\n  ve-adrive-cli config set auth_mode unified\n  ve-adrive-cli config set region cn-beijing\n  ve-adrive-cli config set default.adrive.endpoint https://ids-cn-beijing.volces.com\n  ve-adrive-cli config set max_retry_count 3\n  ve-adrive-cli config set share_endpoint https://pages.example.test\n  ve-adrive-cli config set requesttimeout 300"
 )]
 pub struct ConfigCommand {
     #[command(subcommand)]
@@ -128,7 +128,7 @@ pub enum ConfigAction {
     Show,
     /// Set a configuration value
     #[command(
-        after_help = "Supported KEY values:\n  auth_mode (aksk, oauth, or unified) / region / endpoint / auth_endpoint\n  access_key_id / secret_access_key / security_token\n  share_base_url\n  account_id / default_instance / default_space\n  checkpoint_dir / batch_report_dir / batch_report_format / progress_enabled\n  max_retry_count / requesttimeout / connecttimeout / maxconnections\n\nBare access_key_id / secret_access_key / security_token keys write to [active-profile.adrive] in credentials.toml. Unified ignores those local credentials, selects the same-name external profile, and uses `ve login`.\n\nExamples:\n  ve-adrive-cli config set auth_mode oauth\n  ve-adrive-cli config set auth_mode unified\n  ve-adrive-cli config set auth_endpoint https://idsauth.volces.com\n  ve-adrive-cli config set access_key_id AKxxx\n  ve-adrive-cli config set region cn-beijing\n  ve-adrive-cli config set endpoint https://ids-cn-beijing.volces.com\n  ve-adrive-cli config set max_retry_count 3\n  ve-adrive-cli config set share_base_url https://pages.example.test\n  ve-adrive-cli config set requesttimeout 300"
+        after_help = "Supported KEY values:\n  auth_mode (aksk, oauth, or unified) / region / endpoint / auth_endpoint\n  access_key_id / secret_access_key / security_token\n  share_endpoint\n  account_id / default_instance / default_space\n  checkpoint_dir / batch_report_dir / batch_report_format / progress_enabled\n  max_retry_count / requesttimeout / connecttimeout / maxconnections\n\nBare access_key_id / secret_access_key / security_token keys write to [active-profile.adrive] in credentials.toml. Unified ignores those local credentials, selects the same-name external profile, and uses `ve login`.\n\nExamples:\n  ve-adrive-cli config set auth_mode oauth\n  ve-adrive-cli config set auth_mode unified\n  ve-adrive-cli config set auth_endpoint https://idsauth.volces.com\n  ve-adrive-cli config set access_key_id AKxxx\n  ve-adrive-cli config set region cn-beijing\n  ve-adrive-cli config set endpoint https://ids-cn-beijing.volces.com\n  ve-adrive-cli config set max_retry_count 3\n  ve-adrive-cli config set share_endpoint https://pages.example.test\n  ve-adrive-cli config set requesttimeout 300"
     )]
     Set { key: String, value: String },
 }

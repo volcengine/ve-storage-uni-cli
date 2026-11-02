@@ -380,24 +380,43 @@ fn test_derive_tos_control_endpoint_from_data_endpoint() {
 }
 
 #[test]
+fn adrive_share_endpoint_is_canonical_and_accepts_legacy_config() {
+    let mut config = tos_core::infra::config::ConfigFile::default();
+    config
+        .set_by_path(
+            &["default", "adrive", "share_endpoint"],
+            "http://pages.test:8080",
+        )
+        .expect("the canonical share endpoint must be configurable");
+    let serialized = toml::to_string(&config).unwrap();
+    assert!(serialized.contains("share_endpoint = \"http://pages.test:8080\""));
+    assert!(!serialized.contains("share_base_url"));
+    let legacy: tos_core::infra::config::ConfigFile =
+        toml::from_str("[default.adrive]\nshare_base_url='https://legacy.test'\n").unwrap();
+    let migrated = toml::to_string(&legacy).unwrap();
+    assert!(migrated.contains("share_endpoint = \"https://legacy.test\""));
+    assert!(!migrated.contains("share_base_url"));
+}
+
+#[test]
 fn adrive_share_origin_is_nested_and_validated() {
     let mut config = tos_core::infra::config::ConfigFile::default();
     config
         .set_by_path(
-            &["default", "adrive", "share_base_url"],
+            &["default", "adrive", "share_endpoint"],
             "https://pages.example.test",
         )
         .unwrap();
     let serialized = toml::to_string(&config).unwrap();
-    assert!(serialized.contains("share_base_url = \"https://pages.example.test\""));
+    assert!(serialized.contains("share_endpoint = \"https://pages.example.test\""));
     config
         .set_by_path(
-            &["default", "adrive", "share_base_url"],
+            &["default", "adrive", "share_endpoint"],
             "http://pages.example.test:8080",
         )
         .unwrap();
     let serialized = toml::to_string(&config).unwrap();
-    assert!(serialized.contains("share_base_url = \"http://pages.example.test:8080\""));
+    assert!(serialized.contains("share_endpoint = \"http://pages.example.test:8080\""));
     for origin in [
         "https://u:secret@pages.test",
         "http://u:secret@pages.test",
@@ -414,7 +433,7 @@ fn adrive_share_origin_is_nested_and_validated() {
         "https://pages.test?pwd=secret",
     ] {
         let error = config
-            .set_by_path(&["default", "adrive", "share_base_url"], origin)
+            .set_by_path(&["default", "adrive", "share_endpoint"], origin)
             .unwrap_err();
         assert!(!error.to_string().contains("secret"));
     }
@@ -427,7 +446,7 @@ fn unused_invalid_share_origin_does_not_block_other_profiles_or_binaries() {
         "share-origin-isolation-{}.toml",
         std::process::id()
     ));
-    std::fs::write(&path,"[good]\nregion='cn-beijing'\n[good.adrive]\nendpoint='https://api.example.test'\n[bad.adrive]\nshare_base_url='https://user:must-not-echo@pages.test'\n").unwrap();
+    std::fs::write(&path,"[good]\nregion='cn-beijing'\n[good.adrive]\nendpoint='https://api.example.test'\n[bad.adrive]\nshare_endpoint='https://user:must-not-echo@pages.test'\n").unwrap();
     let config =
         ConfigFile::load_from(&path).expect("an unused origin must not affect config loading");
     assert!(config.get_effective_profile("good", Binary::Tos).is_ok());

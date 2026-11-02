@@ -14,15 +14,95 @@
  * limitations under the License.
  */
 
-use std::sync::Mutex;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Number, Value};
 
 /// Maximum number of service request IDs retained for one CLI invocation.
-pub const SERVICE_REQUEST_ID_LIMIT: usize = 1024;
+pub const SERVICE_REQUEST_ID_LIMIT: usize = 100;
 
 /// Maximum number of Unicode scalar values accepted in one request ID.
 pub const SERVICE_REQUEST_ID_MAX_CHARS: usize = 256;
+
+tokio::task_local! {
+    static OPERATION_REQUEST_TRACES: Vec<Arc<ServiceRequestTrace>>;
+}
+
+/// Run an operation and return its output and sanitized terminal service request ID.
+///
+/// Scopes isolate concurrently polled futures and include nested scopes. A terminal
+/// response without an ID, or a terminal attempt without a response, returns `None`.
+/// Spawned tasks require their own scope; existing transfer workers are polled futures.
+/// The output and errors are passed through unchanged and no ID list is retained here.
+pub async fn capture_service_request_id<F: Future>(operation: F) -> (F::Output, Option<String>) {
+    // [Review Fix #ReportRequestId] Each report operation tracks its own terminal ID, independently of the bounded command summary.
+    let operation_trace = Arc::new(ServiceRequestTrace::with_limit(0));
+    let mut traces = OPERATION_REQUEST_TRACES
+        .try_with(Clone::clone)
+        .unwrap_or_default();
+    traces.push(Arc::clone(&operation_trace));
+    let output = OPERATION_REQUEST_TRACES.scope(traces, operation).await;
+    (
+        output,
+        operation_trace.snapshot().terminal_response_request_id,
+    )
+}
+
+/// Return the sanitized terminal response ID of the innermost operation scope.
+///
+/// Returns `None` outside a scope or when its terminal attempt has no usable ID.
+/// This never consults the command-wide trace or process-wide compatibility mirror.
+pub fn current_service_request_id() -> Option<String> {
+    OPERATION_REQUEST_TRACES
+        .try_with(|traces| {
+            traces
+                .last()
+                .and_then(|trace| trace.snapshot().terminal_response_request_id)
+        })
+        .ok()
+        .flatten()
+}
+
+/// Whether a report-operation scope is active, even when it has no response ID.
+///
+/// Report writers use this to distinguish an authoritative missing ID from a
+/// legacy call outside capture. Suppressed cleanup scopes return `false`.
+pub fn has_operation_request_scope() -> bool {
+    OPERATION_REQUEST_TRACES
+        .try_with(|traces| !traces.is_empty())
+        .unwrap_or(false)
+}
+
+/// Preserve the captured ID of the concurrent part that causes an operation to fail.
+///
+/// Call immediately before returning that part's error, after pending work or cleanup.
+/// `request_id` must come from a part's capture scope; absent or unsafe IDs clear the
+/// current operation ID. Outside a scope this is a no-op. Command diagnostics and
+/// response counts remain unchanged; this function performs no I/O and cannot fail.
+pub fn preserve_operation_failure_request_id(request_id: Option<&str>) {
+    let request_id = request_id.and_then(sanitize_request_id);
+    // [Review Fix #ConcurrentPartId] A later successful sibling response cannot
+    // identify the failed part selected by the transfer worker.
+    let _ = OPERATION_REQUEST_TRACES.try_with(|traces| {
+        for trace in traces {
+            let mut state = trace
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.terminal_response_request_id = request_id.clone();
+        }
+    });
+}
+
+/// Run cleanup without replacing request IDs attached to enclosing report operations.
+///
+/// HTTP events still enter the command-wide trace. This only suppresses delivery to
+/// operation scopes, so an abort/cleanup response cannot hide the original failure ID.
+/// The cleanup output and errors are passed through unchanged.
+pub async fn without_operation_request_tracking<F: Future>(cleanup: F) -> F::Output {
+    OPERATION_REQUEST_TRACES.scope(Vec::new(), cleanup).await
+}
 
 /// Immutable view of the service responses observed by one CLI invocation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -84,6 +164,15 @@ impl ServiceRequestTrace {
     /// `is_success` reflects the HTTP response status. Invalid or absent IDs
     /// still contribute to the response count but never enter structured output.
     pub fn record_response(&self, raw_request_id: Option<&str>, is_success: bool) {
+        self.record_response_locally(raw_request_id, is_success);
+        let _ = OPERATION_REQUEST_TRACES.try_with(|traces| {
+            for trace in traces {
+                trace.record_response_locally(raw_request_id, is_success);
+            }
+        });
+    }
+
+    fn record_response_locally(&self, raw_request_id: Option<&str>, is_success: bool) {
         let mut state = self
             .state
             .lock()
@@ -108,6 +197,15 @@ impl ServiceRequestTrace {
 
     /// Record a terminal HTTP attempt that failed before any response arrived.
     pub fn record_no_response(&self) {
+        self.record_no_response_locally();
+        let _ = OPERATION_REQUEST_TRACES.try_with(|traces| {
+            for trace in traces {
+                trace.record_no_response_locally();
+            }
+        });
+    }
+
+    fn record_no_response_locally(&self) {
         let mut state = self
             .state
             .lock()
@@ -281,20 +379,217 @@ mod tests {
     }
 
     #[test]
-    fn default_limit_retains_1024_and_omits_the_1025th_id() {
+    fn default_limit_retains_first_100_of_10000_ids() {
         let trace = ServiceRequestTrace::default();
-        for index in 0..=SERVICE_REQUEST_ID_LIMIT {
+        for index in 0..10_000 {
             trace.record_response(Some(&format!("request-{index}")), true);
         }
 
         let snapshot = trace.snapshot();
-        assert_eq!(snapshot.request_ids.len(), SERVICE_REQUEST_ID_LIMIT);
-        assert_eq!(snapshot.request_ids_omitted, 1);
-        assert_eq!(snapshot.response_count, SERVICE_REQUEST_ID_LIMIT + 1);
+        assert_eq!(snapshot.request_ids.len(), 100);
+        assert_eq!(snapshot.request_ids[0], "request-0");
+        assert_eq!(snapshot.request_ids[99], "request-99");
+        assert_eq!(snapshot.request_ids_omitted, 9900);
+        assert_eq!(snapshot.response_count, 10_000);
         assert_eq!(
             snapshot.last_successful_request_id.as_deref(),
-            Some("request-1024")
+            Some("request-9999")
         );
+        let mut envelope = serde_json::to_value(Envelope::success("tos cp", json!({})))
+            .expect("serialize envelope");
+        apply_service_trace_to_success_envelope(&mut envelope, &snapshot);
+        assert_eq!(
+            envelope["data"]["service_request_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            100
+        );
+        assert_eq!(envelope["data"]["service_request_ids_omitted"], 9900);
+        assert_eq!(envelope["request_id"], "request-9999");
+    }
+
+    #[tokio::test]
+    async fn operation_ids_stay_with_interleaved_files() {
+        let command_trace = ServiceRequestTrace::default();
+        let (first, second) = tokio::join!(
+            capture_service_request_id(async {
+                command_trace.record_response(Some("first-head"), true);
+                tokio::task::yield_now().await;
+                command_trace.record_response(Some("first-complete"), true);
+                assert_eq!(
+                    current_service_request_id().as_deref(),
+                    Some("first-complete")
+                );
+                "first-file"
+            }),
+            capture_service_request_id(async {
+                command_trace.record_response(Some("second-head"), true);
+                tokio::task::yield_now().await;
+                command_trace.record_response(Some("second-denied"), false);
+                "second-file"
+            }),
+        );
+        assert_eq!(first, ("first-file", Some("first-complete".into())));
+        assert_eq!(second, ("second-file", Some("second-denied".into())));
+        assert_eq!(command_trace.snapshot().response_count, 4);
+        assert_eq!(current_service_request_id(), None);
+    }
+
+    #[tokio::test]
+    async fn operation_ids_do_not_depend_on_command_retention() {
+        let command_trace = ServiceRequestTrace::with_limit(1);
+        for index in 0..150 {
+            let (_, request_id) = capture_service_request_id(async {
+                command_trace.record_response(Some(&format!("file-{index}")), true);
+            })
+            .await;
+            assert_eq!(request_id, Some(format!("file-{index}")));
+        }
+        assert_eq!(command_trace.snapshot().request_ids.len(), 1);
+        assert_eq!(command_trace.snapshot().request_ids_omitted, 149);
+    }
+
+    #[tokio::test]
+    async fn operation_ids_use_terminal_response_after_retries() {
+        let command_trace = ServiceRequestTrace::default();
+        let (_, request_id) = capture_service_request_id(async {
+            command_trace.record_response(Some("retry-denied"), false);
+            command_trace.record_response(Some("final-success"), true);
+        })
+        .await;
+        assert_eq!(request_id.as_deref(), Some("final-success"));
+    }
+
+    #[tokio::test]
+    async fn operation_without_response_never_reuses_another_id() {
+        let command_trace = ServiceRequestTrace::default();
+        command_trace.record_response(Some("unrelated-file"), true);
+        let (_, request_id) = capture_service_request_id(async {
+            assert!(has_operation_request_scope());
+            command_trace.record_response(Some("preflight-head"), true);
+            command_trace.record_no_response();
+        })
+        .await;
+        assert_eq!(request_id, None);
+        let (_, local_error_id) = capture_service_request_id(async { "local error" }).await;
+        assert_eq!(local_error_id, None);
+        assert!(!has_operation_request_scope());
+    }
+
+    #[tokio::test]
+    async fn operation_without_safe_response_id_stays_empty() {
+        let command_trace = ServiceRequestTrace::default();
+        for terminal_id in [None, Some("bad\nheader"), Some("")] {
+            let (_, request_id) = capture_service_request_id(async {
+                command_trace.record_response(Some("previous-head"), true);
+                command_trace.record_response(terminal_id, false);
+            })
+            .await;
+            assert_eq!(request_id, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_operation_ids_update_parents_and_restore_scope() {
+        let command_trace = ServiceRequestTrace::default();
+        let (_, outer_id) = capture_service_request_id(async {
+            command_trace.record_response(Some("outer-head"), true);
+            let (_, inner_id) = capture_service_request_id(async {
+                command_trace.record_response(Some("inner-final"), true);
+            })
+            .await;
+            assert_eq!(inner_id.as_deref(), Some("inner-final"));
+            assert_eq!(current_service_request_id().as_deref(), Some("inner-final"));
+        })
+        .await;
+        assert_eq!(outer_id.as_deref(), Some("inner-final"));
+        assert_eq!(command_trace.snapshot().response_count, 2);
+        assert_eq!(current_service_request_id(), None);
+    }
+
+    #[tokio::test]
+    async fn cleanup_never_replaces_the_file_failure_request_id() {
+        let command_trace = ServiceRequestTrace::default();
+        for original_id in [Some("upload-failed"), None] {
+            let (_, report_id) = capture_service_request_id(async {
+                command_trace.record_response(original_id, false);
+                without_operation_request_tracking(async {
+                    assert!(!has_operation_request_scope());
+                    command_trace.record_response(Some("abort-success"), true);
+                })
+                .await;
+            })
+            .await;
+            assert_eq!(report_id.as_deref(), original_id);
+        }
+        assert_eq!(command_trace.snapshot().response_count, 4);
+        assert_eq!(
+            command_trace
+                .snapshot()
+                .last_successful_request_id
+                .as_deref(),
+            Some("abort-success")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_concurrent_part_restores_its_id_without_rewriting_command_trace() {
+        let command_trace = ServiceRequestTrace::default();
+        for failure_id in [Some("part-denied"), None] {
+            let (_, outer_id) = capture_service_request_id(async {
+                let (_, file_id) = capture_service_request_id(async {
+                    let (_, failed_part_id) = capture_service_request_id(async {
+                        command_trace.record_response(failure_id, false);
+                    })
+                    .await;
+                    command_trace.record_response(Some("later-success"), true);
+                    preserve_operation_failure_request_id(failed_part_id.as_deref());
+                })
+                .await;
+                assert_eq!(file_id.as_deref(), failure_id);
+            })
+            .await;
+            assert_eq!(outer_id.as_deref(), failure_id);
+            assert_eq!(
+                command_trace
+                    .snapshot()
+                    .terminal_response_request_id
+                    .as_deref(),
+                Some("later-success")
+            );
+        }
+        assert_eq!(command_trace.snapshot().response_count, 4);
+        preserve_operation_failure_request_id(Some("outside-scope"));
+        assert_eq!(current_service_request_id(), None);
+    }
+
+    #[tokio::test]
+    async fn preserved_part_failure_rejects_unsafe_ids() {
+        let command_trace = ServiceRequestTrace::default();
+        let (_, file_id) = capture_service_request_id(async {
+            command_trace.record_response(Some("previous-success"), true);
+            preserve_operation_failure_request_id(Some("unsafe\nheader"));
+        })
+        .await;
+        assert_eq!(file_id, None);
+    }
+
+    #[tokio::test]
+    async fn cancelled_operation_restores_the_callers_scope() {
+        let command_trace = ServiceRequestTrace::default();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            capture_service_request_id(async {
+                command_trace.record_response(Some("cancelled-file"), true);
+                std::future::pending::<()>().await;
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(current_service_request_id(), None);
+        let (_, next_id) = capture_service_request_id(async {}).await;
+        assert_eq!(next_id, None);
     }
 
     #[test]

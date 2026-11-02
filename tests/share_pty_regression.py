@@ -4,6 +4,7 @@ import faulthandler
 import http.server
 import json
 import os
+from pathlib import Path
 import pty
 import select
 import signal
@@ -13,6 +14,12 @@ import tempfile
 import termios
 import threading
 import time
+
+
+def entrypoint_command(binary, arguments):
+    # [Review Fix #ShareEndpointPty] Dedicated binaries need no unified command prefix.
+    prefix = [] if Path(binary).stem == "ve-adrive-cli" else ["ve-adrive"]
+    return [binary, *prefix, *arguments]
 
 
 def wait_until(predicate, process, label):
@@ -119,7 +126,7 @@ def spawn_terminal_child(binary, slave, origin):
         fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
 
     return subprocess.Popen(
-        [binary, "ve-adrive", "share", "files", f"{origin}/share/s", "--path", "a.txt", "--output", "table"],
+        entrypoint_command(binary, ["share", "files", f"{origin}/share/s", "--path", "a.txt", "--output", "table"]),
         stdin=slave, stdout=slave, stderr=slave, preexec_fn=prepare_terminal,
     )
 
@@ -173,9 +180,9 @@ def run_management_cases(binary):
             config_path = os.path.join(directory, "config.toml")
             endpoint = f"http://127.0.0.1:{server.server_address[1]}"
             with open(config_path, "w") as config:
-                config.write(f"[default.adrive]\nendpoint='{endpoint}'\nregion='cn-beijing'\naccess_key_id='fixture-ak'\nsecret_access_key='fixture-sk'\nshare_base_url='https://user:unused-secret@bad.test'\n")
+                config.write(f"[default.adrive]\nendpoint='{endpoint}'\nregion='cn-beijing'\naccess_key_id='fixture-ak'\nsecret_access_key='fixture-sk'\nshare_endpoint='https://user:unused-secret@bad.test'\n")
             common = ["--config-path", config_path, "--auth-mode", "aksk", "--output", "json"]
-            process = subprocess.Popen([binary, "ve-adrive", "share", "update", "requested", "--instance", "inst", "--updated-at", "7", "--name", "New", "--share-base-url", "https://pages.test", *common], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process = subprocess.Popen(entrypoint_command(binary, ["share", "update", "requested", "--instance", "inst", "--updated-at", "7", "--name", "New", "--share-endpoint", "https://pages.test", *common]), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             wait_until(server.is_submitting.is_set, process, "submitted update")
             os.kill(process.pid, signal.SIGINT)
             _, errors = process.communicate(timeout=4)
@@ -186,8 +193,8 @@ def run_management_cases(binary):
             assert "reconcile" in envelope["error"]["message"]
             assert server.requests == ["/v1/share_link/update"]
             server.can_finish.set()
-            environment = dict(os.environ, ADRIVE_SHARE_BASE_URL="https://user:env-secret@bad.test")
-            cancel = subprocess.run([binary, "ve-adrive", "share", "cancel", "s", "--instance", "instance_with_underscore", "--yes", *common], capture_output=True, env=environment, timeout=4)
+            environment = dict(os.environ, ADRIVE_SHARE_ENDPOINT="https://user:env-secret@bad.test")
+            cancel = subprocess.run(entrypoint_command(binary, ["share", "cancel", "s", "--instance", "instance_with_underscore", "--yes", *common]), capture_output=True, env=environment, timeout=4)
             assert cancel.returncode == 0, cancel.stderr
             assert json.loads(cancel.stdout)["data"]["Cancelled"] is True
             assert server.requests == ["/v1/share_link/update", "/v1/share_link/cancel"]
@@ -212,7 +219,7 @@ def run_oauth_refresh_interrupt(binary):
                 config.write(f"[default.adrive]\nendpoint='{endpoint}'\nregion='cn-beijing'\n")
             with open(credentials_path, "w") as credentials:
                 credentials.write(f"schema_version=1\n[default.adrive.oauth]\naccess_token='expired-fixture-token'\nrefresh_token='fixture-refresh-token'\nexpires_at='2000-01-01T00:00:00Z'\ninstance_id='inst'\nauth_endpoint='{auth_endpoint}'\n")
-            arguments = [binary,"ve-adrive","share","update","requested","--instance","inst","--updated-at","7","--name","New","--share-base-url","https://pages.test","--config-path",config_path,"--credentials-path",credentials_path,"--auth-mode","oauth","--output","json"]
+            arguments = entrypoint_command(binary, ["share","update","requested","--instance","inst","--updated-at","7","--name","New","--share-endpoint","https://pages.test","--config-path",config_path,"--credentials-path",credentials_path,"--auth-mode","oauth","--output","json"])
             process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             wait_until(server.is_refreshing.is_set, process, "OAuth refresh before resource submission")
             os.kill(process.pid, signal.SIGINT)

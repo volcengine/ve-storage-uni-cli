@@ -31,8 +31,16 @@ fn normalize_password(mut bytes: Vec<u8>) -> Result<String, CliError> {
 
 /// Read a single bounded password from stdin with a 30 second deadline.
 /// The detached reader does not hold Tokio runtime shutdown hostage on stalled input.
+/// Returns a validation error for empty normalized input, invalid content or timeout.
 pub(crate) async fn read_password_stdin() -> Result<String, CliError> {
-    read_password(false).await
+    let password = read_password(false).await?;
+    // [Review Fix #D05] Explicit EOF/blank input is a missing secret; confirmation lines may still be empty.
+    if password.is_empty() {
+        return Err(CliError::ValidationError(
+            "--password-stdin requires a nonempty password; received empty input".into(),
+        ));
+    }
+    Ok(password)
 }
 /// Read one ordinary confirmation line with bounded input and a cancellation-safe waiter.
 pub(crate) async fn read_confirmation_line() -> Result<String, CliError> {

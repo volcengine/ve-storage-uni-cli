@@ -55,3 +55,14 @@ review instead of silently skipping it.
 When the task size is unclear, begin with the small-bug workflow. Escalate only when investigation reveals a public contract change, cross-module impact, security-sensitive behavior, migration requirement, or another concrete risk that the lightweight workflow cannot cover.
 
 Before expanding the scope, state the reason and the additional work required. Avoid duplicate full test runs, unnecessary planning documents, and extra review rounds when there is no evidence that they reduce risk.
+
+## Release verification boundaries
+
+Local fixtures establish CLI behavior without proving every live backend or platform contract. Keep these checks separate from local regression results:
+
+- Directory uploads to real HNS buckets and ADrive spaces, including empty directories and implicit parents.
+- HNS direct recursive deletion combined with `--include-uploads`, whose live backend contract remains unverified.
+- Native Windows execution, including ZTI authentication and filesystem link handling; cross-compilation or macOS fixtures do not replace it.
+- Live share preview routing, tracked with the current [sharing test steps](adrive-share-testing.md).
+
+Persistent local transfer coverage lives in `tests/directory_upload_regression.py`, `tests/batch_transfer_breadth_regression.py`, `tests/concurrent_part_report_regression.py`, `tests/report_request_id_regression.py`, `tests/hns_filtered_move_regression.py` and `tests/tos_unicode_transfer_regression.py`. Report actual commands and results when running them; historical test counts are not evidence for a newer checkout.

@@ -11,6 +11,12 @@ operations if the binary is missing.
 
 ## CLI installation
 
+HTTPS uses the operating system's trusted certificate facilities. For enterprise
+or private CAs, install and trust the CA through the OS; Linux needs a system CA
+bundle. Keep certificate-chain and hostname validation enabled. Credential SDK
+requests retain reqwest 0.12 with system and bundled roots combined; they do not
+have the business client's full platform trust/distrust behavior.
+
 Installing this skill does not install the CLI executable or configure credentials.
 First run `tos-cli --version`; if the selected executable works, skip installation.
 Install only when it is in scope. Choose one channel for the current OS and
@@ -150,5 +156,7 @@ tos-cli cp ./file.txt tos://bucket/file.txt --dry-run
 tos-cli sync ./dir tos://bucket/prefix/ --dry-run
 tos-cli presign tos://bucket/key --expires 3600 --output json
 ```
+
+Local-directory uploads with `cp --recursive` and `sync` preserve selected directories, including empty directories, by default. `--disable-dir-object` skips explicit directory uploads; it is valid only for local-directory uploads. Files can still create required parents in HNS/ADrive. FNS directory markers are zero-byte keys ending in `/`; HNS directory objects use STANDARD rather than a file-only storage-class override. Both manifest and `--no-manifest` execution preserve the same directory policy. An empty source creates the effective destination folder when a non-root path exists; `--include-parent` retains the source basename. Directory tasks count as items with zero bytes. The switch does not authorize deleting source-present directories during `sync --delete`.
 
 Use `tos-cli <command> --help` when flags are uncertain.

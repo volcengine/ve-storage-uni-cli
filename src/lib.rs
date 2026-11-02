@@ -239,10 +239,10 @@ fn normalize_leading_help_flag(args: &[String]) -> Vec<String> {
         let arg = args[index].as_str();
         if arg.starts_with('-') {
             deferred_flags.push(args[index].clone());
-            if flag_takes_value(arg) {
-                if let Some(value) = args.get(index + 1) {
-                    deferred_flags.push(value.clone());
-                }
+            // [Review Fix #CommandIdentity3] Help reordering must preserve the
+            // same option/value boundary as service selection and recovery.
+            if has_separate_option_value(arg, args.get(index + 1)) {
+                deferred_flags.extend(args.get(index + 1).cloned());
                 index += 2;
             } else {
                 index += 1;
@@ -516,6 +516,37 @@ fn help_translations_zh_longest_first() -> &'static [(&'static str, &'static str
 }
 
 const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    // [Review Fix #ShareTransferDocs2] Help rendering translates blank-line paragraphs independently.
+    ("The OS resolves user-selected destination and checkpoint directory aliases before the CLI pins them; downloaded subpaths reject traversal, symlinks/reparse points and case/Unicode or file/directory collisions with Conflict (exit 9). Resume compares resolved roots and verifies completed local sizes/digests; changes fail with Conflict. No --path selects all shared roots; a single-file share is selected automatically, while folders require --recursive. Directory contents map like cp by default; --include-parent retains the selected directory name. For a whole-Space share, omitting --path or using --path / selects the entire Space and requires --recursive. It preserves the full Space-relative hierarchy; --include-parent adds no wrapper because the Space root has no basename. A selected subdirectory keeps the cp layout rules. Multiple roots with colliding contents fail safely; use --include-parent to preserve distinct root names instead of guessing new names. --include and --exclude match cp relative source paths. Default parallelism is 16 files, 4 directory listings and 4 ranges per file; --batch-concurrency, --list-concurrency and --multipart-concurrency override these positive values.", "操作系统先解析用户指定的目标目录及 checkpoint 目录别名，再固定实际根目录；下载子路径拒绝穿越、符号链接/reparse 点、大小写及 Unicode 或文件/目录冲突，返回 Conflict（退出码 9）。恢复时比较解析后的根目录，并验证已完成本地文件大小和摘要；变化时返回 Conflict。不传 --path 时选择全部分享根；单文件自动选中，目录需要 --recursive。默认与 cp 一样复制目录内容；--include-parent 保留选中目录名。整 Space 分享省略 --path 或使用 --path / 时选择整个 Space，且需要 --recursive；保留完整空间相对层级。Space 根没有 basename，因此 --include-parent 不增加包装目录；选中子目录时仍遵循 cp 布局。多个根目录的内容同名时安全拒绝；用 --include-parent 保留不同根目录名，不猜测重命名。--include 和 --exclude 按 cp 的源相对路径匹配。默认并发为 16 个文件、4 个目录列举和每文件 4 个 Range；--batch-concurrency、--list-concurrency 和 --multipart-concurrency 可用正整数覆盖。"),
+    ("Overwrite defaults to force, matching cp. --force and legacy --overwrite select force; --no-clobber skips existing ordinary files, and --overwrite-strategy newer replaces only older destinations. Replacements publish only after verification. --checkpoint [FILE] enables recovery; a bare flag uses a stable task path under ~/.tos/checkpoints/ve-adrive, --checkpoint-dir overrides that directory, and FILE preserves the legacy explicit path. --resume uses the saved selection and policy, revalidates completed files and restores verified partial ranges. Keep selection, filters, layout and overwrite policy unchanged; old checkpoints with the directory-name layout need --include-parent. New remote files are not added during resume. Keep the checkpoint JSON together with its .completed/ completion-ledger directory and .parts/ directory when retaining or moving recovery state; completed entries in the main JSON are not updated after every file.", "覆盖策略默认 force，与 cp 一致。--force 和兼容的 --overwrite 选择 force；--no-clobber 跳过已有普通文件，--overwrite-strategy newer 仅替换较旧目标。校验完成后才发布替换文件。--checkpoint [FILE] 启用恢复；裸参数使用 ~/.tos/checkpoints/ve-adrive 下的稳定任务路径，--checkpoint-dir 覆盖目录，FILE 保留旧显式路径写法。--resume 使用保存的选择和策略，重新验证已完成文件，并恢复已验证的部分 Range。选择、过滤、目录布局和覆盖策略须保持一致；保留目录名布局的旧 checkpoint 需使用 --include-parent。恢复不加入新增远端文件。保存或迁移恢复状态时须同时保留 checkpoint JSON、.completed/ 增量账本目录和 .parts/ 目录；主 JSON 的 completed 不会逐文件实时更新。"),
+    ("Actual downloads create directories, temporary files, default report/manifest CSVs and enabled checkpoint/lock state; preflight may leave empty directories before a later denial. --report-path and --manifest-path override defaults under ~/.tos/reports/ve-adrive; --report-failures-only filters report rows only. --no-manifest disables the manifest CSV while preserving the safety pre-scan and recovery snapshot. Aggregate data includes report_path, manifest_path and checkpoint_path. Report CSV rows retain the request_id of their own operation; artifacts exclude passwords, tokens and signed URLs. The default table shows a cp-style summary of total/succeeded/failed/skipped/pending; Summary.Skipped includes verified resumed files and overwrite-policy skips, is included in Summary.Completed, and succeeded=Completed-Skipped. Files.Status may be completed, failed, pending or skipped; JSON and explicit queries retain details.", "实际下载创建目录、临时文件、默认 report/manifest CSV，以及启用的 checkpoint/锁状态；预检查可能在后续服务拒绝前留下空目录。--report-path 和 --manifest-path 覆盖 ~/.tos/reports/ve-adrive 下的默认路径；--report-failures-only 只过滤报告行。--no-manifest 关闭 manifest CSV，仍保留安全预扫描和恢复快照。聚合 data 包含 report_path、manifest_path、checkpoint_path。报告 CSV 行保留自身操作的 request_id；产物不含密码、token 或签名 URL。默认表格显示 total/succeeded/failed/skipped/pending；Summary.Skipped 包括校验后复用的恢复文件和覆盖策略跳过项，包含在 Summary.Completed 中，succeeded=Completed-Skipped。Files.Status 可为 completed、failed、pending 或 skipped；JSON 和显式 query 保留详情。"),
+    ("Files at least 20MB with a strong ETag or CRC64 automatically use parallel 16MiB ranges without requiring checkpoint; --checkpoint-threshold changes the threshold. Files lacking both identities use one streamed GET. Content retries reuse the issued URL. Ordinary file failures allow other files to continue. DirectoryFailures lists directory errors separately, with failed mkdir report rows; Summary counts files. An unknown URL-issuance outcome stops new dispatch and is never automatically replayed. Issuance may consume download-count quota even when content fails. Explicit service denials such as 403 retain the service code/status/request ID and set IssuanceOutcomeUnknown=false. Forbidden.ShareDownloadDisabled can mean downloads are forbidden or the quota is exhausted; ask the owner to check both.", "有强 ETag 或 CRC64 且大于等于 20MB 的文件自动使用并发 16MiB Range，无需 checkpoint；--checkpoint-threshold 调整阈值。缺少两种标识时使用单次流式 GET。内容重试复用已签发 URL。普通文件失败后继续其他文件。DirectoryFailures 单列目录错误，并写入失败 mkdir 报告行；Summary 仅统计文件。URL 签发结果未知时停止新派发，绝不自动重签。即使内容失败，签发仍可能消耗下载次数配额。403 等明确拒绝保留服务端错误码、状态和 request ID，并设置 IssuanceOutcomeUnknown=false。Forbidden.ShareDownloadDisabled 可能表示禁止下载或次数耗尽，请分享者检查两者。"),
+    ("Listing echo and file-count progress use stderr and default to TTY. --list-echo/--no-list-echo control listing echo; --progress/--no-progress control progress; --quiet disables both. Opposing echo/progress flags conflict. --progress-granularity part (default) or byte selects transfer progress units. --bandwidth-limit applies one bytes-per-second limit across all files/ranges; 0 is unlimited. Local transfer settings use CLI > selected profile adrive/shared transfer fields > ADRIVE environment > defaults, without loading account credentials or changing receiver authentication.", "列举回显和按文件计数的传输进度写入 stderr，默认在 TTY 开启。--list-echo/--no-list-echo 控制列举回显；--progress/--no-progress 控制进度；--quiet 关闭两者。同组相反参数互斥。--progress-granularity part（默认）或 byte 选择传输进度单位。--bandwidth-limit 对全部文件和 Range 共享每秒字节限速；0 不限速。本地传输设置优先级为 CLI > 所选 profile 的 adrive/shared 传输字段 > ADRIVE 环境变量 > 默认值；不加载账户凭据，也不改变接收鉴权。"),
+    // [Review Fix #ShareTransferDocs1] Both entrypoints expose the same cp-compatible receiver controls.
+    ("Include the source directory/prefix name under the destination path", "在目标路径下保留源目录/前缀名称"),
+    ("Include pattern, matching cp relative source paths", "包含模式，按 cp 的源相对路径匹配"),
+    ("Exclude pattern, matching cp relative source paths", "排除模式，按 cp 的源相对路径匹配"),
+    ("Legacy alias for force overwrite (the default strategy)", "强制覆盖的兼容参数（默认策略）"),
+    ("Force overwrite, matching cp's default strategy", "强制覆盖，与 cp 默认策略一致"),
+    ("Do not overwrite existing files", "不覆盖现有文件"),
+    ("Enable recovery with a stable task checkpoint; optionally supply an explicit FILE", "使用稳定任务 checkpoint 启用恢复；可选显式 FILE 路径"),
+    ("Directory for automatic task checkpoints (default ~/.tos/checkpoints/ve-adrive)", "自动任务 checkpoint 的目录（默认 ~/.tos/checkpoints/ve-adrive）"),
+    ("Maximum files/items running concurrently (default 16)", "同时执行的最大文件/条目数（默认 16）"),
+    ("Maximum directory prefixes listed concurrently (default 4)", "同时列举的最大目录前缀数（默认 4）"),
+    ("Progress granularity: part (default) or byte", "进度粒度：part（默认）或 byte"),
+    ("Shared bytes-per-second limit for all files and ranges (for example 100MB; 0 is unlimited)", "全部文件和 Range 共享的每秒字节限速（例如 100MB；0 不限速）"),
+    ("Write batch success/failure report to this path", "批量成功/失败报告写入此路径"),
+    ("Write only failed items to the batch report", "批量报告仅写入失败条目"),
+    ("Write planned transfer manifest to this path", "计划传输清单写入此路径"),
+    ("Disable the manifest CSV; preserve the safety pre-scan and recovery snapshot", "关闭 manifest CSV；保留安全预扫描和恢复快照"),
+    ("Enable listing echo even when stderr is not a TTY", "即使 stderr 不是 TTY 也启用列举回显"),
+    ("Disable listing echo", "关闭列举回显"),
+    ("Enable execution progress output even when stderr is not a TTY", "即使 stderr 不是 TTY 也启用执行进度"),
+    ("Maximum entries to return from the current directory level", "当前目录层级最多返回的条目数"),
+    ("Sort field: key/name, size, or last-modified/mtime", "排序字段：key/name、size 或 last-modified/mtime"),
+    ("Write listing manifest to this path. No manifest is written unless this is set.", "列表清单写入此路径；未设置时不写清单"),
+    ("Validated resumed files and overwrite-policy skips; included in Completed; table succeeded equals Completed minus Skipped", "校验后恢复复用的文件及覆盖策略跳过项；包含在 Completed 中；表格 succeeded=Completed-Skipped"),
+    ("Skip explicit directory uploads. By default, preserve directories including empty directories. Files may still create required parent directories", "跳过显式目录上传。默认保留目录，包括空目录。文件仍可能创建所需的父目录"),
     // [Review Fix #Rebase1] Keep both ByteTOS/ZTI and share help when rebasing onto master.
     // [Review Fix #21] Keep ByteTOS-specific config and doctor help localized
     // after their parser metadata stopped inheriting the ve-tos wording.
@@ -547,12 +578,19 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Share Links:", "分享链接："),
 
     // [Review Fix #LiveDocs1] Keep approved page/API mapping, local-root and rejection rules visible in Chinese help/Describe.
-    ("Standard IDS hosts map between idsapi/idsapp and idsapi-boe/idsapp-boe under volces.com, preserving the Instance label, scheme and port. Share pages, receiver APIs and download addresses support HTTP and HTTPS without protocol upgrades. Override custom page origins with --share-base-url and receiver API origins with --endpoint. Anonymous receivers derive APIs from page URLs without account config; explicit OAuth uses the selected profile API or --endpoint.", "标准 IDS 域名在 volces.com 下按 idsapi/idsapp、idsapi-boe/idsapp-boe 对应，保留实例前缀、协议和端口。分享页面、接收 API 及下载地址支持 HTTP 和 HTTPS，不自动升级协议。自定义页面使用 --share-base-url，接收 API 使用 --endpoint。匿名接收从页面 URL 推导 API，不读取账户配置；显式 OAuth 使用所选 profile 的 API 或 --endpoint。"),
-    ("The OS resolves user-selected destination and checkpoint directory aliases before the CLI pins them; downloaded subpaths still reject symlinks/reparse points. Resume compares resolved roots. Explicit service denials such as 403 retain their error code and set IssuanceOutcomeUnknown=false; ambiguous URL issuance is never automatically replayed. No --path selects all shared roots; a single-file share is selected automatically, while folders require --recursive. Preflight can create directory scaffolding before a later transfer denial. The default download table shows a cp-style summary (total/succeeded/failed/skipped/pending), including empty results; JSON and explicit queries retain file details. Summary.Skipped counts validated completed files reused during resume and is included in Summary.Completed. Files at least 20MB with a strong ETag or CRC64 automatically use parallel 16MiB ranges without requiring a checkpoint; files without either identity use one streamed GET to avoid mixing versions; --checkpoint-threshold changes the threshold and --multipart-concurrency changes the default 4 concurrent ranges. Range retries reuse the same issued URL; completed-file resume remains file-level. Scanning and file-count progress use stderr, with per-file range completion shown during large-file transfers; enabled on TTY by default; --progress forces progress, while --no-progress or --quiet disables it. --progress and --no-progress are mutually exclusive. Forbidden.ShareDownloadDisabled requires the share owner to enable --permission download.", "用户指定的目标目录及 checkpoint 目录别名由操作系统解析后固定；下载内容的子路径仍拒绝符号链接/reparse 点。恢复时比较解析后的根目录。403 等明确服务端拒绝保留错误码，IssuanceOutcomeUnknown=false；结果不明确的下载 URL 签发不会自动重试。不传 --path 时选择全部分享根；单文件自动选中，目录需要 --recursive。预检查可能先创建目录结构，后续下载被拒绝时会留下空目录。默认下载表格显示与 cp 类似的汇总（total/succeeded/failed/skipped/pending），空结果也显示；JSON 和显式 query 保留文件明细。Summary.Skipped 统计恢复时复用的已验证完成文件，并包含在 Summary.Completed 中。有强 ETag 或 CRC64 且大于等于 20MB 的文件自动使用并发的 16MiB Range，无需 checkpoint；缺少这两种版本校验信息时使用单次流式 GET，避免混合版本；--checkpoint-threshold 调整阈值，--multipart-concurrency 调整默认 4 路并发。分片重试复用已签发 URL；checkpoint 仍只恢复已完成文件。扫描、按文件计数和当前文件分片进度写入 stderr，TTY 默认开启；--progress 强制开启，--no-progress 或 --quiet 关闭。--progress 与 --no-progress 互斥。Forbidden.ShareDownloadDisabled 需要分享者开启 --permission download。"),
+    ("Management ShareUrl uses the server ShareURL unless share-endpoint is configured. Override precedence: --share-endpoint > selected profile share_endpoint > ADRIVE_SHARE_ENDPOINT > legacy ADRIVE_SHARE_BASE_URL; overrides append /share/<encoded ShareID> without adding an Instance label or password. Without a server URL or override, the successful ShareID is retained, ShareUrl is omitted and ShareUrlWarning explains the missing URL; the API endpoint is never used to construct it. Create/get may retain the server URL pwd query for authorized delivery; list/update remove all query parameters and omit passwords. Standard IDS receiver hosts map between idsapp/idsapi and idsapp-boe/idsapi-boe under volces.com, preserving the Instance label, scheme and port. Share pages, receiver APIs and download addresses support HTTP and HTTPS without protocol upgrades. Custom receiver APIs use --endpoint. Anonymous receivers derive APIs from page URLs without account config; explicit OAuth uses the selected profile API or --endpoint.", "管理结果的 ShareUrl 默认使用服务端 ShareURL；配置 share-endpoint 时覆盖。优先级：--share-endpoint > 所选 profile 的 share_endpoint > ADRIVE_SHARE_ENDPOINT > 旧变量 ADRIVE_SHARE_BASE_URL；覆盖值后拼接 /share/<编码后的 ShareID>，不添加实例前缀或密码。服务端 URL 和覆盖值均缺失时，保留成功的 ShareID，省略 ShareUrl，并以 ShareUrlWarning 提示缺失；不使用 API endpoint 推导页面 URL。create/get 可保留服务端 URL 的 pwd 查询参数供授权交付；list/update 移除全部查询参数且不返回密码。接收端标准 IDS 域名在 volces.com 下按 idsapp/idsapi、idsapp-boe/idsapi-boe 对应，保留实例前缀、协议和端口。分享页面、接收 API 及下载地址支持 HTTP 和 HTTPS，不自动升级协议。自定义接收 API 使用 --endpoint。匿名接收从页面 URL 推导 API，不读取账户配置；显式 OAuth 使用所选 profile 的 API 或 --endpoint。"),
+    ("The OS resolves user-selected destination and checkpoint directory aliases before the CLI pins them; downloaded subpaths reject traversal, symlinks/reparse points and case/Unicode or file/directory collisions with Conflict (exit 9). Resume compares resolved roots and verifies completed local sizes/digests; changes fail with Conflict. No --path selects all shared roots; a single-file share is selected automatically, while folders require --recursive. Directory contents map like cp by default; --include-parent retains the selected directory name. For a whole-Space share, omitting --path or using --path / selects the entire Space and requires --recursive. It preserves the full Space-relative hierarchy; --include-parent adds no wrapper because the Space root has no basename. A selected subdirectory keeps the cp layout rules. Multiple roots with colliding contents fail safely; use --include-parent to preserve distinct root names instead of guessing new names. --include and --exclude match cp relative source paths. Default parallelism is 16 files, 4 directory listings and 4 ranges per file; --batch-concurrency, --list-concurrency and --multipart-concurrency override these positive values.\n\nOverwrite defaults to force, matching cp. --force and legacy --overwrite select force; --no-clobber skips existing ordinary files, and --overwrite-strategy newer replaces only older destinations. Replacements publish only after verification. --checkpoint [FILE] enables recovery; a bare flag uses a stable task path under ~/.tos/checkpoints/ve-adrive, --checkpoint-dir overrides that directory, and FILE preserves the legacy explicit path. --resume uses the saved selection and policy, revalidates completed files and restores verified partial ranges. Keep selection, filters, layout and overwrite policy unchanged; old checkpoints with the directory-name layout need --include-parent. New remote files are not added during resume. Keep the checkpoint JSON together with its .completed/ completion-ledger directory and .parts/ directory when retaining or moving recovery state; completed entries in the main JSON are not updated after every file.\n\nActual downloads create directories, temporary files, default report/manifest CSVs and enabled checkpoint/lock state; preflight may leave empty directories before a later denial. --report-path and --manifest-path override defaults under ~/.tos/reports/ve-adrive; --report-failures-only filters report rows only. --no-manifest disables the manifest CSV while preserving the safety pre-scan and recovery snapshot. Aggregate data includes report_path, manifest_path and checkpoint_path. Report CSV rows retain the request_id of their own operation; artifacts exclude passwords, tokens and signed URLs. The default table shows a cp-style summary of total/succeeded/failed/skipped/pending; Summary.Skipped includes verified resumed files and overwrite-policy skips, is included in Summary.Completed, and succeeded=Completed-Skipped. Files.Status may be completed, failed, pending or skipped; JSON and explicit queries retain details.\n\nFiles at least 20MB with a strong ETag or CRC64 automatically use parallel 16MiB ranges without requiring checkpoint; --checkpoint-threshold changes the threshold. Files lacking both identities use one streamed GET. Content retries reuse the issued URL. Ordinary file failures allow other files to continue. DirectoryFailures lists directory errors separately, with failed mkdir report rows; Summary counts files. An unknown URL-issuance outcome stops new dispatch and is never automatically replayed. Issuance may consume download-count quota even when content fails. Explicit service denials such as 403 retain the service code/status/request ID and set IssuanceOutcomeUnknown=false. Forbidden.ShareDownloadDisabled can mean downloads are forbidden or the quota is exhausted; ask the owner to check both.\n\nListing echo and file-count progress use stderr and default to TTY. --list-echo/--no-list-echo control listing echo; --progress/--no-progress control progress; --quiet disables both. Opposing echo/progress flags conflict. --progress-granularity part (default) or byte selects transfer progress units. --bandwidth-limit applies one bytes-per-second limit across all files/ranges; 0 is unlimited. Local transfer settings use CLI > selected profile adrive/shared transfer fields > ADRIVE environment > defaults, without loading account credentials or changing receiver authentication.", "操作系统先解析用户指定的目标目录及 checkpoint 目录别名，再固定实际根目录；下载子路径拒绝穿越、符号链接/reparse 点、大小写及 Unicode 或文件/目录冲突，返回 Conflict（退出码 9）。恢复时比较解析后的根目录，并验证已完成本地文件大小和摘要；变化时返回 Conflict。不传 --path 时选择全部分享根；单文件自动选中，目录需要 --recursive。默认与 cp 一样复制目录内容；--include-parent 保留选中目录名。整 Space 分享省略 --path 或使用 --path / 时选择整个 Space，且需要 --recursive；保留完整空间相对层级。Space 根没有 basename，因此 --include-parent 不增加包装目录；选中子目录时仍遵循 cp 布局。多个根目录的内容同名时安全拒绝；用 --include-parent 保留不同根目录名，不猜测重命名。--include 和 --exclude 按 cp 的源相对路径匹配。默认并发为 16 个文件、4 个目录列举和每文件 4 个 Range；--batch-concurrency、--list-concurrency 和 --multipart-concurrency 可用正整数覆盖。\n\n覆盖策略默认 force，与 cp 一致。--force 和兼容的 --overwrite 选择 force；--no-clobber 跳过已有普通文件，--overwrite-strategy newer 仅替换较旧目标。校验完成后才发布替换文件。--checkpoint [FILE] 启用恢复；裸参数使用 ~/.tos/checkpoints/ve-adrive 下的稳定任务路径，--checkpoint-dir 覆盖目录，FILE 保留旧显式路径写法。--resume 使用保存的选择和策略，重新验证已完成文件，并恢复已验证的部分 Range。选择、过滤、目录布局和覆盖策略须保持一致；保留目录名布局的旧 checkpoint 需使用 --include-parent。恢复不加入新增远端文件。保存或迁移恢复状态时须同时保留 checkpoint JSON、.completed/ 增量账本目录和 .parts/ 目录；主 JSON 的 completed 不会逐文件实时更新。\n\n实际下载创建目录、临时文件、默认 report/manifest CSV，以及启用的 checkpoint/锁状态；预检查可能在后续服务拒绝前留下空目录。--report-path 和 --manifest-path 覆盖 ~/.tos/reports/ve-adrive 下的默认路径；--report-failures-only 只过滤报告行。--no-manifest 关闭 manifest CSV，仍保留安全预扫描和恢复快照。聚合 data 包含 report_path、manifest_path、checkpoint_path。报告 CSV 行保留自身操作的 request_id；产物不含密码、token 或签名 URL。默认表格显示 total/succeeded/failed/skipped/pending；Summary.Skipped 包括校验后复用的恢复文件和覆盖策略跳过项，包含在 Summary.Completed 中，succeeded=Completed-Skipped。Files.Status 可为 completed、failed、pending 或 skipped；JSON 和显式 query 保留详情。\n\n有强 ETag 或 CRC64 且大于等于 20MB 的文件自动使用并发 16MiB Range，无需 checkpoint；--checkpoint-threshold 调整阈值。缺少两种标识时使用单次流式 GET。内容重试复用已签发 URL。普通文件失败后继续其他文件。DirectoryFailures 单列目录错误，并写入失败 mkdir 报告行；Summary 仅统计文件。URL 签发结果未知时停止新派发，绝不自动重签。即使内容失败，签发仍可能消耗下载次数配额。403 等明确拒绝保留服务端错误码、状态和 request ID，并设置 IssuanceOutcomeUnknown=false。Forbidden.ShareDownloadDisabled 可能表示禁止下载或次数耗尽，请分享者检查两者。\n\n列举回显和按文件计数的传输进度写入 stderr，默认在 TTY 开启。--list-echo/--no-list-echo 控制列举回显；--progress/--no-progress 控制进度；--quiet 关闭两者。同组相反参数互斥。--progress-granularity part（默认）或 byte 选择传输进度单位。--bandwidth-limit 对全部文件和 Range 共享每秒字节限速；0 不限速。本地传输设置优先级为 CLI > 所选 profile 的 adrive/shared 传输字段 > ADRIVE 环境变量 > 默认值；不加载账户凭据，也不改变接收鉴权。"),
 
+    // [Review Fix #ShareReviewDocs] Root and standalone help use the same planning/input wording.
+    ("Download --dry-run uses read-only share info/token/list/get metadata requests to enumerate every selected page and recursive folder, or validate the saved resume snapshot and completed local file digests. It returns selection.Manifest, PlanComplete=true, FileCount, DirectoryCount, TotalBytes, SkippedCount and Conflicts, plus expected report_path, manifest_path and checkpoint_path. Completed plans with local conflicts exit 9 and retain the plan. DownloadsIssued=0; LocalWrites=false means no local writes: no URL issuance, content fetch, directory creation, temporary file, checkpoint, lock, report or manifest writes. MetadataResponses counts received metadata responses; NetworkRequests=null because wire attempts are not counted. SnapshotGuaranteed=false: remote content and local paths can change after inspection. Missing or negative file sizes fail validation (exit 6); explicit zero is a valid empty file. OAuth dry-run disables automatic refresh to avoid credential and auth-lock writes. If the token is expired, within 60 seconds of expiry, or rejected with 401, first run ve-adrive --profile <profile> share inspect <share-url> --auth-mode oauth as a normal OAuth read to refresh, then retry. Planning never acquires the checkpoint lock; an existing regular sidecar may be active. Execution rechecks state and acquires its lock.", "Download --dry-run 仅通过只读分享 info/token/list/get 元数据请求，枚举全部选中分页和递归目录，或验证保存的恢复快照及已完成本地文件摘要。返回 selection.Manifest、PlanComplete=true、FileCount、DirectoryCount、TotalBytes、SkippedCount、Conflicts，以及预计 report_path、manifest_path、checkpoint_path。完整计划有本地冲突时退出 9，并保留计划。DownloadsIssued=0、LocalWrites=false：不签发下载 URL、不取内容、不创建目录或临时文件，不写 checkpoint、锁、report 或 manifest。MetadataResponses 统计收到的元数据响应；未统计网络尝试次数，因此 NetworkRequests=null。SnapshotGuaranteed=false：检查后远端内容和本地路径仍可能变化。文件大小缺失或为负数时校验失败（退出码 6）；显式 0 是有效空文件。OAuth 预演禁用自动刷新，避免凭据及认证锁写入。token 已过期、距到期 60 秒内或收到 401 时，先正常执行 ve-adrive --profile <profile> share inspect <share-url> --auth-mode oauth 刷新，再重试。规划不获取 checkpoint 锁；已有普通锁文件可能正被使用。实际执行会重新检查并加锁。"),
+    ("Explicit --password-stdin must contain a nonempty password after removing one terminal LF or CRLF; EOF-only, LF-only and CRLF-only input fail validation (exit 6). Significant spaces are preserved. Omitting the flag leaves an existing password unchanged on update. create/update --dry-run also reads and validates explicit stdin; --describe and --help never read stdin.", "显式 --password-stdin 在移除末尾一个 LF 或 CRLF 后必须为非空密码；仅 EOF、LF 或 CRLF 的输入校验失败（退出码 6）。有意义的空格会保留。update 省略该参数时保留现有密码。create/update --dry-run 也读取并校验显式 stdin；--describe 和 --help 从不读取 stdin。"),
+    ("--describe and --help do not load config, access the network or read stdin. Share --dry-run is offline except download metadata planning. Explicit create/update --password-stdin is read and validated during dry-run.", "--describe 和 --help 不加载配置、不访问网络、不读取 stdin。分享命令的 --dry-run 除下载元数据规划外均离线执行。create/update 在 dry-run 时仍读取并校验显式 --password-stdin。"),
     // [Review Fix #ShareTrailingSlash3] Root and dedicated help share this full phrase; translate the new URL rule without an English fallback.
     ("inspect/files/view/download default to anonymous even if a profile configures OAuth. Explicit --auth-mode oauth reuses --profile via auth login/status and existing token refresh; it never starts login or falls back to another identity. OAuth authenticates share info/token exchange; file APIs use only x-share-token and content downloads carry no account credentials. Login and share permissions are validated by the service; passwords are still required when configured. Public URLs accept /share/<id> or /share/<id>/; one trailing slash is normalized away. Select directory prefixes with --path, not additional URL segments.", "inspect/files/view/download 默认匿名，即使 profile 配置了 OAuth。显式 --auth-mode oauth 通过 auth login/status 复用 --profile 和现有 token 刷新机制；不会自动登录或回退到其他身份。OAuth 用于分享概况及 token 交换；文件 API 仅使用 x-share-token，内容下载不携带账户凭据。服务端验证登录和分享权限；设置了提取码时仍须提供。公开 URL 支持 /share/<id> 和 /share/<id>/，末尾一个斜杠会被规范化移除。目录前缀通过 --path 指定，不追加到 URL 路径。"),
-    ("files returns one directory page: --limit sets its size and --marker uses the previous NextMarker; stop when IsTruncated=false. Exact file paths select one file; directory paths end in /. Each invocation needs the extraction code when configured: stdin > URL pwd > hidden ordinary-TTY prompt. --password-stdin reads to EOF (use a pipe); passwords are not saved. Download enumerates pages automatically. For files, default table/CSV uses the same file_path, size, file_type, updated_at and is_folder columns as ls, with folders first. The table Total counts displayed rows; JSON and explicit --query retain the raw service arrays.", "files 返回一页目录：--limit 设置条数，--marker 使用上一页的 NextMarker；IsTruncated=false 时结束。精确文件路径选择一个文件；目录路径以 / 结尾。设置了提取码时每次调用均需提供：stdin > URL pwd > 普通终端隐藏提示。--password-stdin 读取到 EOF（使用管道）；不会保存密码。Download 自动枚举各页。files 的默认 table/CSV 与 ls 使用相同的 file_path、size、file_type、updated_at、is_folder 列，目录在前。表格 Total 为展示行数；JSON 和显式 --query 保留服务原始数组。"),
+    // [Review Fix #ShareFilesMaxKeysZh] Root help matches the files pagination contract used by standalone discovery.
+    ("files lists the current directory level like ls. --max-keys (default 1000) caps files and folders together; service pages are fetched automatically until the cap or listing end. Continue with --marker using the previous NextMarker; IsTruncated=false means the listing ended. --limit is not supported. Exact file paths select one file; directory paths end in /. For a whole-Space share, omitting --path or using --path / lists the Space root. Each invocation needs the extraction code when configured: stdin > URL pwd > hidden ordinary-TTY prompt. --password-stdin reads to EOF (use a pipe); passwords are not saved. Default table/CSV uses the same file_path, size, file_type, updated_at and is_folder columns as ls, with folders first. --human-readable (-H) formats table/CSV sizes and --columns selects display fields. Explicit --sort key/name|size|last-modified/mtime orders the current capped set in every output format and explicit queries, preserving raw metadata values and pagination markers. --manifest-path explicitly writes a listing CSV; files writes no manifest by default. Folder markers, self markers and duplicates are normalized in all output modes; Total and pagination.total_returned count the same logical entries. JSON and explicit --query retain the aggregated normalized Files/Folders metadata.", "files 与 ls 一样列举当前目录层级。--max-keys（默认 1000）限制文件和目录的合计条目数；自动获取服务分页，直到达到上限或列举结束。使用 --marker 传入上一次的 NextMarker 继续；IsTruncated=false 表示列举结束。不支持 --limit。精确文件路径选择一个文件；目录路径以 / 结尾。整 Space 分享省略 --path 或使用 --path / 时列举 Space 根。设置了提取码时每次调用均需提供：stdin > URL pwd > 普通终端隐藏提示。--password-stdin 读取到 EOF（使用管道）；不会保存密码。默认 table/CSV 与 ls 使用相同的 file_path、size、file_type、updated_at、is_folder 列，目录在前。--human-readable（-H）格式化 table/CSV 大小，--columns 选择显示列。显式 --sort key/name|size|last-modified/mtime 对本次上限内的结果在所有格式及显式 query 中排序，保留原始元数据值及分页 marker。仅显式 --manifest-path 写出列表 CSV；files 默认不写 manifest。所有输出模式均规范化目录标记、自身目录标记及重复项；Total 和 pagination.total_returned 统计相同的逻辑条目。JSON 和显式 --query 保留聚合且规范化后的 Files/Folders 元数据。"),
+    // [Review Fix #ShareDownloadSelectionZh] Both entrypoints retain download selection and password precedence without files flags.
+    ("Downloads enumerate all selected service pages automatically. Exact file paths select one file; directory paths end in / and require --recursive. Password precedence is stdin > URL pwd > hidden ordinary-TTY prompt; --password-stdin reads to EOF (use a pipe), and passwords are not saved.", "下载自动枚举全部选中服务分页。精确文件路径选择一个文件；目录路径以 / 结尾，并需要 --recursive。密码优先级为 stdin > URL pwd > 普通终端隐藏提示；--password-stdin 读取到 EOF（使用管道），不会保存密码。"),
     ("Manage and receive share links", "管理和接收分享链接"),
     ("Create a share link", "创建分享链接"),
     ("Get a share link", "获取分享链接"),
@@ -578,8 +616,11 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Require receiver login; accepts explicit true or false", "要求接收者登录；显式接受 true 或 false"),
     ("Maximum preview count; 0 means unlimited", "最大预览次数；0 表示无限制"),
     ("Maximum download count; 0 means unlimited", "最大下载次数；0 表示无限制"),
-    ("ADrive file or folder target", "ADrive 文件或文件夹目标"),
-    ("Share page origin override", "分享页面源地址覆盖值"),
+    // [Review Fix #WholeSpaceZh] Root scope and absent scope fields need the same bilingual contract.
+    ("create shares one file, one folder or a whole Space. adrive://instance/space (with an optional trailing slash) selects the whole Space with ShareAllFiles=true and FilePathList=[]; --instance instance --space space selects the same root. Non-root file/folder targets omit ShareAllFiles (default false) and retain one FilePathList entry. Explicit empty --file values remain invalid.", "create 可分享一个文件、一个目录或整个 Space。adrive://instance/space（末尾可带一个斜杠）选择整个 Space，使用 ShareAllFiles=true 和 FilePathList=[]；--instance instance --space space 选择同一个根。非根文件/目录请求省略 ShareAllFiles（默认 false），并保留单项 FilePathList。显式空 --file 仍无效。"),
+    ("Whether the share covers the whole Space; omitted when not returned by the service", "分享是否覆盖整个 Space；服务端未返回时省略"),
+    ("ADrive file, folder or Space root target", "ADrive 文件、文件夹或 Space 根目标"),
+    ("Share page origin override; otherwise use server ShareURL", "分享页面源地址覆盖值；未配置时使用服务端 ShareURL"),
     ("Share identifier", "分享标识符"),
     ("Share identifier or adrive://instance/share-id", "分享标识符或 adrive://instance/share-id"),
     ("Treat the share target instance as a name and resolve it to an ID", "将分享目标中的实例视为名称并解析为 ID"),
@@ -606,6 +647,9 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Resume using the checkpoint file", "使用 checkpoint 文件续传"),
     ("Share password supplied through child stdin", "通过子进程标准输入提供的分享密码"),
     ("Share password returned for authorized delivery", "为授权交付返回的分享密码"),
+    // [Review Fix #ShareServerURLSchemaZh] Localize optional service URL and missing-URL output guidance.
+    ("Server ShareURL or a URL built from the configured share-endpoint; omitted when unavailable", "服务端 ShareURL 或按配置的 share-endpoint 拼接的 URL；不可用时省略"),
+    ("Successful share result has no usable URL; retain ShareID and configure share-endpoint or retrieve the share again", "分享操作成功但缺少可用 URL；请保留 ShareID，配置 share-endpoint 或重新获取分享"),
     ("Share settings are mutable; the shared target cannot change.", "分享设置可修改；分享目标不可更改。"),
     ("Anonymous receiver access never loads account credentials.", "匿名接收访问不加载账户凭据。"),
 
@@ -1678,8 +1722,8 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
         "要授权的 ADrive Instance ID。覆盖 profile default_instance 和 ADRIVE_DEFAULT_INSTANCE；两者均未配置时必填",
     ),
     (
-        "OAuth Authorization Server base URL. Required unless configured in the selected profile or ADRIVE_AUTH_ENDPOINT",
-        "OAuth 授权服务器基础 URL。除非已在所选 profile 或 ADRIVE_AUTH_ENDPOINT 中配置，否则必填",
+        "OAuth Authorization Server base URL. Overrides profile auth_endpoint and ADRIVE_AUTH_ENDPOINT; defaults to the effective endpoint",
+        "OAuth 授权服务器基础 URL。覆盖 profile 的 auth_endpoint 和 ADRIVE_AUTH_ENDPOINT；默认使用有效 endpoint",
     ),
     (
         "Human-readable device name shown during authorization",
@@ -1775,6 +1819,11 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Source path", "源路径"),
     ("Destination path", "目标路径"),
     ("Recursive copy", "递归复制"),
+    // [Review Fix #FilteredHnsHelp] CLI help has a separate catalog from metadata.
+    (
+        "Recursive move for directories or prefixes. For HNS sources, filtered recursive moves select files only and preserve source directories and excluded files when using --include/--exclude. Without filters, whole-directory rename remains available.",
+        "递归移动目录或前缀。以 HNS 为源时，使用 --include/--exclude 仅移动选中的文件，保留源目录和排除的文件。未使用筛选条件时，仍可执行整目录 rename。",
+    ),
     (
         "Recursive move for directories or prefixes",
         "递归移动目录或前缀",
@@ -2665,7 +2714,7 @@ mod chinese_help_catalog_tests {
             "- region",
             "- requesttimeout",
             "- secret_access_key",
-            "share_base_url",
+            "share_endpoint",
             "access_key_id / secret_access_key / security_token",
             "account_id / default_instance / default_space",
             "auth_mode (aksk, oauth, or unified) / region / endpoint / auth_endpoint",
@@ -4255,10 +4304,161 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 }
 
 fn tool_position(args: &[String], tool: &str) -> Option<usize> {
-    args.iter()
-        .skip(1)
-        .position(|arg| arg_matches_tool(arg, tool))
-        .map(|pos| pos + 1)
+    // [Review Fix #CommandIdentity1] Only the first root operand selects a
+    // service; profile values and nested operands may have the same spelling.
+    let mut index = 1;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            return None;
+        }
+        if !argument.starts_with('-') || argument == "-" {
+            return arg_matches_tool(argument, tool).then_some(index);
+        }
+        index += 1 + usize::from(has_separate_option_value(argument, args.get(index + 1)));
+    }
+    None
+}
+
+fn has_separate_option_value(argument: &str, next: Option<&String>) -> bool {
+    if argument == "--no-color" {
+        use clap::builder::TypedValueParser;
+        return next.is_some_and(|value| {
+            clap::builder::BoolishValueParser::new()
+                .possible_values()
+                .into_iter()
+                .flatten()
+                .any(|candidate| candidate.get_name().eq_ignore_ascii_case(value))
+        });
+    }
+    if argument.starts_with("--") {
+        return flag_takes_value(argument);
+    }
+    // [Review Fix #CommandIdentity2] A short-option cluster consumes the next
+    // argument only when its first value-taking option has no attached value.
+    let shorts = argument.strip_prefix('-').unwrap_or_default();
+    shorts
+        .char_indices()
+        .find(|(_, short)| flag_takes_value(&format!("-{short}")))
+        .is_some_and(|(offset, short)| offset + short.len_utf8() == shorts.len())
+}
+
+#[cfg(test)]
+mod command_identity_tests {
+    use super::{recovered_command_path, tool_position};
+
+    fn strings(arguments: &[&str]) -> Vec<String> {
+        arguments
+            .iter()
+            .map(|argument| (*argument).into())
+            .collect()
+    }
+
+    #[test]
+    fn command_identity_skips_separate_global_option_values() {
+        for option in [
+            "--profile",
+            "-P",
+            "--endpoint",
+            "--query",
+            "--config-path",
+            "--trace-dir",
+        ] {
+            let arguments = strings(&[
+                "cli",
+                option,
+                "tos",
+                "ve-adrive",
+                "share",
+                "download",
+                "--describe",
+            ]);
+            assert_eq!(tool_position(&arguments, "ve-adrive"), Some(3), "{option}");
+            assert_eq!(tool_position(&arguments, "byted-tos"), None, "{option}");
+        }
+    }
+
+    #[test]
+    fn command_identity_ignores_nested_values_and_other_services() {
+        let arguments = strings(&[
+            "cli",
+            "ve-adrive",
+            "share",
+            "get",
+            "tos",
+            "--profile",
+            "ve-tos",
+            "--describe",
+        ]);
+        assert_eq!(tool_position(&arguments, "ve-adrive"), Some(1));
+        assert_eq!(tool_position(&arguments, "byted-tos"), None);
+        assert_eq!(tool_position(&arguments, "ve-tos"), None);
+    }
+
+    #[test]
+    fn command_identity_skips_inline_and_clustered_short_options() {
+        for options in [
+            vec!["--profile=ve-adrive"],
+            vec!["-Pve-adrive"],
+            vec!["-qP", "ve-adrive"],
+            vec!["-vqPve-adrive"],
+        ] {
+            let mut arguments = strings(&["cli"]);
+            arguments.extend(strings(&options));
+            let expected = arguments.len();
+            arguments.extend(strings(&["ve-tos", "cp", "--describe"]));
+            assert_eq!(tool_position(&arguments, "ve-tos"), Some(expected));
+            assert_eq!(tool_position(&arguments, "ve-adrive"), None);
+        }
+    }
+
+    #[test]
+    fn command_identity_handles_optional_boolean_options() {
+        for options in [
+            vec!["--no-color"],
+            vec!["--no-color", "true"],
+            vec!["--no-color", "No"],
+            vec!["--no-color=on"],
+        ] {
+            let mut arguments = strings(&["cli"]);
+            arguments.extend(strings(&options));
+            let expected = arguments.len();
+            arguments.extend(strings(&["tos", "cp", "--describe"]));
+            assert_eq!(tool_position(&arguments, "byted-tos"), Some(expected));
+        }
+    }
+
+    #[test]
+    fn command_identity_rejects_missing_values_and_later_root_operands() {
+        for arguments in [
+            vec!["cli", "--profile", "ve-adrive"],
+            vec!["cli", "unknown", "ve-adrive"],
+            vec!["cli", "--", "ve-adrive"],
+        ] {
+            assert_eq!(
+                tool_position(&strings(&arguments), "ve-adrive"),
+                None,
+                "{arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_identity_recovery_skips_nested_option_values() {
+        for options in [
+            vec!["-qP", "tos"],
+            vec!["--no-color", "No"],
+            vec!["--profile", "ve-tos"],
+        ] {
+            let mut arguments = strings(&["cli", "ve-adrive"]);
+            arguments.extend(strings(&options));
+            arguments.extend(strings(&["share", "download", "--describe"]));
+            assert_eq!(
+                recovered_command_path(&arguments, "ve-adrive"),
+                "ve-adrive share download",
+                "{arguments:?}"
+            );
+        }
+    }
 }
 
 fn arg_matches_tool(arg: &str, tool: &str) -> bool {
@@ -4272,17 +4472,7 @@ fn recovered_command_path(effective_args: &[String], tool: &str) -> String {
     let Some(tool_idx) = tool_position(effective_args, tool) else {
         return tool.to_string();
     };
-    let mut tokens = Vec::new();
-    let mut iter = effective_args[(tool_idx + 1)..].iter().peekable();
-    while let Some(arg) = iter.next() {
-        if arg.starts_with('-') {
-            if flag_takes_value(arg.as_str()) {
-                let _ = iter.next();
-            }
-            continue;
-        }
-        tokens.push(arg.as_str());
-    }
+    let tokens = recovered_command_tokens(&effective_args[(tool_idx + 1)..]);
     if tokens.is_empty() {
         return canonical_tool_command(tool).to_string();
     }
@@ -4322,6 +4512,23 @@ fn recovered_command_path(effective_args: &[String], tool: &str) -> String {
         return recovered_adrive_command_path(&tokens);
     }
     format!("{} {}", canonical_tool_command(tool), tokens.join(" "))
+}
+
+fn recovered_command_tokens(arguments: &[String]) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut iter = arguments.iter().peekable();
+    while let Some(argument) = iter.next() {
+        if argument.starts_with('-') {
+            // [Review Fix #CommandIdentity4] Global options can appear between
+            // service and leaf; their values must not become command tokens.
+            if has_separate_option_value(argument, iter.peek().copied()) {
+                let _ = iter.next();
+            }
+        } else {
+            tokens.push(argument.as_str());
+        }
+    }
+    tokens
 }
 
 fn recovered_adrive_command_path(tokens: &[&str]) -> String {
@@ -4459,7 +4666,7 @@ fn flag_takes_value(flag: &str) -> bool {
             | "--require-login"
             | "--preview-limit"
             | "--download-limit"
-            | "--share-base-url"
+            | "--share-endpoint"
             | "--creator"
             | "--status"
             | "--created-at-start"
@@ -5241,7 +5448,14 @@ async fn handle_adrive(
             // [Review Fix #ShareReceiveGuidance1] Anonymous errors remain account-independent; explicit OAuth preserves the established login/refresh guidance.
             let is_anonymous_receiver =
                 is_receiver && auth.auth_mode != Some(ve_adrive_cli::domain::auth::AuthMode::Oauth);
-            let guidance = if is_anonymous_receiver {
+            let guidance = if is_receiver && semantics.code == "share_local_path_conflict" {
+                // [Review Fix #D04] Planning can fail on a local path before producing an aggregate; link/password advice would misdiagnose that conflict.
+                ve_adrive_cli::handler::common::AdriveErrorGuidance {
+                    suggested_action: "Inspect the local destination or checkpoint path; resolve the unsafe entry or choose another directory".into(),
+                    fix_command: None,
+                    doctor_hint: None,
+                }
+            } else if is_anonymous_receiver {
                 ve_adrive_cli::handler::common::AdriveErrorGuidance {
                     suggested_action:
                         "Check the share link, its password and anonymous access settings".into(),

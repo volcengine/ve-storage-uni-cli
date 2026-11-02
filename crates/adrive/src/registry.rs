@@ -64,7 +64,7 @@ const AUTH_PARAMS: &[RegistryParameter] = &[
     RegistryParameter {
         name: "auth-endpoint",
         required: false,
-        description: "OAuth Authorization Server for login; required unless the selected profile or ADRIVE_AUTH_ENDPOINT supplies it",
+        description: "OAuth Authorization Server for login; defaults to the effective endpoint after command/profile/environment Auth overrides",
     },
     RegistryParameter {
         name: "device-name",
@@ -256,6 +256,12 @@ const CP_PARAMS: &[RegistryParameter] = &[
         name: "recursive",
         required: false,
         description: "Traverse folders recursively",
+    },
+    // [Review Fix #DirectoryDiscovery] Upload policy must be visible in every discovery surface.
+    RegistryParameter {
+        name: "disable-dir-object",
+        required: false,
+        description: "Skip explicit directory uploads. By default, preserve directories including empty directories. Files may still create required parent directories",
     },
     RegistryParameter {
         name: "include-parent",
@@ -514,6 +520,12 @@ const SYNC_PARAMS: &[RegistryParameter] = &[
         name: "exact-timestamps",
         required: false,
         description: "Use exact timestamps for comparison",
+    },
+    // [Review Fix #DirectoryDiscovery] Upload policy must be visible in every discovery surface.
+    RegistryParameter {
+        name: "disable-dir-object",
+        required: false,
+        description: "Skip explicit directory uploads. By default, preserve directories including empty directories. Files may still create required parent directories",
     },
     RegistryParameter {
         name: "include-parent",
@@ -983,6 +995,8 @@ pub const CAPABILITIES: &[CapabilityRow] = &[
         api_actions: &[
             "get_instance",
             "get_space",
+            "list_files",
+            "create_folder",
             "put_file",
             "get_file",
             "copy_file",
@@ -1031,6 +1045,7 @@ pub const CAPABILITIES: &[CapabilityRow] = &[
             "get_instance",
             "get_space",
             "list_files",
+            "create_folder",
             "put_file",
             "get_file",
             "delete_file",

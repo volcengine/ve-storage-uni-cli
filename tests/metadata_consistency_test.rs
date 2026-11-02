@@ -10,6 +10,27 @@ fn output(args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn directory_upload_switch_is_boolean_on_every_cp_and_sync_surface() {
+    for surface in ["tos", "ve-tos", "ve-adrive"] {
+        for action in ["cp", "sync"] {
+            let result = output(&[surface, action, "--describe", "--output", "json"]);
+            assert!(result.status.success(), "{surface} {action}");
+            let document: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+            let parameter = document["data"]["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|parameter| parameter["name"] == "disable-dir-object")
+                .unwrap_or_else(|| panic!("missing directory switch for {surface} {action}"));
+            assert_eq!(parameter["schema"]["type"], "boolean");
+            let description = parameter["description"].as_str().unwrap();
+            assert!(description.contains("preserve directories including empty directories"));
+            assert!(!description.contains("--ddo"));
+        }
+    }
+}
+
+#[test]
 fn byte_tos_config_and_doctor_help_only_describe_supported_surface() {
     for command in [
         vec!["tos", "config", "--help"],

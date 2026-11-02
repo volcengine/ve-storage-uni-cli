@@ -410,11 +410,7 @@ impl Client {
         options: ClientOptions,
     ) -> Result<Self> {
         let (endpoint, region) = resolve_endpoint_and_region(endpoint, region)?;
-        if let RequestAuth::OAuth(manager) = &auth {
-            // [Review Fix #5] Recheck issuer/resource origin separation on
-            // every process start because Resource config may change post-login.
-            manager.validate_resource_origin(&endpoint)?;
-        }
+        // [Review Fix #OAuthEndpoint3] Shared Auth/Resource origins are valid deployment configurations.
         let http = reqwest::Client::builder()
             .user_agent(user_agent())
             .tcp_nodelay(true)
@@ -4000,7 +3996,7 @@ mod tests {
     }
 
     #[test]
-    fn oauth_client_rejects_resource_origin_equal_to_stored_auth_origin() {
+    fn oauth_client_accepts_resource_origin_equal_to_stored_auth_origin() {
         let (directory, manager) = oauth_manager(
             "https://same.example.com",
             "access-current",
@@ -4008,16 +4004,14 @@ mod tests {
             "inst-1",
         );
 
-        let error = Client::new_oauth(
+        let client = Client::new_oauth(
             manager,
             Some("https://same.example.com".to_string()),
             Some("test-region".to_string()),
             no_retry_options(),
         )
-        .err()
-        .expect("matching origins must be rejected");
-
-        assert!(error.to_string().contains("different origins"));
+        .expect("matching origins must be supported");
+        assert_eq!(client.endpoint(), "https://same.example.com");
         let _ = std::fs::remove_dir_all(directory);
     }
 

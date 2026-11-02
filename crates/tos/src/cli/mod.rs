@@ -500,6 +500,7 @@ mod command_path_tests {
             destination: "b".to_string(),
             recursive: false,
             include_parent: false,
+            disable_dir_object: false,
             include: None,
             exclude: None,
             checkpoint: false,

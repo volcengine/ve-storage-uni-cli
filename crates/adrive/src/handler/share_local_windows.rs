@@ -1,7 +1,9 @@
 //! Windows capability backend. Every directory handle excludes DELETE sharing;
 //! every opened component rejects all reparse tags, including junctions.
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
-use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt as CapOpenOptionsExt};
+use cap_std::fs::{
+    Dir, MetadataExt as CapMetadataExt, OpenOptions, OpenOptionsExt as CapOpenOptionsExt,
+};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::{
     fs::File,
@@ -68,9 +70,11 @@ impl SafeDir {
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(error) => return Err(error),
                 }
-                self.directory.open_dir_nofollow(name)?
+                self.directory
+                    .open_dir_nofollow(name)
+                    .map_err(|error| self.classify_entry_error(name, true, error))?
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(self.classify_entry_error(name, true, error)),
         };
         let file = opened.into_std_file();
         reject_reparse(&file, true)?;
@@ -80,6 +84,30 @@ impl SafeDir {
             directory: Arc::new(Dir::from_std_file(file)),
             ancestors,
         })
+    }
+    fn check_entry(&self, name: &std::ffi::OsStr, is_directory: bool) -> io::Result<()> {
+        let metadata = self.directory.symlink_metadata(name)?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || (is_directory && !metadata.is_dir())
+            || (!is_directory && !metadata.is_file())
+        {
+            return Err(super::share_local::path_conflict(
+                "reparse point or unexpected destination file type",
+            ));
+        }
+        Ok(())
+    }
+    fn classify_entry_error(
+        &self,
+        name: &std::ffi::OsStr,
+        is_directory: bool,
+        error: io::Error,
+    ) -> io::Error {
+        // [Review Fix #D04] Reclassify only a verified unsafe entry; preserve permission, disk and unrelated native failures.
+        match self.check_entry(name, is_directory) {
+            Err(conflict) if conflict.kind() == io::ErrorKind::AlreadyExists => conflict,
+            _ => error,
+        }
     }
     /// Resolve a relative directory below pinned handles; optionally create missing components, refusing reparse points.
     pub(crate) fn directory(&self, path: &str, is_create: bool) -> io::Result<Self> {
@@ -116,13 +144,40 @@ impl SafeDir {
     }
     /// Open an ordinary leaf without following reparse points and return its native handle or I/O error.
     pub(crate) fn read(&self, name: &str) -> io::Result<File> {
+        self.check_entry(std::ffi::OsStr::new(name), false)?;
         let mut options = OpenOptions::new();
         options
             .read(true)
             .follow(FollowSymlinks::No)
             .share_mode(FILE_SHARE_READ);
-        let file = self.directory.open_with(name, &options)?.into_std();
+        let file = self
+            .directory
+            .open_with(name, &options)
+            .map_err(|error| self.classify_entry_error(std::ffi::OsStr::new(name), false, error))?
+            .into_std();
         reject_reparse(&file, false)?;
+        Ok(file)
+    }
+    /// Open a read-only private ledger beside its existing writer; refuse reparse points, hard links and native failures.
+    pub(crate) fn read_shared(&self, name: &str) -> io::Result<File> {
+        self.check_entry(std::ffi::OsStr::new(name), false)?;
+        let mut options = OpenOptions::new();
+        // [Review Fix #ShareLedgerWin1] Sharing WRITE permits the existing RW handle, while this new handle requests only READ; the writer still refuses other writers.
+        options
+            .read(true)
+            .follow(FollowSymlinks::No)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        let file = self
+            .directory
+            .open_with(name, &options)
+            .map_err(|error| self.classify_entry_error(std::ffi::OsStr::new(name), false, error))?
+            .into_std();
+        reject_reparse(&file, false)?;
+        if cap_fs_ext::MetadataExt::nlink(&cap_std::fs::Metadata::from_file(&file)?) != 1 {
+            return Err(super::share_local::path_conflict(
+                "completion ledger must have exactly one link",
+            ));
+        }
         Ok(file)
     }
     /// Exclusively create a new ordinary temporary leaf; permit atomic publication while its handle is held.
@@ -140,8 +195,8 @@ impl SafeDir {
     }
     /// Publish by capability-relative rename or no-clobber hard link; propagate failures without following target links.
     pub(crate) fn replace(&self, source: &str, target: &str, is_overwrite: bool) -> io::Result<()> {
+        self.ordinary(target)?;
         if is_overwrite {
-            self.ordinary(target)?;
             self.directory.rename(source, &self.directory, target)?;
         } else {
             self.directory.hard_link(source, &self.directory, target)?;
@@ -160,7 +215,9 @@ fn reject_reparse(file: &File, is_directory: bool) -> io::Result<()> {
         || (is_directory && !metadata.is_dir())
         || (!is_directory && !metadata.is_file())
     {
-        return Err(invalid("reparse point or unexpected file type"));
+        return Err(super::share_local::path_conflict(
+            "reparse point or unexpected destination file type",
+        ));
     }
     Ok(())
 }
