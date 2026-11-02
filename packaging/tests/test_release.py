@@ -237,7 +237,10 @@ def test_packaging_readme_documents_github_release_upload_and_release_phases():
     assert "release.py checksums --out-dir dist" in readme
     assert "`--version <version>` expects `1.0.0`, not `v1.0.0`" in readme
     assert "--execute-publish --otp <otp-code>" in readme
-    assert "granular npm access token that has bypass 2FA enabled" in readme
+    npm_section = readme.split("Publish npm packages", 1)[1].split("Publish PyPI wheels", 1)[0]
+    assert "npm login --registry=https://registry.npmjs.org/" in npm_section
+    assert "granular" not in npm_section
+    assert "NPM_TOKEN" not in npm_section
     assert "For Linux PyPI wheels, use the `.2.17` target" in readme
     assert "Run this command once per PyPI target" in readme
     assert "`dist/pip/wheels/*.whl`" in readme
@@ -248,9 +251,13 @@ def test_packaging_readme_documents_github_release_upload_and_release_phases():
         )
     ]
     publish_section = readme[readme.index("### 3. Publish package registries") :]
-    assert "release.py homebrew" not in wrapper_section
-    assert "Homebrew formulae are macOS-only" not in wrapper_section
-    assert "Homebrew formulae are macOS-only" in publish_section
+    # [Review Fix #HomebrewSeparation] Generation belongs to step 2; step 3
+    # explains publishing the generated formulae through repository sync.
+    assert "release.py homebrew" in wrapper_section
+    assert "Homebrew formulae are macOS-only" in wrapper_section
+    assert "release.py homebrew" not in publish_section
+    assert "synchronized to the public GitHub repository" in publish_section
+    assert "### 4. Proposed internal ByteCloud TOS channel" not in readme
     assert "brew tap volcengine/ve-storage-uni-cli https://github.com/volcengine/ve-storage-uni-cli" in readme
     assert "homebrew --version <version> --checksums dist/SHA256SUMS --tap-dir ." in readme
     assert "synchronized to the public GitHub repository" in readme
@@ -871,6 +878,76 @@ def test_pip_parser_accepts_target_without_binary_dirs():
     assert args.binary_dir is None
 
 
+def test_pip_upload_only_uses_all_prebuilt_platform_wheels(tmp_path, monkeypatch):
+    release = load_release_module()
+    wheel_dir = tmp_path / "wheels"
+    wheel_dir.mkdir()
+    wheel_names = (
+        "ve_tos_cli-1.2.3-py3-none-macosx_11_0_arm64.whl",
+        "ve_tos_cli-1.2.3-py3-none-win_amd64.whl",
+    )
+    for wheel_name in wheel_names:
+        (wheel_dir / wheel_name).write_bytes(b"wheel")
+    commands = []
+    monkeypatch.setattr(release, "missing_python_modules", lambda names: ())
+    monkeypatch.setattr(
+        release, "run_command", lambda command, execute=True: commands.append(command)
+    )
+    args = release.build_parser().parse_args(
+        ["pip", "--version", "1.2.3", "--out-dir", str(tmp_path), "--upload"]
+    )
+
+    release.run_pip(args)
+
+    assert commands == [
+        [
+            release.sys.executable,
+            "-m",
+            "twine",
+            "upload",
+            *(str(wheel_dir / name) for name in sorted(wheel_names)),
+        ]
+    ]
+
+
+def test_pip_upload_only_rejects_empty_wheel_directory(tmp_path, monkeypatch):
+    release = load_release_module()
+    monkeypatch.setattr(release, "missing_python_modules", lambda names: ())
+    args = release.build_parser().parse_args(
+        ["pip", "--version", "1.2.3", "--out-dir", str(tmp_path), "--upload"]
+    )
+
+    with pytest.raises(SystemExit, match="no wheels found"):
+        release.run_pip(args)
+
+
+@pytest.mark.parametrize("flags", [[], ["--build-wheel"], ["--build-wheel", "--upload"]])
+def test_pip_requires_binary_input_unless_upload_only(flags, monkeypatch):
+    release = load_release_module()
+    commands = []
+    monkeypatch.setattr(
+        release, "run_command", lambda command, execute=True: commands.append(command)
+    )
+    args = release.build_parser().parse_args(["pip", "--version", "1.2.3", *flags])
+
+    with pytest.raises(SystemExit, match="requires --target or at least one --binary-dir"):
+        release.run_pip(args)
+
+    assert commands == []
+
+
+def test_pip_upload_keeps_binary_inputs_mutually_exclusive():
+    release = load_release_module()
+
+    with pytest.raises(SystemExit):
+        release.build_parser().parse_args(
+            [
+                "pip", "--version", "1.2.3", "--upload",
+                "--target", "aarch64-apple-darwin", "--binary-dir", "custom/bin",
+            ]
+        )
+
+
 def test_pip_target_expands_to_public_entry_binary_dirs(tmp_path, monkeypatch):
     release = load_release_module()
     commands = []
@@ -1191,6 +1268,55 @@ def test_npm_publish_accepts_otp_for_two_factor_auth(tmp_path, monkeypatch):
         "--otp",
         "123456",
     ) in [command for command, _execute in commands]
+
+
+@pytest.mark.parametrize("is_capture_output", [False, True])
+def test_npm_otp_is_redacted_in_release_logs_and_errors(monkeypatch, capsys, is_capture_output):
+    release = load_release_module()
+    command = ["npm", "publish", "dist/npm/ve-tos-cli", "--otp", "654321"]
+
+    def failed_publish(arguments, **options):
+        assert arguments == command
+        if options["check"]:
+            raise subprocess.CalledProcessError(1, arguments)
+        return subprocess.CompletedProcess(arguments, 1, stdout="", stderr="publish failed\n")
+
+    monkeypatch.setattr(release.subprocess, "run", failed_publish)
+
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        release.run_command(command, capture_output=is_capture_output)
+
+    output = capsys.readouterr()
+    assert "654321" not in output.out + output.err + str(error.value)
+    assert command[-1] == "654321"
+
+
+@pytest.mark.parametrize("is_execute_publish", [False, True])
+def test_npm_publish_excludes_reserved_tos_cli(tmp_path, monkeypatch, is_execute_publish):
+    release = load_release_module()
+    commands = []
+    monkeypatch.setattr(
+        release,
+        "run_command",
+        lambda command, execute=True: commands.append((command, execute)),
+    )
+    args = release.build_parser().parse_args(
+        ["npm", "--version", "1.2.3", "--out-dir", str(tmp_path)]
+        + (["--execute-publish"] if is_execute_publish else [])
+    )
+
+    release.run_npm(args)
+
+    publish_commands = [
+        (command, execute)
+        for command, execute in commands
+        if command[:2] == ["npm", "publish"]
+    ]
+    assert [Path(command[2]).name for command, _ in publish_commands] == [
+        "ve-tos-cli",
+        "ve-adrive-cli",
+    ]
+    assert all(execute == is_execute_publish for _, execute in publish_commands)
 
 
 def test_root_package_is_publishable_to_crates_io():
