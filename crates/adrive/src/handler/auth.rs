@@ -43,12 +43,13 @@ const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 
 struct LoginSettings {
     client_id: String,
-    instance_id: String,
+    instance_id: Option<String>,
     device_name: String,
     client_options: ClientOptions,
 }
 
 struct SavedLogin {
+    instance_id: String,
     expires_at: String,
     scope: Vec<String>,
     user_id: Option<String>,
@@ -239,7 +240,7 @@ async fn handle_login(
     show_login_instructions(&authorization);
     let token = poll_until_authorized(&oauth_client, &authorization, &settings.client_id).await?;
     let saved = validate_and_save_token(global, &settings, oauth_client.endpoint(), token)?;
-    output_login_success(global, &settings, saved)
+    output_login_success(global, saved)
 }
 
 async fn create_device_grant(
@@ -249,7 +250,9 @@ async fn create_device_grant(
     let response = client
         .create_device_authorization(&DeviceAuthorizationRequest {
             client_id: settings.client_id.clone(),
-            instance_id: settings.instance_id.clone(),
+            // [Review Fix #1] Keep the public Rust request type stable; an empty
+            // value is omitted from the encoded form for server-side selection.
+            instance_id: settings.instance_id.clone().unwrap_or_default(),
             device_name: settings.device_name.clone(),
             scope: OAUTH_SCOPE.to_string(),
         })
@@ -367,16 +370,11 @@ fn resolve_login_settings(
     // [Review Fix #5] Login resolves only non-secret raw config fields, so an
     // OAuth flow never parses or decrypts the unselected AK/SK credential set.
     let adrive = profile.and_then(|profile| profile.adrive.as_ref());
-    let instance_id = first_nonempty([
+    let instance_id = resolve_requested_instance(
         args.instance.clone(),
         adrive.and_then(|settings| settings.default_instance.clone()),
         std::env::var("ADRIVE_DEFAULT_INSTANCE").ok(),
-    ])
-    .ok_or_else(|| {
-        // [Review Fix #3] Preserve the missing-Instance cause so the outer
-        // error contract recommends the login command instead of config init.
-        CliError::ConfigMissing("[oauth_instance_required] ADrive OAuth instance is required; use --instance, profile default_instance, or ADRIVE_DEFAULT_INSTANCE".to_string())
-    })?;
+    )?;
     let resource_endpoint = resolve_resource_endpoint(global, adrive);
     let auth_endpoint = resolve_login_auth_endpoint_value(
         args.auth_endpoint.clone(),
@@ -395,6 +393,33 @@ fn resolve_login_settings(
         },
         auth_endpoint,
     ))
+}
+
+fn resolve_requested_instance(
+    command_line: Option<String>,
+    profile_default: Option<String>,
+    environment_default: Option<String>,
+) -> Result<Option<String>, CliError> {
+    // [Review Fix #3] A supplied blank flag is an invalid choice, not a request
+    // for the Auth server to select an Instance.
+    if command_line
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(CliError::ValidationError(
+            "--instance must be a nonempty Instance ID".to_string(),
+        ));
+    }
+    let instance_id = first_nonempty([command_line, profile_default, environment_default]);
+    if instance_id
+        .as_deref()
+        .is_some_and(|value| !is_valid_instance_id(value))
+    {
+        return Err(CliError::ValidationError(
+            "OAuth login Instance ID is not a valid path segment".to_string(),
+        ));
+    }
+    Ok(instance_id)
 }
 
 fn resolve_login_auth_endpoint_value(
@@ -564,11 +589,7 @@ fn validated_login(
             "Token response has an invalid token_type or expires_in",
         ));
     }
-    if token.instance_id != settings.instance_id {
-        return Err(invalid_oauth_response(
-            "Token response instance_id does not match the authorization request",
-        ));
-    }
+    let instance_id = validate_login_instance(settings.instance_id.as_deref(), &token.instance_id)?;
     let scope = token
         .scope
         .split_ascii_whitespace()
@@ -580,6 +601,7 @@ fn validated_login(
     let expires_at = expires_at(token.expires_in)?;
     let user_id = nonempty_string(token.user_id);
     let saved = SavedLogin {
+        instance_id: instance_id.clone(),
         expires_at: expires_at.clone(),
         scope: scope.clone(),
         user_id: user_id.clone(),
@@ -591,11 +613,35 @@ fn validated_login(
         token_type: Some("Bearer".to_string()),
         scope,
         legacy_client_id: None,
-        instance_id: Some(settings.instance_id.clone()),
+        instance_id: Some(instance_id),
         user_id,
         auth_endpoint: Some(auth_endpoint.as_str().to_string()),
     };
     Ok((stored, saved))
+}
+
+fn validate_login_instance(requested: Option<&str>, returned: &str) -> Result<String, CliError> {
+    // [Review Fix #2] The stored ID later becomes one URL path segment; reject
+    // values that could change route structure or normalize to another path.
+    if !is_valid_instance_id(returned) {
+        return Err(invalid_oauth_response(
+            "Token response instance_id is missing or invalid",
+        ));
+    }
+    if requested.is_some_and(|instance_id| instance_id != returned) {
+        return Err(invalid_oauth_response(
+            "Token response instance_id does not match the authorization request",
+        ));
+    }
+    Ok(returned.to_string())
+}
+
+fn is_valid_instance_id(instance_id: &str) -> bool {
+    !instance_id.is_empty()
+        && instance_id.trim() == instance_id
+        && !matches!(instance_id, "." | "..")
+        && !instance_id.contains(['/', '\\'])
+        && !instance_id.chars().any(char::is_control)
 }
 
 fn expires_at(expires_in: u64) -> Result<String, CliError> {
@@ -607,11 +653,7 @@ fn expires_at(expires_in: u64) -> Result<String, CliError> {
         .ok_or_else(|| invalid_oauth_response("Token expiry is outside the supported range"))
 }
 
-fn output_login_success(
-    global: &GlobalArgs,
-    settings: &LoginSettings,
-    saved: SavedLogin,
-) -> Result<i32, CliError> {
+fn output_login_success(global: &GlobalArgs, saved: SavedLogin) -> Result<i32, CliError> {
     output_envelope(
         global,
         &Envelope::success(
@@ -619,7 +661,7 @@ fn output_login_success(
             json!({
                 "status": "logged_in",
                 "profile": global.profile,
-                "instance_id": settings.instance_id,
+                "instance_id": saved.instance_id,
                 "scope": saved.scope,
                 "expires_at": saved.expires_at,
                 "user_id": saved.user_id
@@ -927,10 +969,64 @@ mod tests {
     }
 
     #[test]
+    fn login_rejects_explicit_blank_instance() {
+        let directory = test_directory();
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.toml");
+        ConfigFile::default()
+            .save_to(&directory, &config_path)
+            .unwrap();
+        let global = GlobalArgs {
+            config_path: Some(config_path),
+            ..GlobalArgs::default()
+        };
+
+        let result = super::resolve_login_settings(
+            &global,
+            &LoginArgs {
+                instance: Some("  ".to_string()),
+                auth_endpoint: Some("https://auth.example.com".to_string()),
+                device_name: Some("test-device".to_string()),
+            },
+        );
+
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn requested_instance_resolution_preserves_precedence_and_absence() {
+        assert_eq!(
+            super::resolve_requested_instance(None, None, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            super::resolve_requested_instance(
+                None,
+                Some("profile-inst".to_string()),
+                Some("env-inst".to_string()),
+            )
+            .unwrap()
+            .as_deref(),
+            Some("profile-inst")
+        );
+        assert_eq!(
+            super::resolve_requested_instance(
+                Some("cli-inst".to_string()),
+                Some("profile-inst".to_string()),
+                Some("env-inst".to_string()),
+            )
+            .unwrap()
+            .as_deref(),
+            Some("cli-inst")
+        );
+    }
+
+    #[test]
     fn validated_login_discards_blank_user_id() {
         let settings = LoginSettings {
             client_id: "client-1".to_string(),
-            instance_id: "inst-1".to_string(),
+            instance_id: Some("inst-1".to_string()),
             device_name: "test-device".to_string(),
             client_options: ClientOptions::default(),
         };
@@ -955,7 +1051,7 @@ mod tests {
     fn validated_login_trims_user_id() {
         let settings = LoginSettings {
             client_id: "client-1".to_string(),
-            instance_id: "inst-1".to_string(),
+            instance_id: Some("inst-1".to_string()),
             device_name: "test-device".to_string(),
             client_options: ClientOptions::default(),
         };
@@ -974,6 +1070,83 @@ mod tests {
 
         assert_eq!(saved.user_id.as_deref(), Some("user-1"));
         assert_eq!(stored.user_id.as_deref(), Some("user-1"));
+    }
+
+    #[test]
+    fn validated_login_uses_server_instance_when_request_omits_it() {
+        let settings = LoginSettings {
+            client_id: "client-1".to_string(),
+            instance_id: None,
+            device_name: "test-device".to_string(),
+            client_options: ClientOptions::default(),
+        };
+        let endpoint = reqwest::Url::parse("https://auth.example.com").unwrap();
+        let token = TokenResponse {
+            access_token: "access-1".to_string(),
+            refresh_token: "refresh-1".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 3600,
+            scope: "all".to_string(),
+            user_id: None,
+            instance_id: "server-inst".to_string(),
+        };
+
+        let (stored, _) = validated_login(&settings, &endpoint, token).unwrap();
+
+        assert_eq!(stored.instance_id.as_deref(), Some("server-inst"));
+    }
+
+    #[test]
+    fn validated_login_rejects_missing_server_instance() {
+        let settings = LoginSettings {
+            client_id: "client-1".to_string(),
+            instance_id: None,
+            device_name: "test-device".to_string(),
+            client_options: ClientOptions::default(),
+        };
+        let endpoint = reqwest::Url::parse("https://auth.example.com").unwrap();
+        let token = TokenResponse {
+            access_token: "access-1".to_string(),
+            refresh_token: "refresh-1".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 3600,
+            scope: "all".to_string(),
+            user_id: None,
+            instance_id: String::new(),
+        };
+
+        let error = validated_login(&settings, &endpoint, token)
+            .err()
+            .expect("missing server Instance must be rejected");
+
+        assert!(error.to_string().contains("instance_id"));
+    }
+
+    #[test]
+    fn validated_login_rejects_unsafe_server_instance() {
+        let settings = LoginSettings {
+            client_id: "client-1".to_string(),
+            instance_id: None,
+            device_name: "test-device".to_string(),
+            client_options: ClientOptions::default(),
+        };
+        let endpoint = reqwest::Url::parse("https://auth.example.com").unwrap();
+        for instance_id in ["inst/child", "inst\\child", ".", "..", "in\nst"] {
+            let token = TokenResponse {
+                access_token: "access-1".to_string(),
+                refresh_token: "refresh-1".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_in: 3600,
+                scope: "all".to_string(),
+                user_id: None,
+                instance_id: instance_id.to_string(),
+            };
+
+            assert!(
+                validated_login(&settings, &endpoint, token).is_err(),
+                "unsafe Instance ID {instance_id:?} must be rejected"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1022,6 +1195,49 @@ mod tests {
         assert!(oauth.expires_at.is_some());
         let raw_credentials = std::fs::read_to_string(&credentials_path).unwrap();
         assert!(!raw_credentials.contains("client_id"));
+        server.join().expect("mock OAuth server should finish");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn login_without_instance_persists_server_instance() {
+        let directory = test_directory();
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("config.toml");
+        let credentials_path = directory.join("credentials.toml");
+        ConfigFile::default()
+            .save_to(&directory, &config_path)
+            .unwrap();
+        let (endpoint, server) = serve_successful_login();
+        let global = GlobalArgs {
+            config_path: Some(config_path),
+            credentials_path: Some(credentials_path.clone()),
+            quiet: true,
+            ..GlobalArgs::default()
+        };
+        let command = AuthCommand {
+            action: Some(AuthAction::Login(LoginArgs {
+                instance: None,
+                auth_endpoint: Some(endpoint),
+                device_name: Some("test-device".to_string()),
+            })),
+        };
+
+        let result = handle_auth_command(
+            &global,
+            &ADriveAuthArgs {
+                auth_mode: Some(AuthMode::Oauth),
+            },
+            &command,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), 0);
+        let credentials = CredentialsFile::load_from(&credentials_path).unwrap();
+        let oauth = credentials
+            .adrive_oauth("default", &credentials_path)
+            .unwrap();
+        assert_eq!(oauth.instance_id.as_deref(), Some("inst-1"));
         server.join().expect("mock OAuth server should finish");
         let _ = std::fs::remove_dir_all(directory);
     }

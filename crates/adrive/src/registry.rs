@@ -59,7 +59,7 @@ const AUTH_PARAMS: &[RegistryParameter] = &[
     RegistryParameter {
         name: "instance",
         required: false,
-        description: "OAuth login Instance; required unless the selected profile or ADRIVE_DEFAULT_INSTANCE supplies it",
+        description: "Optional OAuth login Instance; overrides the selected profile and ADRIVE_DEFAULT_INSTANCE, otherwise the authorization server selects it",
     },
     RegistryParameter {
         name: "auth-endpoint",

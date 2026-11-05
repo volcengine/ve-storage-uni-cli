@@ -52,7 +52,7 @@ pub struct AuthCommand {
 #[derive(Clone, Debug, Args)]
 pub struct LoginArgs {
     /// ADrive Instance ID to authorize. Overrides profile default_instance and
-    /// ADRIVE_DEFAULT_INSTANCE; required if neither fallback is configured
+    /// ADRIVE_DEFAULT_INSTANCE; when unset, the authorization server selects the Instance
     #[arg(long, value_name = "INSTANCE_ID")]
     pub instance: Option<String>,
 
@@ -154,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn login_instance_help_explains_resolution_and_requirement() {
+    fn login_instance_help_explains_optional_server_selection() {
         let command = TestCli::command();
         let login = command
             .find_subcommand("login")
@@ -168,7 +168,7 @@ mod tests {
             instance.get_help().map(ToString::to_string).as_deref(),
             Some(
                 "ADrive Instance ID to authorize. Overrides profile default_instance and \
-ADRIVE_DEFAULT_INSTANCE; required if neither fallback is configured"
+ADRIVE_DEFAULT_INSTANCE; when unset, the authorization server selects the Instance"
             )
         );
     }

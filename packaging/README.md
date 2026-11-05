@@ -108,7 +108,14 @@ python3 -m pytest packaging/tests/test_cargo_publish_metadata.py packaging/tests
 
 ## Prerequisites
 
-`packaging/scripts/release.py` itself uses only the Python standard library.
+`packaging/scripts/release.py` uses the Python standard library for packaging.
+Executing the internal `byte-tos` upload channel additionally requires the
+Python `bytedtos` SDK from the internal package index:
+
+```bash
+python3 -m pip install bytedtos --index-url=https://bytedpypi.byted.org/simple
+```
+
 Full release execution shells out to channel-specific tools, so install the
 tools for the stages you plan to run:
 
@@ -218,6 +225,11 @@ Generate npm packages:
 python3 packaging/scripts/release.py npm --version <version>
 ```
 
+All three local wrappers are generated, but npm publishing includes only
+`ve-tos-cli` and `ve-adrive-cli`. The npm name `tos-cli` is already occupied
+by another publisher and is excluded from both publish previews and execution,
+including `all --publish`.
+
 Generate PyPI package trees and wheels from already-built CLI binaries. Pass
 the release target triple; the release script resolves the corresponding
 `packaging/cargo/*/target/<triple>/release` binary directories and writes a
@@ -243,19 +255,17 @@ the artifact directory mapping.
 Use repeated `--binary-dir <dir>` instead of `--target` only when the binaries
 come from non-standard directories.
 
-For publish homebrew formulae, execute the following command:
+Generate Homebrew Formulae after `SHA256SUMS` exists. Homebrew formulae are macOS-only,
+so the generator reads only the `aarch64-apple-darwin` and
+`x86_64-apple-darwin` archive checksums:
 
 ```bash
 python3 packaging/scripts/release.py homebrew --version <version> --checksums dist/SHA256SUMS --tap-dir .
 ```
 
-The command above writes `Formula/*.rb` into the current source checkout. If
-your local checkout is synchronized to the public GitHub repository by another
-process, let that process publish the Formula files. If this checkout pushes
-directly to GitHub, add `--commit --push`.
-
-For local or single-architecture tap validation, add `--target <triple>` to
-limit formula generation to one macOS archive target.
+This writes `Formula/*.rb` into the current source checkout. For local or
+single-architecture tap validation, add `--target <triple>` to limit formula
+generation to one macOS archive target.
 
 Generate WinGet manifests after Windows archive checksums exist:
 
@@ -301,36 +311,145 @@ WinGet, and curl also expose only the three dedicated CLIs.
 python3 packaging/scripts/release.py cargo --execute
 ```
 
-Publish npm packages:
+The release script does not prompt for or pass a Cargo token. Cargo obtains
+credentials from `CARGO_REGISTRY_TOKEN`, a saved `cargo login` credential
+(`$CARGO_HOME/credentials.toml`, usually `~/.cargo/credentials.toml`), or a
+configured credential provider such as the OS keychain. With `cargo:token`,
+the environment token takes precedence over the saved token. Existing
+credentials explain why publishing can succeed without another prompt.
+See the [Cargo authentication documentation](https://doc.rust-lang.org/cargo/reference/registry-authentication.html).
+
+Publish npm packages (`ve-tos-cli` and `ve-adrive-cli` only):
 
 ```bash
+npm login --registry=https://registry.npmjs.org/
+npm whoami --registry=https://registry.npmjs.org/
 python3 packaging/scripts/release.py npm --version <version> --execute-publish
 ```
 
-If your npm account requires two-factor authentication for publishes, either
-pass the current one-time password:
+Log in with an account that maintains both packages. npm saves the login
+credentials in the user configuration and reuses them on later publishes.
+If publishing requires a one-time password, pass the current code:
 
 ```bash
 python3 packaging/scripts/release.py npm --version <version> --execute-publish --otp <otp-code>
 ```
 
-or publish with a granular npm access token that has bypass 2FA enabled.
+If publishing reports `E404` or "could not be found or you do not have
+permission", first check `npm whoami --registry=https://registry.npmjs.org/`
+and `npm owner ls ve-tos-cli --registry=https://registry.npmjs.org/`.
+A `401 Unauthorized` from `whoami` means the current credentials are not
+accepted; log in again with `npm login --registry=https://registry.npmjs.org/`
+and confirm that the authenticated account maintains both packages.
+Adding `--otp` does not repair invalid credentials.
 
 Publish PyPI wheels:
 
 ```bash
-python3 packaging/scripts/release.py pip --version <version> --target <triple> --build-wheel --upload
+python3 packaging/scripts/release.py pip --version <version> --upload
 ```
 
-For a multi-platform release, build every target first, then upload the
-accumulated `dist/pip/wheels/*.whl` set with Twine. Pip selects the matching
-wheel for the user's OS and architecture during `pip install`.
+Build every target first using the commands in step 2, then upload the
+accumulated `dist/pip/wheels/*.whl` set with Twine. Upload-only mode needs
+neither `--target`, `--binary-dir`, nor local build outputs and does not
+regenerate package trees or build wheels. `--target` selects binaries and
+the wheel platform tag during generation/building; it never filters uploads.
+Combining `--target <triple> --build-wheel --upload` still builds one target
+and uploads every accumulated wheel. Pip selects the matching wheel for the
+user's OS and architecture during `pip install`.
 
-Publish Homebrew Formulae into the source repository after `SHA256SUMS` exists.
-Homebrew formulae are macOS-only, so the generator reads only the
-`aarch64-apple-darwin` and `x86_64-apple-darwin` archive checksums. This uses
-`volcengine/ve-storage-uni-cli` itself as a custom tap by keeping formula files
-under the repository root `Formula/` directory, which is already done in "Build package wrappers" section.
+The upload scans every `.whl` in that directory, including older versions:
+`--version` does not filter the upload set. Start each release with a clean
+wheel directory or use a separate `--out-dir` consistently for its builds
+and upload. An empty wheel directory fails before Twine is invoked.
+
+Publish internal ByteCloud TOS packages from the archives and `SHA256SUMS`
+built in step 1. Collect every platform archive for this version into the
+same source directory before publishing. Preview preparation and uploads:
+
+```bash
+python3 packaging/scripts/release.py byte-tos --version <version>
+```
+
+Add `--execute` to upload and read back each object for SHA-256 verification:
+
+```bash
+python3 packaging/scripts/release.py byte-tos --version <version> --execute
+```
+
+The bucket is public-read. Object key `<prefix>/<key>` maps to
+`https://tosv.byted.org/obj/tos-team/<prefix>/<key>`, so the download base defaults
+to `https://tosv.byted.org/obj/tos-team/toscli/new`. Neither
+`--download-base-url` nor `--profile` is required. Use `--download-base-url`
+only to override the download route with a different HTTPS mirror.
+The command uses all supported release archives present in `dist/` by default;
+repeat `--target <triple>` to select targets or use `--source-dir` to read a
+separate collected release. It creates dedicated archives containing only
+`bin/tos-cli` (Windows: `bin/tos-cli.exe`) and `LICENSE`, plus `SHA256SUMS` under
+`dist/byte-tos/<version>/`. It uploads them to `tos://tos-team/toscli/new/<version>/`
+and publishes `install.sh` at `tos://tos-team/toscli/new/install.sh` last.
+No manifest or latest JSON is generated. This is a separate explicit channel;
+`all --publish` does not upload to the internal bucket.
+
+Uploads and read-back verification call the Python `bytedtos` SDK directly.
+No `tos-cli` executable is installed, located, extracted for execution, or
+invoked; cross-platform release packages can be published from the same runner.
+Install the SDK into the Python environment used to run `release.py`:
+
+```bash
+python3 -m pip install bytedtos --index-url=https://bytedpypi.byted.org/simple
+```
+
+Set `BYTE_TOSTEAM_ACCESS_KEY` to the single AccessKey generated for the
+`tos-team` bucket in that process's environment before publishing. A separate
+`BYTE_TOSTEAM_SECRET_KEY` is not required or read. The script constructs
+`bytedtos.Client("tos-team", access_key, endpoint="tos-cn-north.byted.org")`
+using the SDK's bucket-AccessKey mode. Uploads and read-back verification use
+this explicit endpoint instead of BNS/PSM service discovery; the script does
+not configure service-discovery IPv6. Run it from an environment that can
+resolve and reach this endpoint. The credentials must authorize
+writing `tos-team/toscli/new/` and reading back the uploaded objects. The script
+does not read CLI profiles or other credential variables; `--profile`,
+`--auth-mode`, and `--tos-cli-path` are not used by this channel.
+Public-read access makes installation anonymous but does not grant write access.
+The release script does not prompt for, accept on the command line, or print
+secret values. Previewing does not load the SDK or require credentials.
+
+Supply the version value, for example:
+`python3 packaging/scripts/release.py byte-tos --version 1.0.3 --execute`.
+
+Versioned uploads use `If-None-Match: *`; existing objects are read back and must
+match the locally prepared hash. Use `--clobber` only to deliberately replace
+a version's contents. The root installer is updated after versioned objects
+have been verified. SDK requests have a 600-second read timeout and a
+10-second connect timeout by default; adjust `--timeout` as needed. Transient
+429/5xx responses are retried with bounded backoff and reopened upload streams.
+SDK responses and the client session are closed after use.
+
+Users install through the internal HTTPS endpoint with `curl`, `tar` (or
+`unzip` for Windows through a POSIX shell), and `sha256sum` or `shasum`:
+
+```bash
+curl -fsSL https://tosv.byted.org/obj/tos-team/toscli/new/install.sh -o install.sh
+sh install.sh --version <version>
+```
+
+For example, the macOS arm64 archive for 1.0.3 is downloaded from
+`https://tosv.byted.org/obj/tos-team/toscli/new/1.0.3/tos-cli-1.0.3-aarch64-apple-darwin.tar.gz`.
+
+The installer detects the platform, downloads the versioned archive, verifies
+its SHA-256, and installs only `tos-cli` into `~/.local/bin`. Add that directory
+to PATH or set `--install-dir <directory>`. Versions are explicit; Linux uses
+the `.2.17` glibc archives, and musl Linux is unsupported. No existing `tos-cli`
+or TOS credentials are needed for installation through the download endpoint.
+
+Publish the Homebrew Formulae generated in step 2 through the source repository.
+This uses `volcengine/ve-storage-uni-cli` itself as a custom tap by keeping
+formula files under the repository root `Formula/` directory. If your local
+checkout is synchronized to the public GitHub repository by another process,
+let that process publish the Formula files. If this checkout pushes directly
+to GitHub, commit and push the generated `Formula/*.rb` files; the generator
+also supports `--commit --push` for that workflow.
 
 Users install through an explicit tap URL once, then install by formula name:
 
@@ -357,7 +476,7 @@ gh pr create --repo microsoft/winget-pkgs --head <github-user>:volcengine-storag
 ```
 
 Registry authentication is handled by the underlying tools: `cargo login` or
-`CARGO_REGISTRY_TOKEN`, `gh`/`GITHUB_TOKEN`, npm login/token, Twine/PyPI token,
+`CARGO_REGISTRY_TOKEN`, `gh`/`GITHUB_TOKEN`, npm login, Twine/PyPI token,
 git access to the source repository for Homebrew Formulae, and GitHub access to
 your `winget-pkgs` fork.
 
@@ -373,6 +492,64 @@ GitHub Release assets are available.
 ```bash
 python3 packaging/scripts/release.py all --version <version> --target <triple> --pip-target <triple> --publish --tap-dir . --github-release-clobber
 ```
+
+### ADrive-only npm and PyPI release
+
+For an ADrive-only release such as `1.0.4`, publish neither the other CLI
+packages nor the `all --publish` flow. Build from the merged commit after it
+has reached the public GitHub repository. Only `ve-adrive-cli-core` and the
+dedicated `ve-adrive-cli` entry crate have version `1.0.4`; the shared root
+crate and the other CLI packages stay at `1.0.3`.
+
+The npm installer downloads `ve-storage-uni-cli-<target>` archives from the
+GitHub Release tagged `v1.0.4`. Build an ADrive-only archive for each npm
+target on its matching runner; use one clean output directory per release and
+collect the archives into it before regenerating checksums:
+
+```bash
+python3 packaging/scripts/release.py archives --package ve-adrive-cli --target <triple> --out-dir dist/adrive-1.0.4
+python3 packaging/scripts/release.py checksums --out-dir dist/adrive-1.0.4
+```
+
+The npm targets are `x86_64-apple-darwin`, `aarch64-apple-darwin`,
+`x86_64-unknown-linux-gnu.2.17`, `aarch64-unknown-linux-gnu.2.17`, and
+`x86_64-pc-windows-msvc`. The Linux `.2.17` targets need `cargo-zigbuild`,
+and Windows MSVC needs `cargo-xwin`, as in the general release runbook. Check
+each archive contains
+only `bin/ve-adrive-cli` (or `.exe` on Windows) before uploading. Keep this
+ADrive-only GitHub Release out of the generic `latest` installer channel:
+
+```bash
+gh release create v1.0.4 dist/adrive-1.0.4/ve-storage-uni-cli-* dist/adrive-1.0.4/SHA256SUMS \
+  --repo volcengine/ve-storage-uni-cli --target <public-commit-sha> --latest=false \
+  --title 've-adrive-cli v1.0.4' --notes 'ADrive OAuth login can select an Instance during device verification.'
+```
+
+After the assets are available, publish only the npm package. Its postinstall
+script requires the archive for the installer's target platform:
+
+```bash
+python3 packaging/scripts/release.py npm --version 1.0.4 --package ve-adrive-cli --out-dir dist/adrive-1.0.4/npm
+npm whoami --registry=https://registry.npmjs.org/
+python3 packaging/scripts/release.py npm --version 1.0.4 --package ve-adrive-cli --out-dir dist/adrive-1.0.4/npm --execute-publish
+```
+
+Build the PyPI wheel once per supported wheel target. Collect the wheels in
+one clean `wheels/` directory, then upload only the matching package and
+version. PyPI wheels contain the binary and do not download GitHub assets:
+
+```bash
+python3 packaging/scripts/release.py pip --version 1.0.4 --package ve-adrive-cli \
+  --target <triple> --out-dir dist/adrive-1.0.4/pip --build-wheel
+python3 packaging/scripts/release.py pip --version 1.0.4 --package ve-adrive-cli \
+  --out-dir dist/adrive-1.0.4/pip --upload
+```
+
+For PyPI Linux wheels use the `.2.17` triples in `platforms.json`; the plain
+GNU triples have no default manylinux wheel tag. The `--package` selector also
+filters upload files by package and version if the wheel directory contains
+unrelated files. No Cargo, Homebrew, WinGet, or ByteCloud TOS publishing step
+is part of this release.
 
 ## curl Installer
 

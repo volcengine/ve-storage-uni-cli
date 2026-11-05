@@ -38,6 +38,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
 PUBLIC_PACKAGES = ("ve-tos-cli", "tos-cli", "ve-adrive-cli")
+# [Review Fix #NpmReservedName] The npm tos-cli name is owned by another publisher.
+NPM_PUBLISH_PACKAGES = ("ve-tos-cli", "ve-adrive-cli")
 ENTRY_CRATES = PUBLIC_PACKAGES
 PIP_PACKAGES_CONFIG = ROOT / "packaging" / "pip" / "packages.json"
 CARGO_PUBLISH_RETRY_DELAYS = (15, 30, 60, 120)
@@ -75,17 +77,33 @@ CARGO_PUBLISH_STEPS = (
 )
 
 
+def _redacted_command(command: list[str] | tuple[str, ...]) -> list[str]:
+    redacted = []
+    is_otp_value = False
+    for part in command:
+        redacted.append("<redacted>" if is_otp_value else part)
+        is_otp_value = part == "--otp"
+    return redacted
+
+
 def run_command(
     command: list[str] | tuple[str, ...],
     execute: bool = True,
     capture_output: bool = False,
 ) -> None:
-    printable = " ".join(shlex.quote(part) for part in command)
+    # [Review Fix #NpmOtpRedaction] Keep the real OTP only in the child argv;
+    # logs and CalledProcessError text must not expose the one-time credential.
+    redacted_command = _redacted_command(command)
+    printable = " ".join(shlex.quote(part) for part in redacted_command)
     print(f"$ {printable}")
     if not execute:
         return
     if not capture_output:
-        subprocess.run(list(command), cwd=ROOT, check=True)
+        try:
+            subprocess.run(list(command), cwd=ROOT, check=True)
+        except subprocess.CalledProcessError as error:
+            error.cmd = redacted_command
+            raise
         return
 
     completed_process = subprocess.run(
@@ -103,7 +121,7 @@ def run_command(
     if completed_process.returncode != 0:
         raise subprocess.CalledProcessError(
             completed_process.returncode,
-            list(command),
+            redacted_command,
             output=completed_process.stdout,
             stderr=completed_process.stderr,
         )
@@ -258,13 +276,17 @@ def build_command_prefix(target: str) -> list[str]:
 def binary_dirs_for_target(
     target: str,
     root_target_dir: Path,
+    package: str | None = None,
 ) -> list[Path]:
     del root_target_dir
     artifact_target = cargo_artifact_target(target)
-    return [entry_release_dir(entry_name, artifact_target) for entry_name in ENTRY_CRATES]
+    selected_entries = (package,) if package else ENTRY_CRATES
+    return [entry_release_dir(entry_name, artifact_target) for entry_name in selected_entries]
 
 
-def build_release_binaries(target: str, skip_build: bool) -> None:
+def build_release_binaries(
+    target: str, skip_build: bool, package: str | None = None
+) -> None:
     if skip_build:
         return
 
@@ -272,7 +294,7 @@ def build_release_binaries(target: str, skip_build: bool) -> None:
     # select the cross-build backend from the target triple instead of making
     # release operators invoke cargo-zigbuild or cargo-xwin directly.
     command_prefix = build_command_prefix(target)
-    for entry_name in ENTRY_CRATES:
+    for entry_name in ((package,) if package else ENTRY_CRATES):
         manifest = f"packaging/cargo/{entry_name}/Cargo.toml"
         run_command(
             [
@@ -364,9 +386,11 @@ def verify_native_bytetos_auth(target: str) -> None:
 
 
 def run_archives(args: argparse.Namespace) -> None:
+    package = getattr(args, "package", None)
     for target in args.target:
-        build_release_binaries(target, args.skip_build)
-        verify_native_bytetos_auth(target)
+        build_release_binaries(target, args.skip_build, package)
+        if package is None or package == "tos-cli":
+            verify_native_bytetos_auth(target)
         archive_args = [
             "--target",
             target,
@@ -377,8 +401,10 @@ def run_archives(args: argparse.Namespace) -> None:
             "--metadata",
             str(args.metadata),
         ]
-        for binary_dir in binary_dirs_for_target(target, args.target_dir):
+        for binary_dir in binary_dirs_for_target(target, args.target_dir, package):
             archive_args.extend(["--binary-dir", str(binary_dir)])
+        if package:
+            archive_args.extend(["--command", package])
         run_command(script_command("archives.py", archive_args))
 
 
@@ -398,10 +424,18 @@ def run_cargo(args: argparse.Namespace) -> None:
 
 
 def run_npm(args: argparse.Namespace) -> None:
-    run_command(
-        script_command("npm.py", ["--version", args.version, "--out-dir", str(args.out_dir)])
-    )
-    for package_name in PUBLIC_PACKAGES:
+    """Generate wrappers and preview or publish the allowed npm packages.
+
+    Args contains version, output directory, access, tag and publish options.
+    Returns None; subprocess failures propagate as CalledProcessError.
+    """
+    package = getattr(args, "package", None)
+    package_args = ["--version", args.version, "--out-dir", str(args.out_dir)]
+    if package:
+        package_args.extend(["--package", package])
+    run_command(script_command("npm.py", package_args))
+    selected_packages = (package,) if package else NPM_PUBLISH_PACKAGES
+    for package_name in selected_packages:
         command = [
             "npm",
             "publish",
@@ -422,7 +456,7 @@ def pip_binary_dirs(args: argparse.Namespace) -> list[Path]:
         return list(args.binary_dir)
     target = getattr(args, "target", None)
     if target:
-        return binary_dirs_for_target(target, Path("target"))
+        return binary_dirs_for_target(target, Path("target"), getattr(args, "package", None))
     raise SystemExit("pip requires --target or at least one --binary-dir")
 
 
@@ -498,7 +532,42 @@ def pip_package_names(config_path: Path = PIP_PACKAGES_CONFIG) -> tuple[str, ...
     return tuple(str(package["name"]) for package in package_config["packages"])
 
 
+def pip_wheel_files(args: argparse.Namespace) -> list[str]:
+    wheel_dir = args.out_dir / "wheels"
+    package = getattr(args, "package", None)
+    if package:
+        wheel_prefix = f"{package.replace('-', '_')}-{args.version}-"
+        # [Review Fix #2] Treat the requested version literally, not as a glob.
+        return sorted(
+            str(path) for path in wheel_dir.glob("*.whl")
+            if path.name.startswith(wheel_prefix)
+        )
+    return sorted(glob.glob(str(wheel_dir / "*.whl")))
+
+
+def pip_preview_files(args: argparse.Namespace, wheel_files: list[str]) -> list[str]:
+    if wheel_files:
+        return wheel_files
+    package = getattr(args, "package", None)
+    wheel_pattern = (
+        f"{package.replace('-', '_')}-{args.version}-*.whl" if package else "*.whl"
+    )
+    return [str(args.out_dir / "wheels" / wheel_pattern)]
+
+
 def run_pip(args: argparse.Namespace) -> None:
+    """Generate/build wheels or upload prebuilt wheels using release options.
+
+    Args selects binary inputs, output directory and build/upload actions.
+    Returns None. Invalid inputs/dependencies raise SystemExit; subprocess
+    failures propagate as CalledProcessError.
+    """
+    has_binary_input = bool(args.binary_dir or getattr(args, "target", None))
+    if not has_binary_input and (args.build_wheel or not args.upload):
+        raise SystemExit(
+            "pip requires --target or at least one --binary-dir "
+            "unless uploading prebuilt wheels"
+        )
     platform_tag = None
     if args.build_wheel:
         platform_tag = pip_platform_tag(args)
@@ -506,23 +575,32 @@ def run_pip(args: argparse.Namespace) -> None:
     if args.upload:
         ensure_python_modules(PYPI_UPLOAD_MODULES, "PyPI upload")
 
-    package_args = ["--version", args.version, "--out-dir", str(args.out_dir)]
-    for binary_dir in pip_binary_dirs(args):
-        package_args.extend(["--binary-dir", str(binary_dir)])
-    run_command(script_command("pip.py", package_args))
+    # [Review Fix #PipUploadOnly] Uploading accumulated wheels must not require
+    # a target's build outputs or regenerate its package source trees.
+    if has_binary_input:
+        package_args = ["--version", args.version, "--out-dir", str(args.out_dir)]
+        for binary_dir in pip_binary_dirs(args):
+            package_args.extend(["--binary-dir", str(binary_dir)])
+        if getattr(args, "package", None):
+            package_args.extend(["--package", args.package])
+        run_command(script_command("pip.py", package_args))
 
     if args.build_wheel:
         wheel_dir = args.out_dir / "wheels"
-        for package_name in pip_package_names():
+        for package_name in ((args.package,) if getattr(args, "package", None) else pip_package_names()):
             run_command(build_wheel_command(args.out_dir / package_name, wheel_dir, platform_tag))
 
-    wheel_files = sorted(glob.glob(str(args.out_dir / "wheels" / "*.whl")))
+    wheel_files = pip_wheel_files(args)
     if args.upload:
         if not wheel_files:
             raise SystemExit("no wheels found; run with --build-wheel before --upload")
         run_command([sys.executable, "-m", "twine", "upload", *wheel_files])
     else:
-        run_command([sys.executable, "-m", "twine", "upload", str(args.out_dir / "wheels" / "*.whl")], False)
+        # [Review Fix #4] Preview the same package/version selection as upload.
+        run_command(
+            [sys.executable, "-m", "twine", "upload", *pip_preview_files(args, wheel_files)],
+            False,
+        )
 
 
 def run_homebrew(args: argparse.Namespace) -> None:
@@ -803,6 +881,7 @@ def add_archive_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--skip-build", action="store_true", help="Use already-built binaries")
     parser.add_argument("--target-dir", default=Path("target"), type=Path, help="Root target dir")
     parser.add_argument("--out-dir", default=Path("dist"), type=Path, help="Release archive dir")
+    parser.add_argument("--package", choices=PUBLIC_PACKAGES, help="Build only this CLI")
     parser.add_argument(
         "--metadata",
         default=Path("packaging/release/platforms.json"),
@@ -837,9 +916,26 @@ def add_github_release_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--execute", action="store_true", help="Run gh commands")
 
 
+def add_byte_tos_channel(subparsers: argparse._SubParsersAction) -> None:
+    """Register internal TOS release options on subparsers; return None.
+
+    Raises ImportError/OSError if the local channel implementation is missing.
+    """
+    spec = importlib.util.spec_from_file_location("byte_tos_release", SCRIPT_DIR / "byte_tos.py")
+    if spec is None or spec.loader is None:
+        raise ImportError("could not load internal TOS release channel")
+    channel = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(channel)
+    parser = subparsers.add_parser("byte-tos", help="Prepare or publish internal tos-cli archives")
+    add_common_version(parser)
+    channel.add_options(parser)
+    parser.set_defaults(func=channel.run)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="channel", required=True)
+    add_byte_tos_channel(subparsers)
 
     cargo = subparsers.add_parser("cargo", help="Print or run cargo publish steps")
     cargo.add_argument("--execute", action="store_true", help="Run cargo publish commands")
@@ -859,24 +955,33 @@ def build_parser() -> argparse.ArgumentParser:
     npm = subparsers.add_parser("npm", help="Generate npm packages")
     add_common_version(npm)
     npm.add_argument("--out-dir", default=Path("dist/npm"), type=Path)
+    npm.add_argument("--package", choices=NPM_PUBLISH_PACKAGES, help="Publish only this CLI")
     npm.add_argument("--access", default="public")
     npm.add_argument("--tag", default="latest")
     npm.add_argument("--otp", help="One-time password for npm publish with 2FA")
     npm.add_argument("--execute-publish", action="store_true", help="Run npm publish")
     npm.set_defaults(func=run_npm)
 
-    pip = subparsers.add_parser("pip", help="Generate PyPI package trees")
+    pip = subparsers.add_parser("pip", help="Generate PyPI packages or upload prebuilt wheels")
     add_common_version(pip)
-    pip_binary_input = pip.add_mutually_exclusive_group(required=True)
+    pip_binary_input = pip.add_mutually_exclusive_group()
     pip_binary_input.add_argument("--binary-dir", action="append", type=Path)
     pip_binary_input.add_argument(
         "--target",
         help="Rust target triple whose wrapper binaries seed wheels",
     )
     pip.add_argument("--out-dir", default=Path("dist/pip"), type=Path)
+    pip.add_argument("--package", choices=PUBLIC_PACKAGES, help="Build or upload only this CLI")
     pip.add_argument("--build-wheel", action="store_true")
     pip.add_argument("--platform-tag", help="Override the wheel platform tag")
-    pip.add_argument("--upload", action="store_true", help="Upload wheels with twine")
+    pip.add_argument(
+        "--upload",
+        action="store_true",
+        help=(
+            "Upload all wheels in out-dir/wheels with twine; "
+            "binary input is optional without --build-wheel"
+        ),
+    )
     pip.set_defaults(func=run_pip)
 
     homebrew = subparsers.add_parser("homebrew", help="Generate Homebrew Formula files")

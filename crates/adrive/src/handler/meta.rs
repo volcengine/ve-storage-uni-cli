@@ -347,7 +347,7 @@ const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Inspect authentication status or manage OAuth. Unified uses the same-name external profile, ignores local AK/SK and OAuth credentials, and delegates login/logout to `ve login` / `ve logout`", "查看鉴权状态或管理 OAuth。Unified 使用同名外部 profile，忽略本地 AK/SK 和 OAuth 凭证，并将登录/登出交由 `ve login` / `ve logout`"),
     ("Per-invocation override: --auth-mode <MODE>; supported values are aksk, oauth, or unified. ADRIVE_AUTH_MODE supplies the environment value", "单次调用覆盖：--auth-mode <MODE>；支持值为 aksk、oauth 或 unified。环境变量由 ADRIVE_AUTH_MODE 提供"),
     ("Authentication action: status (default), login, or logout", "鉴权操作：status（默认）、login 或 logout"),
-    ("OAuth login Instance; required unless the selected profile or ADRIVE_DEFAULT_INSTANCE supplies it", "OAuth 登录 Instance；除非所选 profile 或 ADRIVE_DEFAULT_INSTANCE 已提供，否则必填"),
+    ("Optional OAuth login Instance; overrides the selected profile and ADRIVE_DEFAULT_INSTANCE, otherwise the authorization server selects it", "可选的 OAuth 登录 Instance；覆盖所选 profile 和 ADRIVE_DEFAULT_INSTANCE，未设置时由授权服务器选择"),
     ("OAuth Authorization Server for login; defaults to the effective endpoint after command/profile/environment Auth overrides", "OAuth 登录授权服务器；优先使用命令行、profile 和认证环境变量，未设置时回退到有效 endpoint"),
     ("Human-readable device name shown during OAuth authorization", "OAuth 授权期间显示的人类可读设备名称"),
     ("Unified uses the same-name external profile, ignores local AK/SK and OAuth credentials, and delegates login/logout to `ve login` / `ve logout`", "Unified 使用同名外部 profile，忽略本地 AK/SK 和 OAuth 凭证，并将登录/登出交由 `ve login` / `ve logout`"),

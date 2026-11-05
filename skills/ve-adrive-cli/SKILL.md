@@ -174,7 +174,7 @@ ve-adrive-cli ls adrive://<instance-id> --output json
 ## OAuth login
 
 Default to OAuth for a user's cloud drive. When the user asks to set up or log in, configure the selected Profile once
-so later Resource commands stay short. For normal public ADrive, require only the Instance ID and use:
+so later Resource commands stay short. For normal public ADrive, use:
 
 - Auth base URL: defaults to the configured Resource endpoint; set `auth_endpoint` only when a separate Auth service is required.
 - Resource base URL: `https://idsapi.volces.com`
@@ -194,9 +194,13 @@ requests a non-persistent invocation, pass the same values as command or environ
 ve-adrive-cli config set auth_mode oauth
 ve-adrive-cli config set endpoint https://idsapi.volces.com
 ve-adrive-cli config set region cn-beijing
-ve-adrive-cli config set default_instance <instance-id>
 ve-adrive-cli config show --output json
 ```
+
+Set `default_instance` only when the user wants to choose a specific Instance; `--instance` overrides it for one login.
+If neither is set and `ADRIVE_DEFAULT_INSTANCE` is absent, the Auth service selects the Instance. The CLI requires a
+nonempty Instance ID in the Token response and saves that ID with the OAuth credentials, independently of
+`default_instance` in the Profile.
 
 Pass only the base URL to `--auth-endpoint`; the CLI appends paths such as
 `/v1/oauth/device_authorization` and `/v1/oauth/token`. Keep the foreground process running while the user completes
@@ -222,7 +226,7 @@ plus Doctor validate local credential readiness; finish a real end-to-end check 
 rather than business API success.
 
 Treat an OAuth status as reusable only when `ready` is true and its
-`instance_id` matches the requested Instance. Otherwise start a new explicit login for the requested Instance.
+`instance_id` matches the requested Instance. Otherwise start a new login for the requested Instance with `--instance`.
 
 OAuth login stores returned identity metadata such as `user_id` with the selected profile. It does not decode identity
 from a Token.

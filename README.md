@@ -201,9 +201,12 @@ without rewriting `credentials.toml` or creating local encryption key material.
 
 `auth login` runs the Device Authorization flow in the foreground: it prints
 the verification URL and then polls until the user finishes or the grant
-expires. It requests the fixed `all` scope and saves
+expires. The Instance comes from `--instance`, the selected Profile's
+`default_instance`, or `ADRIVE_DEFAULT_INSTANCE`; if none is set, the
+Authorization Server selects the Instance and returns its ID with the Token.
+Login rejects a missing or mismatched returned ID. It requests the fixed `all` scope and saves
 the returned Access/Refresh Token pair under the current Profile in encrypted
-`credentials.toml`, along with any returned `user_id` identity metadata. OAuth
+`credentials.toml`, along with the returned Instance ID and any `user_id` identity metadata. OAuth
 user-owned Space creation uses that metadata when `--owner-id` is omitted;
 OAuth group-owned Spaces always require an explicit `--owner-id`. The Auth
 endpoint priority is `--auth-endpoint` > `[profile.adrive].auth_endpoint` >

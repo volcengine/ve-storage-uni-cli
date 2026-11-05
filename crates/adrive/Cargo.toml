@@ -14,7 +14,7 @@
 
 [package]
 name = "ve-adrive-cli-core"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 license = "Apache-2.0"
 description = "Core ADrive command surface used by ve-storage-uni-cli and ve-adrive-cli"

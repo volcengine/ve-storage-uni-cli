@@ -2981,7 +2981,8 @@ fn test_adrive_auth_login_is_mode_strict_and_dry_run_stays_offline() {
 }
 
 #[test]
-fn test_adrive_oauth_login_without_instance_returns_actionable_command() {
+// [Review Fix #5] A missing Instance is valid; the missing Auth endpoint is the actionable error.
+fn test_adrive_oauth_login_without_instance_or_endpoint_returns_endpoint_guidance() {
     let home = tempdir();
     let output = cli_with_home(
         &home,
@@ -2998,15 +2999,42 @@ fn test_adrive_oauth_login_without_instance_returns_actionable_command() {
 
     assert!(!output.status.success());
     let json = parse_json(&output);
-    assert_eq!(json["error"]["code"], "oauth_instance_required");
+    assert_eq!(json["error"]["code"], "oauth_auth_endpoint_required");
     assert_eq!(
         json["error"]["fix_command"],
-        "ve-adrive auth login --instance <instance_id>"
+        "ve-adrive config set auth_endpoint <url>"
     );
     assert_eq!(
         json["error"]["doctor_hint"],
         "ve-adrive doctor --check config"
     );
+}
+
+#[test]
+fn test_adrive_oauth_login_without_instance_accepts_server_selection_in_dry_run() {
+    let home = tempdir();
+    let output = cli_with_home(
+        &home,
+        &[
+            "--output",
+            "json",
+            "--dry-run",
+            "ve-adrive",
+            "--auth-mode",
+            "oauth",
+            "auth",
+            "login",
+            "--auth-endpoint",
+            "https://auth.example.com",
+        ],
+    );
+
+    assert!(output.status.success());
+    let json = parse_json(&output);
+    assert_eq!(json["data"]["dry_run"], true);
+    assert!(json["data"]["instance_id"].is_null());
+    assert_eq!(json["data"]["network_requests"], 0);
+    assert_eq!(json["data"]["credentials_written"], false);
 }
 
 #[test]

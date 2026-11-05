@@ -86,6 +86,152 @@ def test_release_public_package_set_excludes_internal_dispatcher():
     assert release.ENTRY_CRATES == PUBLIC_CLI_PACKAGES
 
 
+def test_adrive_only_archive_build_does_not_build_or_check_tos(tmp_path, monkeypatch):
+    release = load_release_module()
+    commands = []
+    auth_checks = []
+    monkeypatch.setattr(
+        release,
+        "run_command",
+        lambda command, execute=True: commands.append(tuple(str(part) for part in command)),
+    )
+    monkeypatch.setattr(
+        release, "verify_native_bytetos_auth", lambda target: auth_checks.append(target)
+    )
+    args = release.build_parser().parse_args(
+        [
+            "archives", "--target", "aarch64-apple-darwin",
+            "--package", "ve-adrive-cli", "--out-dir", str(tmp_path),
+        ]
+    )
+
+    release.run_archives(args)
+
+    assert len(commands) == 2
+    assert commands[0][-1] == "packaging/cargo/ve-adrive-cli/Cargo.toml"
+    assert "--command" in commands[1]
+    assert commands[1][commands[1].index("--command") + 1] == "ve-adrive-cli"
+    assert "packaging/cargo/tos-cli" not in " ".join(commands[1])
+    assert "packaging/cargo/ve-tos-cli" not in " ".join(commands[1])
+    assert auth_checks == []
+
+
+def test_adrive_only_npm_publish_does_not_publish_ve_tos(tmp_path, monkeypatch):
+    release = load_release_module()
+    commands = []
+    monkeypatch.setattr(
+        release,
+        "run_command",
+        lambda command, execute=True: commands.append((tuple(str(part) for part in command), execute)),
+    )
+    args = release.build_parser().parse_args(
+        [
+            "npm", "--version", "1.0.4", "--package", "ve-adrive-cli",
+            "--out-dir", str(tmp_path), "--execute-publish",
+        ]
+    )
+
+    release.run_npm(args)
+
+    assert len(commands) == 2
+    assert commands[0][0][-2:] == ("--package", "ve-adrive-cli")
+    assert commands[1][0][:3] == ("npm", "publish", str(tmp_path / "ve-adrive-cli"))
+    assert commands[1][1] is True
+
+
+def test_adrive_only_pip_upload_selects_current_adrive_wheels(tmp_path, monkeypatch):
+    release = load_release_module()
+    wheel_dir = tmp_path / "wheels"
+    wheel_dir.mkdir()
+    selected = wheel_dir / "ve_adrive_cli-1.0.4-py3-none-macosx_11_0_arm64.whl"
+    selected.write_bytes(b"wheel")
+    (wheel_dir / "ve_adrive_cli-1.0.3-py3-none-macosx_11_0_arm64.whl").write_bytes(b"old")
+    (wheel_dir / "ve_tos_cli-1.0.4-py3-none-macosx_11_0_arm64.whl").write_bytes(b"other")
+    commands = []
+    monkeypatch.setattr(release, "missing_python_modules", lambda names: ())
+    monkeypatch.setattr(release, "run_command", lambda command, execute=True: commands.append(command))
+    args = release.build_parser().parse_args(
+        [
+            "pip", "--version", "1.0.4", "--package", "ve-adrive-cli",
+            "--out-dir", str(tmp_path), "--upload",
+        ]
+    )
+
+    release.run_pip(args)
+
+    assert commands == [[release.sys.executable, "-m", "twine", "upload", str(selected)]]
+
+
+def test_adrive_only_pip_preview_lists_only_selected_wheels(tmp_path, monkeypatch):
+    release = load_release_module()
+    wheel_dir = tmp_path / "wheels"
+    wheel_dir.mkdir()
+    selected = wheel_dir / "ve_adrive_cli-1.0.4-py3-none-macosx_11_0_arm64.whl"
+    selected.write_bytes(b"wheel")
+    (wheel_dir / "ve_tos_cli-1.0.4-py3-none-macosx_11_0_arm64.whl").write_bytes(b"other")
+    commands = []
+    monkeypatch.setattr(
+        release, "run_command",
+        lambda command, execute=True: commands.append((command, execute)),
+    )
+    args = release.build_parser().parse_args(
+        [
+            "pip", "--version", "1.0.4", "--package", "ve-adrive-cli",
+            "--out-dir", str(tmp_path), "--target", "aarch64-apple-darwin",
+        ]
+    )
+
+    release.run_pip(args)
+
+    assert commands[-1] == (
+        [release.sys.executable, "-m", "twine", "upload", str(selected)], False
+    )
+
+
+def test_adrive_only_generators_emit_only_the_selected_cli(tmp_path):
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    (binary_dir / "ve-adrive-cli").write_bytes(b"adrive executable")
+    archive_dir = tmp_path / "archives"
+    subprocess.run(
+        [
+            "python3", str(ARCHIVES_SCRIPT), "--target", "aarch64-apple-darwin",
+            "--binary-dir", str(binary_dir), "--out-dir", str(archive_dir),
+            "--command", "ve-adrive-cli",
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    with tarfile.open(archive_dir / "ve-storage-uni-cli-aarch64-apple-darwin.tar.gz") as archive:
+        binary_names = sorted(name for name in archive.getnames() if name.startswith("bin/"))
+    assert binary_names == ["bin/ve-adrive-cli"]
+    assert not (archive_dir / "install.sh").exists()
+
+    npm_dir = tmp_path / "npm"
+    subprocess.run(
+        [
+            "python3", str(REPO_ROOT / "packaging/scripts/npm.py"),
+            "--version", "1.0.4", "--out-dir", str(npm_dir),
+            "--package", "ve-adrive-cli",
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    assert sorted(path.name for path in npm_dir.iterdir()) == ["ve-adrive-cli"]
+
+    pip_dir = tmp_path / "pip"
+    subprocess.run(
+        [
+            "python3", str(REPO_ROOT / "packaging/scripts/pip.py"),
+            "--version", "1.0.4", "--binary-dir", str(binary_dir),
+            "--out-dir", str(pip_dir), "--package", "ve-adrive-cli",
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    assert sorted(path.name for path in pip_dir.iterdir()) == ["ve-adrive-cli"]
+
+
 def test_cargo_publish_steps_publish_only_required_public_cli_graph():
     release = load_release_module()
 
@@ -237,7 +383,10 @@ def test_packaging_readme_documents_github_release_upload_and_release_phases():
     assert "release.py checksums --out-dir dist" in readme
     assert "`--version <version>` expects `1.0.0`, not `v1.0.0`" in readme
     assert "--execute-publish --otp <otp-code>" in readme
-    assert "granular npm access token that has bypass 2FA enabled" in readme
+    npm_section = readme.split("Publish npm packages", 1)[1].split("Publish PyPI wheels", 1)[0]
+    assert "npm login --registry=https://registry.npmjs.org/" in npm_section
+    assert "granular" not in npm_section
+    assert "NPM_TOKEN" not in npm_section
     assert "For Linux PyPI wheels, use the `.2.17` target" in readme
     assert "Run this command once per PyPI target" in readme
     assert "`dist/pip/wheels/*.whl`" in readme
@@ -248,9 +397,13 @@ def test_packaging_readme_documents_github_release_upload_and_release_phases():
         )
     ]
     publish_section = readme[readme.index("### 3. Publish package registries") :]
-    assert "release.py homebrew" not in wrapper_section
-    assert "Homebrew formulae are macOS-only" not in wrapper_section
-    assert "Homebrew formulae are macOS-only" in publish_section
+    # [Review Fix #HomebrewSeparation] Generation belongs to step 2; step 3
+    # explains publishing the generated formulae through repository sync.
+    assert "release.py homebrew" in wrapper_section
+    assert "Homebrew formulae are macOS-only" in wrapper_section
+    assert "release.py homebrew" not in publish_section
+    assert "synchronized to the public GitHub repository" in publish_section
+    assert "### 4. Proposed internal ByteCloud TOS channel" not in readme
     assert "brew tap volcengine/ve-storage-uni-cli https://github.com/volcengine/ve-storage-uni-cli" in readme
     assert "homebrew --version <version> --checksums dist/SHA256SUMS --tap-dir ." in readme
     assert "synchronized to the public GitHub repository" in readme
@@ -871,6 +1024,76 @@ def test_pip_parser_accepts_target_without_binary_dirs():
     assert args.binary_dir is None
 
 
+def test_pip_upload_only_uses_all_prebuilt_platform_wheels(tmp_path, monkeypatch):
+    release = load_release_module()
+    wheel_dir = tmp_path / "wheels"
+    wheel_dir.mkdir()
+    wheel_names = (
+        "ve_tos_cli-1.2.3-py3-none-macosx_11_0_arm64.whl",
+        "ve_tos_cli-1.2.3-py3-none-win_amd64.whl",
+    )
+    for wheel_name in wheel_names:
+        (wheel_dir / wheel_name).write_bytes(b"wheel")
+    commands = []
+    monkeypatch.setattr(release, "missing_python_modules", lambda names: ())
+    monkeypatch.setattr(
+        release, "run_command", lambda command, execute=True: commands.append(command)
+    )
+    args = release.build_parser().parse_args(
+        ["pip", "--version", "1.2.3", "--out-dir", str(tmp_path), "--upload"]
+    )
+
+    release.run_pip(args)
+
+    assert commands == [
+        [
+            release.sys.executable,
+            "-m",
+            "twine",
+            "upload",
+            *(str(wheel_dir / name) for name in sorted(wheel_names)),
+        ]
+    ]
+
+
+def test_pip_upload_only_rejects_empty_wheel_directory(tmp_path, monkeypatch):
+    release = load_release_module()
+    monkeypatch.setattr(release, "missing_python_modules", lambda names: ())
+    args = release.build_parser().parse_args(
+        ["pip", "--version", "1.2.3", "--out-dir", str(tmp_path), "--upload"]
+    )
+
+    with pytest.raises(SystemExit, match="no wheels found"):
+        release.run_pip(args)
+
+
+@pytest.mark.parametrize("flags", [[], ["--build-wheel"], ["--build-wheel", "--upload"]])
+def test_pip_requires_binary_input_unless_upload_only(flags, monkeypatch):
+    release = load_release_module()
+    commands = []
+    monkeypatch.setattr(
+        release, "run_command", lambda command, execute=True: commands.append(command)
+    )
+    args = release.build_parser().parse_args(["pip", "--version", "1.2.3", *flags])
+
+    with pytest.raises(SystemExit, match="requires --target or at least one --binary-dir"):
+        release.run_pip(args)
+
+    assert commands == []
+
+
+def test_pip_upload_keeps_binary_inputs_mutually_exclusive():
+    release = load_release_module()
+
+    with pytest.raises(SystemExit):
+        release.build_parser().parse_args(
+            [
+                "pip", "--version", "1.2.3", "--upload",
+                "--target", "aarch64-apple-darwin", "--binary-dir", "custom/bin",
+            ]
+        )
+
+
 def test_pip_target_expands_to_public_entry_binary_dirs(tmp_path, monkeypatch):
     release = load_release_module()
     commands = []
@@ -1191,6 +1414,55 @@ def test_npm_publish_accepts_otp_for_two_factor_auth(tmp_path, monkeypatch):
         "--otp",
         "123456",
     ) in [command for command, _execute in commands]
+
+
+@pytest.mark.parametrize("is_capture_output", [False, True])
+def test_npm_otp_is_redacted_in_release_logs_and_errors(monkeypatch, capsys, is_capture_output):
+    release = load_release_module()
+    command = ["npm", "publish", "dist/npm/ve-tos-cli", "--otp", "654321"]
+
+    def failed_publish(arguments, **options):
+        assert arguments == command
+        if options["check"]:
+            raise subprocess.CalledProcessError(1, arguments)
+        return subprocess.CompletedProcess(arguments, 1, stdout="", stderr="publish failed\n")
+
+    monkeypatch.setattr(release.subprocess, "run", failed_publish)
+
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        release.run_command(command, capture_output=is_capture_output)
+
+    output = capsys.readouterr()
+    assert "654321" not in output.out + output.err + str(error.value)
+    assert command[-1] == "654321"
+
+
+@pytest.mark.parametrize("is_execute_publish", [False, True])
+def test_npm_publish_excludes_reserved_tos_cli(tmp_path, monkeypatch, is_execute_publish):
+    release = load_release_module()
+    commands = []
+    monkeypatch.setattr(
+        release,
+        "run_command",
+        lambda command, execute=True: commands.append((command, execute)),
+    )
+    args = release.build_parser().parse_args(
+        ["npm", "--version", "1.2.3", "--out-dir", str(tmp_path)]
+        + (["--execute-publish"] if is_execute_publish else [])
+    )
+
+    release.run_npm(args)
+
+    publish_commands = [
+        (command, execute)
+        for command, execute in commands
+        if command[:2] == ["npm", "publish"]
+    ]
+    assert [Path(command[2]).name for command, _ in publish_commands] == [
+        "ve-tos-cli",
+        "ve-adrive-cli",
+    ]
+    assert all(execute == is_execute_publish for _, execute in publish_commands)
 
 
 def test_root_package_is_publishable_to_crates_io():

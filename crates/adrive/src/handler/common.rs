@@ -1159,7 +1159,8 @@ fn auth_error_guidance(
         ));
     }
     if mode == Some(AuthMode::Oauth) && code == "oauth_user_id_required" {
-        // [Review Fix #2] `auth login` requires the target Instance on this CLI surface.
+        // [Review Fix #5] Recommend an explicit target here so the new login
+        // refreshes identity metadata for the Instance being operated on.
         return Some(guidance(
             "Run ve-adrive auth login --instance <instance_id> to refresh the selected user identity, or pass --owner-id explicitly",
             Some("ve-adrive auth login --instance <instance_id>"),

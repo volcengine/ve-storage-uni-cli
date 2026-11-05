@@ -2305,7 +2305,7 @@ fn test_chinese_auth_help_localizes_new_authentication_contract() {
     let login_help =
         successful_cli_stdout(&["ve-adrive", "auth", "login", "--help", "--language", "zh"]);
     for expected in [
-        "要授权的 ADrive Instance ID",
+        "要授权的 ADrive Instance ID。覆盖 profile default_instance 和 ADRIVE_DEFAULT_INSTANCE；未设置时由授权服务器选择 Instance",
         "OAuth 授权服务器基础 URL",
         "授权期间显示的人类可读设备名称",
     ] {

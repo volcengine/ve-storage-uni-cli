@@ -191,6 +191,7 @@ process.exit(result.status === null ? 1 : result.status);
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True, help="Package version")
+    parser.add_argument("--package", help="Generate only the named npm package")
     parser.add_argument(
         "--config",
         default=Path("packaging/npm/packages.json"),
@@ -259,7 +260,13 @@ def generate_package(out_dir: Path, package: dict[str, object], version: str, re
 def main() -> None:
     args = parse_args()
     config = json.loads(args.config.read_text(encoding="utf-8"))
-    for package in config["packages"]:
+    packages = [
+        package for package in config["packages"]
+        if args.package is None or package["name"] == args.package
+    ]
+    if not packages:
+        raise SystemExit(f"unknown npm package: {args.package}")
+    for package in packages:
         generate_package(args.out_dir, package, args.version, config["releaseRepo"])
 
 

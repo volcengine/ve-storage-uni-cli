@@ -106,7 +106,10 @@ fn dedicated_adrive_cli_version_output() {
         .output()
         .expect("Failed to execute ve-adrive-cli --version");
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("ve-adrive-cli"));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        format!("ve-adrive-cli {}", env!("CARGO_PKG_VERSION"))
+    );
 }
 
 #[test]

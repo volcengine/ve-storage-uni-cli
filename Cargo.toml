@@ -75,7 +75,7 @@ include = [
 tos-core = { version = "1.0.3", path = "crates/tos-core" }
 ve-tos-cli = { package = "ve-tos-cli-core", version = "1.0.3", path = "crates/tos" }
 tos-cli = { package = "tos-cli-core", version = "1.0.3", path = "crates/toscli" }
-ve-adrive-cli = { package = "ve-adrive-cli-core", version = "1.0.3", path = "crates/adrive" }
+ve-adrive-cli = { package = "ve-adrive-cli-core", version = "1.0.4", path = "crates/adrive" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

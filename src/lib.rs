@@ -1717,9 +1717,10 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
         "Use credentials managed by the unified authentication integration",
         "使用统一登录集成管理的凭证",
     ),
+    // [Review Fix #4] Keep localized help aligned with the optional login field.
     (
-        "ADrive Instance ID to authorize. Overrides profile default_instance and ADRIVE_DEFAULT_INSTANCE; required if neither fallback is configured",
-        "要授权的 ADrive Instance ID。覆盖 profile default_instance 和 ADRIVE_DEFAULT_INSTANCE；两者均未配置时必填",
+        "ADrive Instance ID to authorize. Overrides profile default_instance and ADRIVE_DEFAULT_INSTANCE; when unset, the authorization server selects the Instance",
+        "要授权的 ADrive Instance ID。覆盖 profile default_instance 和 ADRIVE_DEFAULT_INSTANCE；未设置时由授权服务器选择 Instance",
     ),
     (
         "OAuth Authorization Server base URL. Overrides profile auth_endpoint and ADRIVE_AUTH_ENDPOINT; defaults to the effective endpoint",
@@ -3667,7 +3668,12 @@ fn direct_tool_args(args: Vec<String>, tool: &str) -> Vec<String> {
 
 fn maybe_print_direct_version(args: &[String], binary_name: &str) -> bool {
     if args.len() == 2 && matches!(args[1].as_str(), "--version" | "-V") {
-        println!("{} {}", binary_name, env!("CARGO_PKG_VERSION"));
+        // [Review Fix #5] ADrive has its own release version; TOS uses the root version.
+        let version = match binary_name {
+            "ve-adrive-cli" => ve_adrive_cli::CLI_VERSION,
+            _ => env!("CARGO_PKG_VERSION"),
+        };
+        println!("{binary_name} {version}");
         return true;
     }
     false
@@ -4217,7 +4223,7 @@ fn maybe_emit_adrive_describe_recovery(effective_args: &[String]) -> bool {
     let mut data = if command == "ve-adrive" {
         serde_json::json!({
             "tool": "ve-adrive",
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": ve_adrive_cli::CLI_VERSION,
             "description": "ADrive CLI high-level file operations and agent utilities",
             "uri_format": "adrive://instance/space/folder/file",
             "implemented_layers": ["high_level", "utilities", "share"],
