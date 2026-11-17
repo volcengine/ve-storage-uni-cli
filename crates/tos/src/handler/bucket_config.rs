@@ -707,6 +707,7 @@ where
     }
 
     let Some(action) = action else {
+        let group_name = crate::handler::common::public_tos_template(group_name);
         return Err(CliError::ValidationError(format!(
             "`{group_name}` requires a subcommand; use `{group_name} --help` or `{group_name} --describe`"
         )));
@@ -757,6 +758,7 @@ fn current_bucket_config_command_path(group_name: &str) -> String {
         tokens.push(arg.as_str());
     }
     for len in (1..=tokens.len()).rev() {
+        // [Review Fix #CommandDisplay9] Registry lookup keys are canonical IDs.
         let candidate = format!("ve-tos {}", tokens[..len].join(" "));
         if crate::registry::capability_row_for_command(&candidate, false).is_some()
             || crate::registry::find_command_tree_entry(&candidate).is_some()
@@ -1567,12 +1569,16 @@ fn acl_operation(action: &AclAction) -> Result<BucketConfigOperation, CliError> 
             let body_mode = args.config.is_some();
             if !header_mode && !body_mode {
                 return Err(CliError::ValidationError(
-                    "ve-tos acl set requires either ACL headers or ACL body fields".into(),
+                    crate::handler::common::public_tos_template(
+                        "ve-tos acl set requires either ACL headers or ACL body fields",
+                    ),
                 ));
             }
             if header_mode && body_mode {
                 return Err(CliError::ValidationError(
-                    "ve-tos acl set cannot mix ACL header mode with ACL body mode".into(),
+                    crate::handler::common::public_tos_template(
+                        "ve-tos acl set cannot mix ACL header mode with ACL body mode",
+                    ),
                 ));
             }
 
@@ -1589,16 +1595,10 @@ fn acl_operation(action: &AclAction) -> Result<BucketConfigOperation, CliError> 
                     .into_iter()
                     .any(|present| present)
                 {
-                    return Err(CliError::ValidationError(
-                        "ve-tos acl set cannot combine --acl with explicit x-tos-grant-* headers"
-                            .into(),
-                    ));
+                    return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos acl set cannot combine --acl with explicit x-tos-grant-* headers")));
                 }
                 if args.grant_read_non_list.is_some() && args.grant_read_acp.is_none() {
-                    return Err(CliError::ValidationError(
-                        "ve-tos acl set requires --grant-read-acp when --grant-read-non-list is used"
-                            .into(),
-                    ));
+                    return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos acl set requires --grant-read-acp when --grant-read-non-list is used")));
                 }
                 let mut headers = BTreeMap::new();
                 insert_optional_header(&mut headers, "x-tos-acl", args.acl.clone());
@@ -2641,11 +2641,12 @@ fn quota_body(args: &QuotaSetArgs) -> Result<Vec<u8>, CliError> {
     }
 
     Err(CliError::ValidationError(
-        "ve-tos quota set requires --config JSON body".into(),
+        crate::handler::common::public_tos_template("ve-tos quota set requires --config JSON body"),
     ))
 }
 
 fn required_config_body(config: &Option<String>, command: &str) -> Result<Vec<u8>, CliError> {
+    let command = crate::handler::common::public_tos_template(command);
     json_bytes_from_input(config.as_deref().ok_or_else(|| {
         CliError::ValidationError(format!("{command} requires --config JSON body"))
     })?)
@@ -2681,7 +2682,8 @@ fn normalize_trash_payload(value: Value) -> Result<Value, CliError> {
         Value::Object(map) => map,
         other => {
             return Err(CliError::ValidationError(format!(
-                "ve-tos trash set requires a JSON object payload, got {other}"
+                "{} trash set requires a JSON object payload, got {other}",
+                crate::handler::common::public_tos_template("ve-tos")
             )));
         }
     };
@@ -2697,8 +2699,11 @@ fn normalize_trash_payload(value: Value) -> Result<Value, CliError> {
         }
     };
 
-    let status = take_json_alias(&mut trash, &["Status", "status"])
-        .ok_or_else(|| CliError::ValidationError("ve-tos trash set requires `Status`".into()))?;
+    let status = take_json_alias(&mut trash, &["Status", "status"]).ok_or_else(|| {
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos trash set requires `Status`",
+        ))
+    })?;
     let status = trash_string_field(status, "Status")?;
     let status = normalize_enum_value(
         "ve-tos trash set",
@@ -2858,7 +2863,9 @@ fn intelligent_tiering_body(args: &IntelligentTieringSetArgs) -> Result<Vec<u8>,
 fn transfer_acceleration_body(args: &TransferAccelerationSetArgs) -> Result<Vec<u8>, CliError> {
     if args.enabled.is_some() && args.status.is_some() {
         return Err(CliError::ValidationError(
-            "ve-tos transfer-acceleration set cannot mix --enabled with --status".into(),
+            crate::handler::common::public_tos_template(
+                "ve-tos transfer-acceleration set cannot mix --enabled with --status",
+            ),
         ));
     }
     let enabled_str = if let Some(enabled) = args.enabled {
@@ -2891,19 +2898,19 @@ fn cdn_notification_body(args: &CdnNotificationSetArgs) -> Result<Vec<u8>, CliEr
     }
 
     let events = parse_string_list(args.events.as_deref().ok_or_else(|| {
-        CliError::ValidationError(
-            "ve-tos cdn-notification set requires --events when using field-level flags".into(),
-        )
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos cdn-notification set requires --events when using field-level flags",
+        ))
     })?)?;
     let role = args.role.clone().ok_or_else(|| {
-        CliError::ValidationError(
-            "ve-tos cdn-notification set requires --role when using field-level flags".into(),
-        )
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos cdn-notification set requires --role when using field-level flags",
+        ))
     })?;
     let custom_domain = args.endpoint.clone().ok_or_else(|| {
-        CliError::ValidationError(
-            "ve-tos cdn-notification set requires --endpoint when using field-level flags".into(),
-        )
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos cdn-notification set requires --endpoint when using field-level flags",
+        ))
     })?;
     let filter = json!({
         "TOSKey": {
@@ -2937,7 +2944,9 @@ fn cdn_notification_config_body(input: &str) -> Result<Vec<u8>, CliError> {
 fn normalize_cdn_notification_value(value: Value) -> Result<Value, CliError> {
     let Value::Object(mut map) = value else {
         return Err(CliError::ValidationError(
-            "ve-tos cdn-notification set request body must be a JSON object".into(),
+            crate::handler::common::public_tos_template(
+                "ve-tos cdn-notification set request body must be a JSON object",
+            ),
         ));
     };
     if map.contains_key("Rules") {
@@ -2949,15 +2958,17 @@ fn normalize_cdn_notification_value(value: Value) -> Result<Value, CliError> {
     // config files fail less surprisingly while the outgoing body is canonical.
     let role = take_required_string(&mut map, "Role", "ve-tos cdn-notification set")?;
     let events = map.remove("Events").ok_or_else(|| {
-        CliError::ValidationError("ve-tos cdn-notification set requires Events".into())
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos cdn-notification set requires Events",
+        ))
     })?;
     validate_string_array_value(&events, "Events", "ve-tos cdn-notification set")?;
     let custom_domain = take_optional_string(&mut map, "CustomDomain")
         .or_else(|| take_optional_string(&mut map, "Endpoint"))
         .ok_or_else(|| {
-            CliError::ValidationError(
-                "ve-tos cdn-notification set requires CustomDomain in each rule".into(),
-            )
+            CliError::ValidationError(crate::handler::common::public_tos_template(
+                "ve-tos cdn-notification set requires CustomDomain in each rule",
+            ))
         })?;
     let rule_id = take_optional_string(&mut map, "RuleId").unwrap_or_else(|| "default".to_string());
     let filter = map.remove("Filter").unwrap_or_else(|| {
@@ -2988,32 +2999,44 @@ fn validate_cdn_notification_canonical(
 ) -> Result<(), CliError> {
     validate_required_string(map, "Role", "ve-tos cdn-notification set")?;
     let rules = map.get("Rules").ok_or_else(|| {
-        CliError::ValidationError("ve-tos cdn-notification set requires Rules".into())
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos cdn-notification set requires Rules",
+        ))
     })?;
     let Value::Array(rules) = rules else {
         return Err(CliError::ValidationError(
-            "ve-tos cdn-notification set requires Rules to be an array".into(),
+            crate::handler::common::public_tos_template(
+                "ve-tos cdn-notification set requires Rules to be an array",
+            ),
         ));
     };
     if rules.is_empty() {
         return Err(CliError::ValidationError(
-            "ve-tos cdn-notification set requires at least one rule".into(),
+            crate::handler::common::public_tos_template(
+                "ve-tos cdn-notification set requires at least one rule",
+            ),
         ));
     }
     for rule in rules {
         let Value::Object(rule_map) = rule else {
             return Err(CliError::ValidationError(
-                "ve-tos cdn-notification set requires each rule to be an object".into(),
+                crate::handler::common::public_tos_template(
+                    "ve-tos cdn-notification set requires each rule to be an object",
+                ),
             ));
         };
         validate_required_string(rule_map, "RuleId", "ve-tos cdn-notification set")?;
         validate_required_string(rule_map, "CustomDomain", "ve-tos cdn-notification set")?;
         let events = rule_map.get("Events").ok_or_else(|| {
-            CliError::ValidationError("ve-tos cdn-notification set requires rule Events".into())
+            CliError::ValidationError(crate::handler::common::public_tos_template(
+                "ve-tos cdn-notification set requires rule Events",
+            ))
         })?;
         validate_string_array_value(events, "Rules.Events", "ve-tos cdn-notification set")?;
         let filter = rule_map.get("Filter").ok_or_else(|| {
-            CliError::ValidationError("ve-tos cdn-notification set requires rule Filter".into())
+            CliError::ValidationError(crate::handler::common::public_tos_template(
+                "ve-tos cdn-notification set requires rule Filter",
+            ))
         })?;
         validate_cdn_filter(filter)?;
     }
@@ -3026,18 +3049,24 @@ fn validate_cdn_filter(value: &Value) -> Result<(), CliError> {
         .and_then(|tos_key| tos_key.get("FilterRules"))
     else {
         return Err(CliError::ValidationError(
-            "ve-tos cdn-notification set requires Filter.TOSKey.FilterRules".into(),
+            crate::handler::common::public_tos_template(
+                "ve-tos cdn-notification set requires Filter.TOSKey.FilterRules",
+            ),
         ));
     };
     let Value::Array(rules) = filter_rules else {
         return Err(CliError::ValidationError(
-            "ve-tos cdn-notification set requires FilterRules to be an array".into(),
+            crate::handler::common::public_tos_template(
+                "ve-tos cdn-notification set requires FilterRules to be an array",
+            ),
         ));
     };
     for rule in rules {
         let Value::Object(rule_map) = rule else {
             return Err(CliError::ValidationError(
-                "ve-tos cdn-notification set requires each FilterRule to be an object".into(),
+                crate::handler::common::public_tos_template(
+                    "ve-tos cdn-notification set requires each FilterRule to be an object",
+                ),
             ));
         };
         validate_required_string(rule_map, "Name", "ve-tos cdn-notification set")?;
@@ -3051,6 +3080,7 @@ fn validate_required_string(
     field: &str,
     command: &str,
 ) -> Result<(), CliError> {
+    let command = crate::handler::common::public_tos_template(command);
     match map.get(field).and_then(Value::as_str) {
         Some(value) if !value.trim().is_empty() => Ok(()),
         _ => Err(CliError::ValidationError(format!(
@@ -3064,6 +3094,7 @@ fn take_required_string(
     field: &str,
     command: &str,
 ) -> Result<String, CliError> {
+    let command = crate::handler::common::public_tos_template(command);
     let value = map
         .remove(field)
         .ok_or_else(|| CliError::ValidationError(format!("{command} requires {field}")))?;
@@ -3085,6 +3116,7 @@ fn take_optional_string(map: &mut serde_json::Map<String, Value>, field: &str) -
 }
 
 fn validate_string_array_value(value: &Value, field: &str, command: &str) -> Result<(), CliError> {
+    let command = crate::handler::common::public_tos_template(command);
     let Value::Array(items) = value else {
         return Err(CliError::ValidationError(format!(
             "{command} requires {field} to be an array of strings"
@@ -3118,10 +3150,7 @@ fn redundancy_transition_body(
         if let Value::Object(map) = &mut value {
             if let Some(raw_target_redundancy) = map.remove("TargetRedundancy") {
                 let extracted = raw_target_redundancy.as_str().ok_or_else(|| {
-                    CliError::ValidationError(
-                        "ve-tos redundancy-transition create requires TargetRedundancy to be a string"
-                            .into(),
-                    )
+                    CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos redundancy-transition create requires TargetRedundancy to be a string"))
                 })?;
                 target_redundancy = Some(extracted.to_string());
             }
@@ -3224,16 +3253,16 @@ fn notification_body(args: &NotificationSetArgs) -> Result<Vec<u8>, CliError> {
     ensure_payload_mode("notification", args.rules.is_some(), structured)?;
 
     let version = args.version.clone().ok_or_else(|| {
-        CliError::ValidationError("ve-tos notification set requires --version".into())
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos notification set requires --version",
+        ))
     })?;
 
     let rules = if let Some(input) = &args.rules {
         parse_json_array(input, "Rules")?
     } else {
         let events = parse_string_list(args.events.as_deref().ok_or_else(|| {
-            CliError::ValidationError(
-                "ve-tos notification set requires --events when using field-level notification_v2 flags".into(),
-            )
+            CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos notification set requires --events when using field-level notification_v2 flags"))
         })?)?;
 
         let vefaas = if let Some(input) = &args.destination_vefaas {
@@ -3263,10 +3292,10 @@ fn notification_body(args: &NotificationSetArgs) -> Result<Vec<u8>, CliError> {
             || args.kafka_region.is_some()
         {
             Value::Array(vec![json!({
-                "Role": args.kafka_role.clone().ok_or_else(|| CliError::ValidationError("ve-tos notification set requires --kafka-role when Kafka destination fields are used".into()))?,
-                "InstanceId": args.kafka_instance_id.clone().ok_or_else(|| CliError::ValidationError("ve-tos notification set requires --kafka-instance-id when Kafka destination fields are used".into()))?,
-                "Topic": args.kafka_topic.clone().ok_or_else(|| CliError::ValidationError("ve-tos notification set requires --kafka-topic when Kafka destination fields are used".into()))?,
-                "User": args.kafka_user.clone().ok_or_else(|| CliError::ValidationError("ve-tos notification set requires --kafka-user when Kafka destination fields are used".into()))?,
+                "Role": args.kafka_role.clone().ok_or_else(|| CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos notification set requires --kafka-role when Kafka destination fields are used")))?,
+                "InstanceId": args.kafka_instance_id.clone().ok_or_else(|| CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos notification set requires --kafka-instance-id when Kafka destination fields are used")))?,
+                "Topic": args.kafka_topic.clone().ok_or_else(|| CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos notification set requires --kafka-topic when Kafka destination fields are used")))?,
+                "User": args.kafka_user.clone().ok_or_else(|| CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos notification set requires --kafka-user when Kafka destination fields are used")))?,
                 "Region": args.kafka_region.clone().unwrap_or_default(),
             })])
         } else {
@@ -3281,10 +3310,10 @@ fn notification_body(args: &NotificationSetArgs) -> Result<Vec<u8>, CliError> {
             || args.rocketmq_access_key_id.is_some()
         {
             Value::Array(vec![json!({
-                "Role": args.rocketmq_role.clone().ok_or_else(|| CliError::ValidationError("ve-tos notification set requires --rocketmq-role when RocketMQ destination fields are used".into()))?,
-                "InstanceId": args.rocketmq_instance_id.clone().ok_or_else(|| CliError::ValidationError("ve-tos notification set requires --rocketmq-instance-id when RocketMQ destination fields are used".into()))?,
-                "Topic": args.rocketmq_topic.clone().ok_or_else(|| CliError::ValidationError("ve-tos notification set requires --rocketmq-topic when RocketMQ destination fields are used".into()))?,
-                "AccessKeyId": args.rocketmq_access_key_id.clone().ok_or_else(|| CliError::ValidationError("ve-tos notification set requires --rocketmq-access-key-id when RocketMQ destination fields are used".into()))?,
+                "Role": args.rocketmq_role.clone().ok_or_else(|| CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos notification set requires --rocketmq-role when RocketMQ destination fields are used")))?,
+                "InstanceId": args.rocketmq_instance_id.clone().ok_or_else(|| CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos notification set requires --rocketmq-instance-id when RocketMQ destination fields are used")))?,
+                "Topic": args.rocketmq_topic.clone().ok_or_else(|| CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos notification set requires --rocketmq-topic when RocketMQ destination fields are used")))?,
+                "AccessKeyId": args.rocketmq_access_key_id.clone().ok_or_else(|| CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos notification set requires --rocketmq-access-key-id when RocketMQ destination fields are used")))?,
             })])
         } else {
             Value::Array(Vec::new())
@@ -3294,10 +3323,7 @@ fn notification_body(args: &NotificationSetArgs) -> Result<Vec<u8>, CliError> {
             && kafka.as_array().map_or(true, |items| items.is_empty())
             && rocketmq.as_array().map_or(true, |items| items.is_empty())
         {
-            return Err(CliError::ValidationError(
-                "ve-tos notification set requires at least one destination in notification_v2 mode"
-                    .into(),
-            ));
+            return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos notification set requires at least one destination in notification_v2 mode")));
         }
 
         Value::Array(vec![json!({
@@ -3340,18 +3366,16 @@ fn website_body(args: &WebsiteSetArgs) -> Result<Vec<u8>, CliError> {
     if args.redirect_all_requests_to_protocol.is_some()
         && args.redirect_all_requests_to_host_name.is_none()
     {
-        return Err(CliError::ValidationError(
-            "ve-tos website set requires --redirect-all-requests-to-host-name when --redirect-all-requests-to-protocol is used".into(),
-        ));
+        return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos website set requires --redirect-all-requests-to-host-name when --redirect-all-requests-to-protocol is used")));
     }
     if args.index_document_forbidden_sub_dir.is_some() && args.index_document_suffix.is_none() {
-        return Err(CliError::ValidationError(
-            "ve-tos website set requires --index-document-suffix when --index-document-forbidden-sub-dir is used".into(),
-        ));
+        return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos website set requires --index-document-suffix when --index-document-forbidden-sub-dir is used")));
     }
     if args.routing_rules.is_some() && has_routing_rule_fields {
         return Err(CliError::ValidationError(
-            "ve-tos website set cannot mix --routing-rules with single routing rule flags".into(),
+            crate::handler::common::public_tos_template(
+                "ve-tos website set cannot mix --routing-rules with single routing rule flags",
+            ),
         ));
     }
     if has_redirect_all
@@ -3360,16 +3384,12 @@ fn website_body(args: &WebsiteSetArgs) -> Result<Vec<u8>, CliError> {
             || args.routing_rules.is_some()
             || has_routing_rule_fields)
     {
-        return Err(CliError::ValidationError(
-            "ve-tos website set cannot combine RedirectAllRequestsTo with index/error/routing website configuration".into(),
-        ));
+        return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos website set cannot combine RedirectAllRequestsTo with index/error/routing website configuration")));
     }
     if args.routing_rule_replace_key_prefix_with.is_some()
         && args.routing_rule_replace_key_with.is_some()
     {
-        return Err(CliError::ValidationError(
-            "ve-tos website set cannot use --routing-rule-replace-key-prefix-with together with --routing-rule-replace-key-with".into(),
-        ));
+        return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos website set cannot use --routing-rule-replace-key-prefix-with together with --routing-rule-replace-key-with")));
     }
 
     let mut body = serde_json::Map::new();
@@ -3423,9 +3443,7 @@ fn website_body(args: &WebsiteSetArgs) -> Result<Vec<u8>, CliError> {
         .into_iter()
         .any(|present| present);
         if !has_redirect {
-            return Err(CliError::ValidationError(
-                "ve-tos website set requires at least one redirect field when using single routing rule flags".into(),
-            ));
+            return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos website set requires at least one redirect field when using single routing rule flags")));
         }
 
         let mut condition = serde_json::Map::new();
@@ -3475,7 +3493,9 @@ fn website_body(args: &WebsiteSetArgs) -> Result<Vec<u8>, CliError> {
 
     if body.is_empty() {
         return Err(CliError::ValidationError(
-            "ve-tos website set requires at least one website configuration field".into(),
+            crate::handler::common::public_tos_template(
+                "ve-tos website set requires at least one website configuration field",
+            ),
         ));
     }
 
@@ -3533,18 +3553,14 @@ fn mirror_body(args: &MirrorSetArgs) -> Result<Vec<u8>, CliError> {
             Value::Object(map) if map.contains_key("Rules") => {
                 serde_json::to_vec(&Value::Object(map)).map_err(CliError::Json)
             }
-            other => Err(CliError::ValidationError(format!(
-                "ve-tos mirror set expects a JSON array of rules or an object containing `Rules`, got {other}"
-            ))),
+            other => Err(CliError::ValidationError(format!("{} mirror set expects a JSON array of rules or an object containing `Rules`, got {other}", crate::handler::common::public_tos_template("ve-tos")))),
         };
     }
 
     if args.transform_replace_key_prefix.is_some()
         ^ args.transform_replace_key_prefix_with.is_some()
     {
-        return Err(CliError::ValidationError(
-            "ve-tos mirror set requires both --transform-replace-key-prefix and --transform-replace-key-prefix-with when using ReplaceKeyPrefix".into(),
-        ));
+        return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos mirror set requires both --transform-replace-key-prefix and --transform-replace-key-prefix-with when using ReplaceKeyPrefix")));
     }
 
     let mut condition = serde_json::Map::new();
@@ -3679,10 +3695,7 @@ fn mirror_body(args: &MirrorSetArgs) -> Result<Vec<u8>, CliError> {
     }
 
     if rule.is_empty() {
-        return Err(CliError::ValidationError(
-            "ve-tos mirror set requires either a full JSON payload or field-level mirror schema flags"
-                .into(),
-        ));
+        return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos mirror set requires either a full JSON payload or field-level mirror schema flags")));
     }
 
     serde_json::to_vec(&json!({ "Rules": [Value::Object(rule)] })).map_err(CliError::Json)
@@ -3691,28 +3704,44 @@ fn mirror_body(args: &MirrorSetArgs) -> Result<Vec<u8>, CliError> {
 #[cfg(test)]
 fn inventory_body(args: &InventorySetArgs) -> Result<Vec<u8>, CliError> {
     let is_enabled = args.is_enabled.ok_or_else(|| {
-        CliError::ValidationError("ve-tos inventory set requires --is-enabled".into())
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos inventory set requires --is-enabled",
+        ))
     })?;
     let destination_format = args.destination_format.clone().ok_or_else(|| {
-        CliError::ValidationError("ve-tos inventory set requires --destination-format".into())
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos inventory set requires --destination-format",
+        ))
     })?;
     let destination_account_id = args.destination_account_id.clone().ok_or_else(|| {
-        CliError::ValidationError("ve-tos inventory set requires --destination-account-id".into())
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos inventory set requires --destination-account-id",
+        ))
     })?;
     let destination_role = args.destination_role.clone().ok_or_else(|| {
-        CliError::ValidationError("ve-tos inventory set requires --destination-role".into())
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos inventory set requires --destination-role",
+        ))
     })?;
     let destination_bucket = args.destination_bucket.clone().ok_or_else(|| {
-        CliError::ValidationError("ve-tos inventory set requires --destination-bucket".into())
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos inventory set requires --destination-bucket",
+        ))
     })?;
     let schedule_frequency = args.schedule_frequency.clone().ok_or_else(|| {
-        CliError::ValidationError("ve-tos inventory set requires --schedule-frequency".into())
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos inventory set requires --schedule-frequency",
+        ))
     })?;
     let included_object_versions = args.included_object_versions.clone().ok_or_else(|| {
-        CliError::ValidationError("ve-tos inventory set requires --included-object-versions".into())
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos inventory set requires --included-object-versions",
+        ))
     })?;
     let is_uncompressed = args.is_uncompressed.ok_or_else(|| {
-        CliError::ValidationError("ve-tos inventory set requires --is-uncompressed".into())
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos inventory set requires --is-uncompressed",
+        ))
     })?;
 
     let mut destination = serde_json::Map::new();
@@ -3760,17 +3789,15 @@ fn real_time_log_body(args: &RealTimeLogSetArgs) -> Result<Vec<u8>, CliError> {
         return json_bytes_from_input(config);
     }
     let use_service_topic = args.use_service_topic.ok_or_else(|| {
-        CliError::ValidationError("ve-tos real-time-log set requires --use-service-topic".into())
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos real-time-log set requires --use-service-topic",
+        ))
     })?;
     if use_service_topic && (args.tls_project_id.is_some() || args.tls_topic_id.is_some()) {
-        return Err(CliError::ValidationError(
-            "ve-tos real-time-log set cannot provide TLS project/topic IDs when --use-service-topic true is used".into(),
-        ));
+        return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos real-time-log set cannot provide TLS project/topic IDs when --use-service-topic true is used")));
     }
     if !use_service_topic && (args.tls_project_id.is_none() || args.tls_topic_id.is_none()) {
-        return Err(CliError::ValidationError(
-            "ve-tos real-time-log set requires --tls-project-id and --tls-topic-id when --use-service-topic false is used".into(),
-        ));
+        return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos real-time-log set requires --tls-project-id and --tls-topic-id when --use-service-topic false is used")));
     }
 
     let mut access_log_configuration = serde_json::Map::new();
@@ -3815,10 +3842,7 @@ fn logging_body(args: &LoggingSetArgs) -> Result<Vec<u8>, CliError> {
             "BucketLoggingStatus": {}
         }))
         .map_err(CliError::Json),
-        _ => Err(CliError::ValidationError(
-            "ve-tos logging set requires --target-bucket and --target-prefix together, or omits both to disable logging"
-                .into(),
-        )),
+        _ => Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos logging set requires --target-bucket and --target-prefix together, or omits both to disable logging"))),
     }
 }
 
@@ -3836,9 +3860,7 @@ fn worm_body(args: &WormSetArgs) -> Result<Vec<u8>, CliError> {
     )?;
 
     if args.default_retention_days.is_some() && args.default_retention_years.is_some() {
-        return Err(CliError::ValidationError(
-            "ve-tos worm set cannot use --default-retention-days together with --default-retention-years".into(),
-        ));
+        return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos worm set cannot use --default-retention-days together with --default-retention-years")));
     }
     if [
         args.default_retention_mode.is_some(),
@@ -3852,9 +3874,7 @@ fn worm_body(args: &WormSetArgs) -> Result<Vec<u8>, CliError> {
             "ve-tos worm set",
             "default-retention-mode",
             args.default_retention_mode.as_deref().ok_or_else(|| {
-                CliError::ValidationError(
-                    "ve-tos worm set requires --default-retention-mode when default retention is configured".into(),
-                )
+                CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos worm set requires --default-retention-mode when default retention is configured"))
             })?,
             &["COMPLIANCE", "GOVERNANCE"],
         )?;
@@ -3867,9 +3887,7 @@ fn worm_body(args: &WormSetArgs) -> Result<Vec<u8>, CliError> {
             default_retention.insert("Years".to_string(), json!(years));
         }
         if !default_retention.contains_key("Days") && !default_retention.contains_key("Years") {
-            return Err(CliError::ValidationError(
-                "ve-tos worm set requires either --default-retention-days or --default-retention-years when default retention is configured".into(),
-            ));
+            return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos worm set requires either --default-retention-days or --default-retention-years when default retention is configured")));
         }
         return serde_json::to_vec(&json!({
             "ObjectLockEnabled": object_lock_enabled,
@@ -3955,19 +3973,13 @@ fn build_private_source(args: &MirrorSetArgs) -> Result<Option<Value>, CliError>
     {
         Some(json!({
             "StorageVendor": args.private_source_storage_vendor.clone().ok_or_else(|| {
-                CliError::ValidationError(
-                    "ve-tos mirror set requires --private-source-storage-vendor when private static credential is used".into(),
-                )
+                CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos mirror set requires --private-source-storage-vendor when private static credential is used"))
             })?,
             "AK": args.private_source_ak.clone().ok_or_else(|| {
-                CliError::ValidationError(
-                    "ve-tos mirror set requires --private-source-ak when private static credential is used".into(),
-                )
+                CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos mirror set requires --private-source-ak when private static credential is used"))
             })?,
             "SK": args.private_source_sk.clone().ok_or_else(|| {
-                CliError::ValidationError(
-                    "ve-tos mirror set requires --private-source-sk when private static credential is used".into(),
-                )
+                CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos mirror set requires --private-source-sk when private static credential is used"))
             })?,
             "SKEncryptType": args.private_source_sk_encrypt_type.clone(),
         }))
@@ -5375,12 +5387,16 @@ fn acl_body(args: &AclSetArgs) -> Result<Vec<u8>, CliError> {
     .any(|present| present);
     if args.grants.is_some() && structured_grant {
         return Err(CliError::ValidationError(
-            "ve-tos acl set cannot mix --grants with single-grant body fields".into(),
+            crate::handler::common::public_tos_template(
+                "ve-tos acl set cannot mix --grants with single-grant body fields",
+            ),
         ));
     }
     if args.bucket_acl_delivered == Some(true) && args.owner_id.is_none() {
         return Err(CliError::ValidationError(
-            "ve-tos acl set requires --owner-id when --bucket-acl-delivered true is used".into(),
+            crate::handler::common::public_tos_template(
+                "ve-tos acl set requires --owner-id when --bucket-acl-delivered true is used",
+            ),
         ));
     }
 
@@ -5421,16 +5437,10 @@ fn acl_body(args: &AclSetArgs) -> Result<Vec<u8>, CliError> {
         match grantee_type.as_str() {
             "CanonicalUser" => {
                 let id = args.grantee_id.clone().ok_or_else(|| {
-                    CliError::ValidationError(
-                        "ve-tos acl set requires --grantee-id when --grantee-type CanonicalUser is used"
-                            .into(),
-                    )
+                    CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos acl set requires --grantee-id when --grantee-type CanonicalUser is used"))
                 })?;
                 if args.grantee_canned.is_some() {
-                    return Err(CliError::ValidationError(
-                        "ve-tos acl set cannot use --grantee-canned with --grantee-type CanonicalUser"
-                            .into(),
-                    ));
+                    return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos acl set cannot use --grantee-canned with --grantee-type CanonicalUser")));
                 }
                 grantee.insert("ID".to_string(), Value::String(id));
             }
@@ -5443,7 +5453,9 @@ fn acl_body(args: &AclSetArgs) -> Result<Vec<u8>, CliError> {
                 )?;
                 if args.grantee_id.is_some() {
                     return Err(CliError::ValidationError(
-                        "ve-tos acl set cannot use --grantee-id with --grantee-type Group".into(),
+                        crate::handler::common::public_tos_template(
+                            "ve-tos acl set cannot use --grantee-id with --grantee-type Group",
+                        ),
                     ));
                 }
                 grantee.insert("Canned".to_string(), Value::String(canned));
@@ -5460,7 +5472,9 @@ fn acl_body(args: &AclSetArgs) -> Result<Vec<u8>, CliError> {
     }
     if body.is_empty() {
         return Err(CliError::ValidationError(
-            "ve-tos acl set body mode requires at least one ACL body field".into(),
+            crate::handler::common::public_tos_template(
+                "ve-tos acl set body mode requires at least one ACL body field",
+            ),
         ));
     }
     serde_json::to_vec(&Value::Object(body)).map_err(CliError::Json)
@@ -5492,9 +5506,9 @@ fn lifecycle_body(args: &LifecycleSetArgs) -> Result<Vec<u8>, CliError> {
     }
 
     let status = args.status.clone().ok_or_else(|| {
-        CliError::ValidationError(
-            "ve-tos lifecycle set requires --status when using field-level lifecycle flags".into(),
-        )
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos lifecycle set requires --status when using field-level lifecycle flags",
+        ))
     })?;
     let mut rule = serde_json::Map::new();
     rule.insert("Status".to_string(), Value::String(status));
@@ -5571,14 +5585,14 @@ fn cors_body(args: &CorsSetArgs) -> Result<Vec<u8>, CliError> {
     }
 
     let allowed_origins = parse_string_list(args.allowed_origins.as_deref().ok_or_else(|| {
-        CliError::ValidationError(
-            "ve-tos cors set requires --allowed-origins when using field-level CORS flags".into(),
-        )
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos cors set requires --allowed-origins when using field-level CORS flags",
+        ))
     })?)?;
     let allowed_methods = parse_string_list(args.allowed_methods.as_deref().ok_or_else(|| {
-        CliError::ValidationError(
-            "ve-tos cors set requires --allowed-methods when using field-level CORS flags".into(),
-        )
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos cors set requires --allowed-methods when using field-level CORS flags",
+        ))
     })?)?;
 
     let mut rule = serde_json::Map::new();
@@ -5631,26 +5645,20 @@ fn replication_body(args: &ReplicationSetArgs) -> Result<Vec<u8>, CliError> {
     }
 
     let role = args.role.clone().ok_or_else(|| {
-        CliError::ValidationError(
-            "ve-tos replication set requires --role when using field-level replication flags"
-                .into(),
-        )
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos replication set requires --role when using field-level replication flags",
+        ))
     })?;
     let status = args.status.clone().ok_or_else(|| {
-        CliError::ValidationError(
-            "ve-tos replication set requires --status when using field-level replication flags"
-                .into(),
-        )
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos replication set requires --status when using field-level replication flags",
+        ))
     })?;
     let destination_bucket = args.destination_bucket.clone().ok_or_else(|| {
-        CliError::ValidationError(
-            "ve-tos replication set requires --destination-bucket when using field-level replication flags".into(),
-        )
+        CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos replication set requires --destination-bucket when using field-level replication flags"))
     })?;
     let destination_location = args.destination_location.clone().ok_or_else(|| {
-        CliError::ValidationError(
-            "ve-tos replication set requires --destination-location when using field-level replication flags".into(),
-        )
+        CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos replication set requires --destination-location when using field-level replication flags"))
     })?;
 
     let mut destination = serde_json::Map::new();
@@ -5701,10 +5709,7 @@ fn replication_body(args: &ReplicationSetArgs) -> Result<Vec<u8>, CliError> {
 #[cfg(test)]
 fn encryption_body(args: &EncryptionSetArgs) -> Result<Vec<u8>, CliError> {
     if args.sse_algorithm.eq_ignore_ascii_case("KMS") && args.kms_master_key_id.is_none() {
-        return Err(CliError::ValidationError(
-            "ve-tos encryption set requires --kms-master-key-id when --sse-algorithm KMS is used"
-                .into(),
-        ));
+        return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos encryption set requires --kms-master-key-id when --sse-algorithm KMS is used")));
     }
 
     let mut defaults = serde_json::Map::new();
@@ -5737,14 +5742,16 @@ fn ensure_payload_mode(
 ) -> Result<(), CliError> {
     if has_raw_payload && has_structured_payload {
         return Err(CliError::ValidationError(format!(
-            "ve-tos {command} set cannot mix raw JSON payload input with field-level flags"
+            "{} {command} set cannot mix raw JSON payload input with field-level flags",
+            crate::handler::common::public_tos_template("ve-tos")
         )));
     }
     if has_raw_payload || has_structured_payload {
         return Ok(());
     }
     Err(CliError::ValidationError(format!(
-        "ve-tos {command} set requires either a full JSON payload or field-level schema flags"
+        "{} {command} set requires either a full JSON payload or field-level schema flags",
+        crate::handler::common::public_tos_template("ve-tos")
     )))
 }
 
@@ -5963,6 +5970,7 @@ fn normalize_enum_value(
     value: &str,
     allowed: &[&str],
 ) -> Result<String, CliError> {
+    let command = crate::handler::common::public_tos_template(command);
     allowed
         .iter()
         .find(|candidate| candidate.eq_ignore_ascii_case(value))

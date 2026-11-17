@@ -10,6 +10,63 @@ fn output(args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn adrive_root_help_lists_namespaces_under_their_command_layers() {
+    for (language, high_title, low_title, utilities_title) in [
+        (
+            "en",
+            "High-Level Commands:",
+            "Low-Level Commands:",
+            "Capabilities / Utilities:",
+        ),
+        ("zh", "高阶命令:", "低阶命令:", "能力 / 工具:"),
+    ] {
+        let result = output(&["ve-adrive", "--help", "--language", language]);
+        assert!(result.status.success());
+        let help = String::from_utf8_lossy(&result.stdout);
+        let high_level = help
+            .split_once(high_title)
+            .unwrap()
+            .1
+            .split_once(low_title)
+            .unwrap()
+            .0;
+        assert!(high_level
+            .lines()
+            .any(|line| line.trim_start().starts_with("share ")));
+        assert!(!high_level.contains("share create"));
+        let low_level = help
+            .split_once(low_title)
+            .unwrap()
+            .1
+            .split_once(utilities_title)
+            .unwrap()
+            .0;
+        assert!(low_level
+            .lines()
+            .any(|line| line.trim_start().starts_with("chunk ")));
+        assert!(!low_level.contains("chunk search"));
+        assert!(!help.contains("Document Chunks:") && !help.contains("Share Links:"));
+        assert!(!help.contains("文档片段:") && !help.contains("分享链接:"));
+    }
+}
+
+#[test]
+fn adrive_root_describe_reports_layers_instead_of_business_topics() {
+    let result = output(&["ve-adrive", "--describe", "--output", "json"]);
+    assert!(result.status.success());
+    let document: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        document["data"]["implemented_layers"],
+        serde_json::json!(["high_level", "low_level", "utilities"])
+    );
+    let groups = document["data"]["groups"].as_array().unwrap();
+    assert!(groups
+        .iter()
+        .any(|group| group["name"] == "low_level" && group["command"] == "ve-adrive chunk"));
+    assert!(!groups.iter().any(|group| group["name"] == "share"));
+}
+
+#[test]
 fn directory_upload_switch_is_boolean_on_every_cp_and_sync_surface() {
     for surface in ["tos", "ve-tos", "ve-adrive"] {
         for action in ["cp", "sync"] {

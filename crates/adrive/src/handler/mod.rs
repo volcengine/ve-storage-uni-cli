@@ -15,7 +15,10 @@
  */
 
 pub mod auth;
+pub mod chunk;
 pub mod common;
+pub mod file;
+mod group_spaces;
 pub mod high_level;
 pub mod meta;
 

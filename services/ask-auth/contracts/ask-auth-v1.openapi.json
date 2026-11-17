@@ -1,0 +1,1880 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Storage CLI ask authorization API",
+    "version": "1.0.0",
+    "description": "Design v1.15: the CLI generates and persists a canonical UUIDv7 auth_id as the single public resource ID and auth_sessions A primary key for create, poll, claim, refresh, credentials, status and logout. No phase aliases or separate grant row exist. Status uses required query auth_id plus BrokerBearer; logout requires JSON auth_id plus BrokerBearer. Lock A by its primary key and authenticate with its fixed stored HMAC version, without broker reverse lookup, key enumeration or a broker unique index. IDs are public locators; all tokens remain in Authorization headers or JSON bodies. R.request_id, claim_request_id, Idempotency-Key and outer trace request_id are distinct independently generated canonical RFC-variant UUIDv7 identities; ask-result request_id is also UUIDv7; Doubao question session_id is unrelated. Login and authorization deadlines remain separate, claimed is only a bounded public projection, and R retains independent bounded refresh recovery. CLI calls Doubao directly for questions. Only OAuth lifecycle endpoints are defined here; no /ask or arbitrary proxy. Server URL is configured by the released CLI after M0, not supplied per request."
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "paths": {
+    "/v1/auth/login-attempts": {
+      "post": {
+        "operationId": "createLoginAttempt",
+        "security": [],
+        "responses": {
+          "201": {
+            "description": "Successful response",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginCreateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginCreateRequest"
+              }
+            }
+          }
+        },
+        "description": "Create A=auth_sessions with the CLI-generated auth_id primary key and status=pending. While the original request_hash and login ticket remain, same ID/ticket/normalized payload returns the same login resource without extending login_expires_at; changed ticket/payload returns 409 idempotency_conflict. If A still exists but its original creation group has been cleared, return 409 idempotency_conflict: never overwrite, reauthorize or reset that existing session. New login uses a new auth_id. If A is absent an insert may create a new operation, always with a fresh server state nonce; the full original-state fence rejects old callbacks after ID reuse."
+      }
+    },
+    "/v1/auth/login-attempts/{auth_id}": {
+      "get": {
+        "operationId": "getLoginAttempt",
+        "security": [
+          {
+            "LoginTicketBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "auth_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/AuthId"
+            }
+          }
+        ],
+        "description": "Lookup A by the auth_id primary key; authenticate the retained login ticket before any public LoginState projection. exchanging maps to pending; active/refreshing may map to claimed only while claim metadata/cache and login deadline remain valid. Poll does not require claim_verifier. If A is active/refreshing and the retained login deadline has elapsed, authenticated polling returns 200 with public state=expired and reason_code=claim_recovery_expired; this does not change A.status or end its authorization. Cleared login temporary authentication fields, absent A and invalid ticket all return 401 authentication_required, including when an active authorization row still exists. Retained login terminal states may be returned after ticket verification. Poll never recreates A or extends login/auth deadlines."
+      }
+    },
+    "/v1/auth/token": {
+      "post": {
+        "operationId": "claimTokens",
+        "security": [
+          {
+            "LoginTicketBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClaimRequest"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Uuid"
+            },
+            "description": "Persist before send; reuse with identical body and identity. Never reuse for a new operation."
+          }
+        ],
+        "description": "Lock A by auth_id; authenticate retained ticket and claim_verifier before exposing any login result. Cleared login temporary fields, absent A or invalid proof return 401 authentication_required even if an active A still exists. pending/exchanging returns 409 login_pending; authenticated denied returns 403 login_denied; retained first-claim expiry returns 410 login_expired. First claim atomically changes ready to active, records claim_request_id and changes login_expires_at to at most claim+5 minutes and necessary actual credential deadlines; auth_expires_at stays separate. Replay requires active, generation=1, matching original claim ID/ticket/proof, unexpired encrypted result/login deadline, current admission and actual token validity. For active/refreshing, an elapsed retained login cache deadline returns 409 claim_recovery_expired after proof validation, before testing refresh-in-progress. Only refreshing with an unexpired retained cache returns 409 refresh_in_progress, without a cached bundle. After temporary fields are cleared use 401. Never exchange a code here."
+      }
+    },
+    "/v1/auth/refresh": {
+      "post": {
+        "operationId": "refreshTokens",
+        "security": [
+          {
+            "BrokerBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefreshRequest"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Uuid"
+            },
+            "description": "Persist before send; reuse with identical body and identity. Never reuse for a new operation."
+          }
+        ],
+        "description": "HTTP auth_id selects A by primary key; R primary key is (auth_id,request_id). Always lock A before R; do not hold a database transaction over upstream HTTP. Existing R may authenticate an exact retry with its own fixed request HMAC version; cached expiry or generation mismatch returns 409 only after proof is valid. On R miss require current A broker/RT/generation and active authorization before upstream use; ready and absent/invalid credentials return 401 authentication_required. An authenticated generation mismatch returns 409 credential_generation_mismatch. New R.pending and A.refreshing commit together; success updates A digests/generation and active with R.completed and its bounded encrypted response in one transaction. That same success clears all original login temporary/creation fields before rotating the shared A HMAC key version; R keeps its fixed independent HMAC version. Login cleanup alone never deletes active/refreshing A or changes auth_expires_at. Detected ambiguous outcomes settle R.unknown/A.reauth_required under original guards; lease sweeps settle abandoned workers. Never replay an unknown operation or infer historical success after purge."
+      }
+    },
+    "/v1/auth/status": {
+      "get": {
+        "operationId": "getAuthStatus",
+        "security": [
+          {
+            "BrokerBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "auth_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/AuthId"
+            },
+            "description": "Public resource locator, not a secret. BrokerBearer authenticates this selected row."
+          }
+        ],
+        "description": "Require auth_id query parameter plus BrokerBearer. Lock A by this primary key, validate app/shape and calculate the broker HMAC with this row's fixed HMAC version. Compare in constant time; never reverse-lookup broker digests or enumerate keys. Wrong or absent row, mismatching token and ready/pending/exchanging all return the same generic 401 authentication_required without revealing identity or existence. Missing/malformed auth_id, duplicate auth_id or unsupported query fields are 400 invalid_request. Return only the existing authorization-state enum, trusted identity, admission and bounded broker lifetime; no raw credentials. Cleared login temporary fields do not invalidate current broker authorization for active/refreshing and retained ended authorization phases."
+      }
+    },
+    "/v1/auth/logout": {
+      "post": {
+        "operationId": "revokeAuthSession",
+        "security": [
+          {
+            "BrokerBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogoutResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Sanitized protocol error",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LogoutRequest"
+              }
+            }
+          }
+        },
+        "description": "Require JSON {auth_id} plus BrokerBearer. Lock A by its primary key, validate app/shape and authenticate the token using that row's fixed HMAC version with constant-time comparison. Do not reverse-lookup broker digests or enumerate keys. Wrong/absent ID, mismatching token and ready/unclaimed phases all return generic 401 authentication_required. Missing/malformed auth_id is 400 invalid_request. Revoke the authenticated authorization, end pending R and clear cached credentials atomically; remove A only after child cleanup. The same verifiable revoked current broker and auth_id may repeat logout during retained lifetime, including after admission removal. Rotated old brokers cannot authenticate current A or another A."
+      }
+    },
+    "/v1/oauth/doubao/callback": {
+      "get": {
+        "operationId": "oauthCallback",
+        "security": [],
+        "description": "Server HTTPS callback. Decode OAuthState for an untrusted auth_id locator; lock that original A row, verify the full state HMAC, app, pending status and original login_expires_at before CAS to exchanging. Completion remains fenced by the original state/HMAC version/deadline. Exactly one of code and error must exist; reject duplicate state parameters. Only code exchanges a token; error does not. Success performs UPDATE on the original auth_sessions A: set trusted identity, current broker/RT digests, generation=1, encrypted first bundle, auth_expires_at and ready; clear OAuth context. There is no new authorization-row INSERT. No browser-to-CLI token redirect. No-store and no-referrer headers required.",
+        "parameters": [
+          {
+            "name": "state",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OAuthState"
+            }
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192
+            }
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Safe HTML completion page; no tokens or reflected raw input",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              },
+              "Referrer-Policy": {
+                "required": true,
+                "schema": {
+                  "const": "no-referrer"
+                }
+              }
+            },
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Safe HTML completion page; no tokens or reflected raw input",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              },
+              "Referrer-Policy": {
+                "required": true,
+                "schema": {
+                  "const": "no-referrer"
+                }
+              }
+            },
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Safe HTML completion page; no tokens or reflected raw input",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              },
+              "Referrer-Policy": {
+                "required": true,
+                "schema": {
+                  "const": "no-referrer"
+                }
+              }
+            },
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Safe HTML completion page; no tokens or reflected raw input",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              },
+              "Referrer-Policy": {
+                "required": true,
+                "schema": {
+                  "const": "no-referrer"
+                }
+              }
+            },
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "operationId": "health",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "operationId": "ready",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Dependencies ready",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Dependencies unavailable",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Request-ID": {
+                "required": true,
+                "schema": {
+                  "$ref": "#/components/schemas/Uuid"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Uuid": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 36,
+        "format": "uuid",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      },
+      "Nonce": {
+        "type": "string",
+        "minLength": 43,
+        "maxLength": 43,
+        "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
+        "description": "Canonical unpadded Base64URL of exactly 32 bytes. Decode and re-encode identically; reject nonzero unused pad bits. Used for ticket, claim proof/challenge and broker."
+      },
+      "OAuthState": {
+        "type": "string",
+        "minLength": 64,
+        "maxLength": 64,
+        "pattern": "^[A-Za-z0-9_-]{64}$",
+        "description": "Unpadded Base64URL of 16 RFC-order UUIDv7 auth_id bytes followed by 32 server-random nonce bytes. Decode for primary-key lookup only; verify the complete state HMAC and original operation before exchange. Reject duplicate parameters, noncanonical encoding and wrong UUID version/variant."
+      },
+      "OpaqueToken": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 16384
+      },
+      "Timestamp": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 40,
+        "format": "date-time"
+      },
+      "NullableTimestamp": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "Scope": {
+        "type": "array",
+        "maxItems": 100,
+        "uniqueItems": true,
+        "items": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "LoginState": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "ready",
+          "claimed",
+          "denied",
+          "expired",
+          "error"
+        ],
+        "description": "Public login-state projection, not a second persisted status. A pending/exchanging maps to pending, ready to ready, and authenticated login terminal states to their public names. claimed may project active/refreshing only while the retained login ticket, claim metadata/cache and login deadline remain verifiable. After an active/refreshing login deadline elapses but its ticket group remains, project expired with reason_code=claim_recovery_expired; do not change the authorization status. Polling verifies the ticket; it does not require a claim_verifier. No persisted claimed state exists. Cleared login authentication fields produce 401 instead of a projection."
+      },
+      "Identity": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "tenant_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "required": [
+          "user_id",
+          "tenant_id"
+        ]
+      },
+      "LoginCreateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "auth_id": {
+            "$ref": "#/components/schemas/AuthId",
+            "description": "CLI-generated UUIDv7 and auth_sessions primary key. Persist before create; reuse only for an identical creation retry. A new login generates a new auth_id. This public locator is not a secret or an authentication credential."
+          },
+          "login_ticket": {
+            "$ref": "#/components/schemas/Nonce"
+          },
+          "claim_challenge": {
+            "$ref": "#/components/schemas/Nonce"
+          },
+          "device_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "cli_version": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "required": [
+          "auth_id",
+          "login_ticket",
+          "claim_challenge",
+          "device_name",
+          "cli_version"
+        ]
+      },
+      "LoginCreateResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "schema_version": {
+            "const": 1
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "data": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "auth_id": {
+                "$ref": "#/components/schemas/AuthId",
+                "description": "The same CLI-generated auth_id supplied on creation; it identifies the same auth_sessions row through login, claim, refresh and termination."
+              },
+              "state": {
+                "$ref": "#/components/schemas/LoginState"
+              },
+              "authorization_url": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uri",
+                "maxLength": 8192,
+                "description": "Fixed-provider browser authorization link while pending; null after callback consumption or terminal state. No tokens, Secret or claim verifier; needed state/challenge remain intact."
+              },
+              "expires_at": {
+                "$ref": "#/components/schemas/Timestamp",
+                "description": "Short login phase deadline: original authorization/first-claim deadline, or the bounded claim replay deadline after activation. It is not auth_expires_at. Polling and retries do not extend it."
+              },
+              "poll_interval_seconds": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 30
+              }
+            },
+            "required": [
+              "auth_id",
+              "state",
+              "authorization_url",
+              "expires_at",
+              "poll_interval_seconds"
+            ]
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "data"
+        ]
+      },
+      "LoginStatusResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "schema_version": {
+            "const": 1
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "data": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "auth_id": {
+                "$ref": "#/components/schemas/AuthId",
+                "description": "The same CLI-generated auth_id supplied on creation; it identifies the same auth_sessions row through login, claim, refresh and termination."
+              },
+              "state": {
+                "$ref": "#/components/schemas/LoginState"
+              },
+              "expires_at": {
+                "$ref": "#/components/schemas/Timestamp",
+                "description": "Short login phase deadline: original authorization/first-claim deadline, or the bounded claim replay deadline after activation. It is not auth_expires_at. Polling and retries do not extend it."
+              },
+              "poll_interval_seconds": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 30
+              },
+              "reason_code": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 64
+              }
+            },
+            "required": [
+              "auth_id",
+              "state",
+              "expires_at",
+              "poll_interval_seconds",
+              "reason_code"
+            ]
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "data"
+        ]
+      },
+      "ClaimRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "auth_id": {
+            "$ref": "#/components/schemas/AuthId",
+            "description": "The existing authorization-session primary key; valid ticket/proof are still required."
+          },
+          "claim_verifier": {
+            "$ref": "#/components/schemas/Nonce"
+          }
+        },
+        "required": [
+          "auth_id",
+          "claim_verifier"
+        ]
+      },
+      "RefreshRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "auth_id": {
+            "$ref": "#/components/schemas/AuthId",
+            "description": "The existing auth_id primary key of auth_sessions, unchanged from creation. It selects a row but never substitutes for broker/token validation."
+          },
+          "refresh_token": {
+            "$ref": "#/components/schemas/OpaqueToken"
+          },
+          "credential_generation": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "auth_id",
+          "refresh_token",
+          "credential_generation"
+        ]
+      },
+      "TokenBundle": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "auth_id": {
+            "$ref": "#/components/schemas/AuthId",
+            "description": "The existing auth_id primary key of auth_sessions, unchanged from creation. It selects a row but never substitutes for broker/token validation."
+          },
+          "provider": {
+            "const": "doubao"
+          },
+          "app_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "environment": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
+          "identity": {
+            "$ref": "#/components/schemas/Identity"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/Scope"
+          },
+          "token_type": {
+            "const": "Bearer"
+          },
+          "access_token": {
+            "$ref": "#/components/schemas/OpaqueToken"
+          },
+          "refresh_token": {
+            "$ref": "#/components/schemas/OpaqueToken"
+          },
+          "expires_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "refresh_expires_at": {
+            "$ref": "#/components/schemas/NullableTimestamp"
+          },
+          "broker_token": {
+            "$ref": "#/components/schemas/Nonce"
+          },
+          "broker_expires_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "credential_generation": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "auth_id",
+          "provider",
+          "app_id",
+          "environment",
+          "identity",
+          "scope",
+          "token_type",
+          "access_token",
+          "refresh_token",
+          "expires_at",
+          "refresh_expires_at",
+          "broker_token",
+          "broker_expires_at",
+          "credential_generation"
+        ],
+        "description": "Credential bundle carries the same unified auth_id as creation. Access/refresh token expirations live in this bundle and bounded encrypted caches; auth_expires_at is the database authorization/broker upper bound. No raw tokens are stored long term and no duplicate per-token expiry columns are required."
+      },
+      "TokenResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "schema_version": {
+            "const": 1
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "data": {
+            "$ref": "#/components/schemas/TokenBundle"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "data"
+        ]
+      },
+      "StatusResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "schema_version": {
+            "const": 1
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "data": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "auth_id": {
+                "$ref": "#/components/schemas/AuthId",
+                "description": "The same auth_id used to locate and authenticate this authorization session."
+              },
+              "status": {
+                "enum": [
+                  "active",
+                  "refreshing",
+                  "reauth_required",
+                  "revoked",
+                  "expired"
+                ]
+              },
+              "is_allowed": {
+                "type": "boolean"
+              },
+              "identity": {
+                "$ref": "#/components/schemas/Identity"
+              },
+              "scope": {
+                "$ref": "#/components/schemas/Scope"
+              },
+              "broker_expires_at": {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              "credential_generation": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "required": [
+              "auth_id",
+              "status",
+              "is_allowed",
+              "identity",
+              "scope",
+              "broker_expires_at",
+              "credential_generation"
+            ]
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "data"
+        ],
+        "description": "Only already claimed authorization states are public here. ready is not broker-authenticated; pending/exchanging/ready are not added to this existing v1 status enum."
+      },
+      "LogoutRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "auth_id": {
+            "$ref": "#/components/schemas/AuthId",
+            "description": "The existing auth_id primary key of auth_sessions, unchanged from creation. It selects a row but never substitutes for broker/token validation."
+          }
+        },
+        "required": [
+          "auth_id"
+        ]
+      },
+      "LogoutResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "schema_version": {
+            "const": 1
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "data": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "auth_id": {
+                "$ref": "#/components/schemas/AuthId",
+                "description": "The same auth_id used to locate and authenticate this authorization session."
+              },
+              "status": {
+                "const": "revoked"
+              }
+            },
+            "required": [
+              "auth_id",
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "data"
+        ]
+      },
+      "HealthResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "enum": [
+              "ok",
+              "unavailable"
+            ]
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "schema_version": {
+            "const": 1
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "invalid_request",
+                  "idempotency_conflict",
+                  "login_expired",
+                  "login_denied",
+                  "login_outcome_unknown",
+                  "authentication_required",
+                  "broker_expired",
+                  "access_denied",
+                  "scope_missing",
+                  "login_pending",
+                  "refresh_in_progress",
+                  "refresh_outcome_unknown",
+                  "refresh_recovery_expired",
+                  "claim_recovery_expired",
+                  "credential_generation_mismatch",
+                  "rate_limited",
+                  "upstream_unavailable",
+                  "provider_contract_error",
+                  "internal_error"
+                ]
+              },
+              "message": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "retry_after_seconds": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1,
+                "maximum": 600
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable",
+              "retry_after_seconds"
+            ]
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "error"
+        ]
+      },
+      "AuthId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 36,
+        "format": "uuid",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        "description": "Canonical lowercase RFC-variant UUIDv7 auth_id, generated and durably saved by the CLI before create. Public row locator only; separate high-entropy proof authenticates every operation."
+      }
+    },
+    "securitySchemes": {
+      "BrokerBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque 256-bit base64url"
+      },
+      "LoginTicketBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "client-generated 256-bit base64url"
+      }
+    }
+  }
+}

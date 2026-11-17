@@ -8,6 +8,20 @@ struct TestCli {
 }
 
 #[test]
+fn share_group_and_leaf_describe_remain_high_level() {
+    let group = ve_adrive_cli::share_metadata::describe_share_command("ve-adrive share").unwrap();
+    assert_eq!(group["layer"], "high-level");
+    for row in ve_adrive_cli::registry::capabilities()
+        .iter()
+        .filter(|row| row.group == "share")
+    {
+        assert_eq!(row.layer, "high-level");
+        let leaf = ve_adrive_cli::share_metadata::describe_share_command(row.command).unwrap();
+        assert_eq!(leaf["layer"], "high-level");
+    }
+}
+
+#[test]
 fn share_cli_exposes_nine_leaf_commands() {
     for (action, arguments) in [
         ("create", vec!["adrive://inst/space/docs/"]),

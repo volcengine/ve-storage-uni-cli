@@ -1209,7 +1209,7 @@ fn test_byted_tos_runtime_uses_byte_tos_env_not_tos_env() {
     let error = parse_json(&tos_env_output);
     assert_eq!(
         error["error"]["fix_command"],
-        "tos config set endpoint <endpoint>"
+        "ve-storage-uni-cli tos config set endpoint <endpoint>"
     );
 
     let mut byte_env = Command::new(env!("CARGO_BIN_EXE_ve-storage-uni-cli"));
@@ -1530,7 +1530,7 @@ fn test_ve_tos_custom_endpoint_without_region_recommends_region() {
         .contains("region is required"));
     assert_eq!(
         error["error"]["fix_command"],
-        "ve-tos config set region <region>"
+        "ve-storage-uni-cli ve-tos config set region <region>"
     );
 }
 
@@ -2138,7 +2138,7 @@ fn test_adrive_doctor_region_only_recommends_endpoint() {
     assert_eq!(check["status"], "warning");
     assert_eq!(
         check["fix_command"],
-        "ve-adrive config set endpoint <endpoint>"
+        "ve-storage-uni-cli ve-adrive config set endpoint <endpoint>"
     );
 }
 
@@ -2751,10 +2751,13 @@ fn test_oauth_mode_does_not_fall_back_to_configured_aksk() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("login_required"), "stderr={stderr}");
     let json: serde_json::Value = serde_json::from_str(stderr.trim()).expect("valid json");
-    assert_eq!(json["error"]["fix_command"], "ve-adrive auth login");
+    assert_eq!(
+        json["error"]["fix_command"],
+        "ve-storage-uni-cli ve-adrive auth login"
+    );
     assert_eq!(
         json["error"]["doctor_hint"],
-        "ve-adrive doctor --check auth"
+        "ve-storage-uni-cli ve-adrive doctor --check auth"
     );
 }
 
@@ -2779,10 +2782,13 @@ fn test_configured_oauth_without_credentials_prioritizes_login_remediation() {
 
     assert!(!output.status.success());
     let json = parse_json(&output);
-    assert_eq!(json["error"]["fix_command"], "ve-adrive auth login");
+    assert_eq!(
+        json["error"]["fix_command"],
+        "ve-storage-uni-cli ve-adrive auth login"
+    );
     assert_eq!(
         json["error"]["doctor_hint"],
-        "ve-adrive doctor --check auth"
+        "ve-storage-uni-cli ve-adrive doctor --check auth"
     );
 }
 
@@ -2809,11 +2815,11 @@ fn test_oauth_with_access_token_reports_resource_configuration_remediation() {
     let json = parse_json(&output);
     assert_eq!(
         json["error"]["fix_command"],
-        "ve-adrive config set endpoint <endpoint>"
+        "ve-storage-uni-cli ve-adrive config set endpoint <endpoint>"
     );
     assert_eq!(
         json["error"]["doctor_hint"],
-        "ve-adrive doctor --check config"
+        "ve-storage-uni-cli ve-adrive doctor --check config"
     );
 }
 
@@ -2852,10 +2858,13 @@ fn test_oauth_missing_profile_recommends_profile_initialization() {
 
     assert!(!output.status.success());
     let json = parse_json(&output);
-    assert_eq!(json["error"]["fix_command"], "ve-adrive config init");
+    assert_eq!(
+        json["error"]["fix_command"],
+        "ve-storage-uni-cli ve-adrive config init"
+    );
     assert_eq!(
         json["error"]["doctor_hint"],
-        "ve-adrive doctor --check config"
+        "ve-storage-uni-cli ve-adrive doctor --check config"
     );
 }
 
@@ -2981,7 +2990,8 @@ fn test_adrive_auth_login_is_mode_strict_and_dry_run_stays_offline() {
 }
 
 #[test]
-fn test_adrive_oauth_login_without_instance_returns_actionable_command() {
+// [Review Fix #5] A missing Instance is valid; the missing Auth endpoint is the actionable error.
+fn test_adrive_oauth_login_without_instance_or_endpoint_returns_endpoint_guidance() {
     let home = tempdir();
     let output = cli_with_home(
         &home,
@@ -2998,15 +3008,42 @@ fn test_adrive_oauth_login_without_instance_returns_actionable_command() {
 
     assert!(!output.status.success());
     let json = parse_json(&output);
-    assert_eq!(json["error"]["code"], "oauth_instance_required");
+    assert_eq!(json["error"]["code"], "oauth_auth_endpoint_required");
     assert_eq!(
         json["error"]["fix_command"],
-        "ve-adrive auth login --instance <instance_id>"
+        "ve-storage-uni-cli ve-adrive config set auth_endpoint <url>"
     );
     assert_eq!(
         json["error"]["doctor_hint"],
-        "ve-adrive doctor --check config"
+        "ve-storage-uni-cli ve-adrive doctor --check config"
     );
+}
+
+#[test]
+fn test_adrive_oauth_login_without_instance_accepts_server_selection_in_dry_run() {
+    let home = tempdir();
+    let output = cli_with_home(
+        &home,
+        &[
+            "--output",
+            "json",
+            "--dry-run",
+            "ve-adrive",
+            "--auth-mode",
+            "oauth",
+            "auth",
+            "login",
+            "--auth-endpoint",
+            "https://auth.example.com",
+        ],
+    );
+
+    assert!(output.status.success());
+    let json = parse_json(&output);
+    assert_eq!(json["data"]["dry_run"], true);
+    assert!(json["data"]["instance_id"].is_null());
+    assert_eq!(json["data"]["network_requests"], 0);
+    assert_eq!(json["data"]["credentials_written"], false);
 }
 
 #[test]
@@ -3032,11 +3069,11 @@ fn test_adrive_oauth_login_without_auth_endpoint_returns_actionable_command() {
     assert_eq!(json["error"]["code"], "oauth_auth_endpoint_required");
     assert_eq!(
         json["error"]["fix_command"],
-        "ve-adrive config set auth_endpoint <url>"
+        "ve-storage-uni-cli ve-adrive config set auth_endpoint <url>"
     );
     assert_eq!(
         json["error"]["doctor_hint"],
-        "ve-adrive doctor --check config"
+        "ve-storage-uni-cli ve-adrive doctor --check config"
     );
 }
 
@@ -3270,7 +3307,10 @@ fn test_adrive_doctor_uses_registered_builtin_oauth_client_id() {
         .contains("credentials are not configured"));
     assert_eq!(auth_check["details"]["oauth_client_id_source"], "built_in");
     assert_eq!(auth_check["details"]["oauth_client_id_placeholder"], false);
-    assert_eq!(auth_check["fix_command"], "ve-adrive auth login");
+    assert_eq!(
+        auth_check["fix_command"],
+        "ve-storage-uni-cli ve-adrive auth login"
+    );
 }
 
 #[test]
@@ -3334,7 +3374,10 @@ fn test_adrive_doctor_oauth_without_tokens_recommends_login() {
     let auth_check = &json["data"]["checks"][0];
     assert_eq!(auth_check["status"], "warning");
     assert_eq!(auth_check["details"]["credential_state"], "logged_out");
-    assert_eq!(auth_check["fix_command"], "ve-adrive auth login");
+    assert_eq!(
+        auth_check["fix_command"],
+        "ve-storage-uni-cli ve-adrive auth login"
+    );
 }
 
 #[test]
@@ -3484,14 +3527,14 @@ fn test_adrive_doctor_recommends_the_missing_aksk_field() {
             "ADRIVE_SECRET_KEY",
             "ONLY_SK",
             "Access Key",
-            "ve-adrive config set access_key_id <access_key_id>",
+            "ve-storage-uni-cli ve-adrive config set access_key_id <access_key_id>",
         ),
         (
             "missing-secret-key",
             "ADRIVE_ACCESS_KEY",
             "ONLY_AK",
             "Secret Key",
-            "ve-adrive config set secret_access_key <secret_access_key>",
+            "ve-storage-uni-cli ve-adrive config set secret_access_key <secret_access_key>",
         ),
     ];
 
@@ -3548,7 +3591,10 @@ fn test_adrive_doctor_without_aksk_recommends_config_init() {
     let json = parse_json(&output);
     let auth_check = &json["data"]["checks"][0];
     assert_eq!(auth_check["status"], "warning");
-    assert_eq!(auth_check["fix_command"], "ve-adrive config init");
+    assert_eq!(
+        auth_check["fix_command"],
+        "ve-storage-uni-cli ve-adrive config init"
+    );
     assert_eq!(auth_check["details"]["credential_source"], "none");
 }
 
@@ -3579,7 +3625,7 @@ fn test_adrive_oauth_doctor_requires_login_auth_endpoint() {
     assert_eq!(check["status"], "warning");
     assert_eq!(
         check["fix_command"],
-        "ve-adrive config set auth_endpoint <url>"
+        "ve-storage-uni-cli ve-adrive config set auth_endpoint <url>"
     );
 }
 
@@ -3627,7 +3673,7 @@ fn test_adrive_doctor_rejects_environment_refresh_token_without_access_token() {
     );
     assert_eq!(
         json["data"]["checks"][0]["fix_command"],
-        "ve-adrive auth login"
+        "ve-storage-uni-cli ve-adrive auth login"
     );
     assert_eq!(json["data"]["summary"]["warnings"], 1);
 }

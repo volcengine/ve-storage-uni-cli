@@ -45,6 +45,7 @@ fn direct_help_exposes_tos_cli_surface() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("High-Level Commands"));
     assert!(stdout.contains("Capabilities / Utilities"));
+    assert!(!stdout.contains("ve-storage-uni-cli"));
     assert!(!stdout.contains("Low-Level API"));
     assert!(!stdout.contains("  mb            "));
     assert!(!stdout.contains("  rb            "));
@@ -53,6 +54,26 @@ fn direct_help_exposes_tos_cli_surface() {
     // no longer builds a `tos-cli` binary for integration tests.
     assert!(!stdout.contains("--control-endpoint"));
     assert!(!stdout.contains("--account-id"));
+}
+
+#[test]
+fn direct_tos_leaf_help_uses_only_dedicated_invocation() {
+    for args in [
+        vec!["ls", "--help"],
+        vec!["config", "set", "--help"],
+        vec!["doctor", "--help", "--language", "zh"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_tos-cli"))
+            .args(&args)
+            .output()
+            .expect("run tos-cli help");
+        assert!(output.status.success(), "args={args:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("ve-storage-uni-cli"),
+            "args={args:?}: {stdout}"
+        );
+    }
 }
 
 #[test]

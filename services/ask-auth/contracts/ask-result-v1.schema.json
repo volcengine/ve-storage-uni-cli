@@ -1,0 +1,296 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "request_id": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "result_type": {
+      "enum": [
+        "recommendation",
+        "explanation",
+        "clarification",
+        "out_of_scope"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 2000
+    },
+    "steps": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "command"
+              },
+              "command_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9_.:/-]+$"
+              },
+              "arguments": {
+                "type": "array",
+                "maxItems": 128,
+                "items": {
+                  "type": "string",
+                  "maxLength": 4096
+                }
+              },
+              "is_template": {
+                "type": "boolean"
+              },
+              "placeholders": {
+                "type": "array",
+                "maxItems": 32,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+                    },
+                    "argument_index": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 127
+                    },
+                    "parameter": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[A-Za-z0-9_.:/-]+$"
+                    },
+                    "description": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 1000
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "argument_index",
+                    "parameter",
+                    "description"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "kind",
+              "command_id",
+              "arguments",
+              "is_template",
+              "placeholders"
+            ],
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "is_template": {
+                      "const": true
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "placeholders": {
+                      "minItems": 1
+                    }
+                  }
+                },
+                "else": {
+                  "properties": {
+                    "placeholders": {
+                      "maxItems": 0
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "guide"
+              },
+              "guide_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9_.:/-]+$"
+              },
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1000
+              }
+            },
+            "required": [
+              "kind",
+              "guide_id",
+              "text"
+            ]
+          }
+        ]
+      }
+    },
+    "missing_fields": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9_.:/-]+$"
+      }
+    },
+    "questions": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1000
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "request_id",
+    "result_type",
+    "summary",
+    "steps",
+    "missing_fields",
+    "questions"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Storage CLI ask model payload v1",
+  "description": "Untrusted model payload only. CLI must also check request identity, catalog references, argv semantics, placeholder bindings and risk. No execution is authorized by this schema.",
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "result_type": {
+            "const": "recommendation"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "steps": {
+            "minItems": 1,
+            "contains": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "command"
+                }
+              },
+              "required": [
+                "kind"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "result_type": {
+            "const": "explanation"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "steps": {
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "guide"
+                },
+                "guide_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[A-Za-z0-9_.:/-]+$"
+                },
+                "text": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1000
+                }
+              },
+              "required": [
+                "kind",
+                "guide_id",
+                "text"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "result_type": {
+            "const": "clarification"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "questions": {
+            "minItems": 1
+          },
+          "missing_fields": {
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "result_type": {
+            "const": "out_of_scope"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "steps": {
+            "maxItems": 0
+          },
+          "missing_fields": {
+            "maxItems": 0
+          },
+          "questions": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ]
+}

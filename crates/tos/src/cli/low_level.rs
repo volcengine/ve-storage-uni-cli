@@ -793,10 +793,10 @@ pub struct ObjectBatchDeleteArgs {
     /// Confirm destructive delete before execution
     #[arg(long)]
     pub force: bool,
-    /// Recursive delete flag (queryRecursive)
+    /// Recursive delete flag (recursive query)
     #[arg(long)]
     pub recursive: bool,
-    /// Skip trash flag (querySkipTrash)
+    /// Skip trash flag (skipTrash query)
     #[arg(long)]
     pub skip_trash: bool,
     /// Content-MD5 header
@@ -899,10 +899,14 @@ pub struct ObjectSetMetaArgs {
     /// Version ID
     #[arg(long)]
     pub version_id: Option<String>,
-    /// Unique tag (x-unique-tag)
+    /// Unique tag (x-tos-unique-tag)
     #[arg(long)]
     pub unique_tag: Option<String>,
-    /// Content-Type header
+    // [Review Fix #ProtocolMeta] Make merge behavior independent of server defaults.
+    /// Metadata replacement mode (REPLACE_NEW merges supplied values; REPLACE replaces all)
+    #[arg(long, default_value = "REPLACE_NEW", value_parser = ["REPLACE_NEW", "REPLACE"])]
+    pub metadata_directive: String,
+    /// Explicit Content-Type update (REPLACE_NEW preserves omitted values)
     #[arg(long)]
     pub content_type: Option<String>,
 }
@@ -920,10 +924,10 @@ pub struct ObjectSetTimeArgs {
     /// Timestamp (RFC3339 or Unix epoch)
     #[arg(long)]
     pub time: String,
-    /// x-modify-timestamp header
+    /// Compatibility seconds value; must agree with --time (x-tos-modify-timestamp)
     #[arg(long)]
     pub modify_timestamp: Option<String>,
-    /// x-modify-timestamp-ns header
+    /// Fractional nanoseconds in 0..999999999 (x-tos-modify-timestamp-ns)
     #[arg(long)]
     pub modify_timestamp_ns: Option<String>,
 }
@@ -938,7 +942,7 @@ pub struct ObjectSetExpiresArgs {
     /// Object key
     #[arg(long)]
     pub key: Option<String>,
-    /// Expiration time (RFC3339 or Unix epoch)
+    /// Object TTL in nonnegative integer days (0 clears expiration)
     #[arg(long)]
     pub expires: String,
     /// Version ID

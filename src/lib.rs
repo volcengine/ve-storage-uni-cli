@@ -48,14 +48,14 @@ const HELP_LANGUAGE_ALIAS_HINT_EN: &str =
 #[derive(Parser)]
 #[command(
     name = "ve-storage-uni-cli",
+    mut_args = |argument| argument.hide_env_values(true),
     version,
     about = "Agent-Native CLI for Volcengine storage services",
     long_about = "Volcengine Storage Unified CLI — agent-native command-line interface for storage tools.\n\n\
         Usage:\n  \
         ve-storage-uni-cli tos <command>          ByteCloud TOS Object Storage\n  \
         ve-storage-uni-cli ve-tos <command>       TOS Object Storage\n  \
-        ve-storage-uni-cli ve-adrive <command>    A-Drive\n\n\
-        Tip: use the dedicated tos-cli, ve-tos-cli, and ve-adrive-cli binaries for direct invocation.",
+        ve-storage-uni-cli ve-adrive <command>    A-Drive",
     after_help = "Language:\n  --language <en|zh>      Help output language, e.g. --help --language zh"
 )]
 struct Cli {
@@ -86,7 +86,7 @@ enum ToolCommand {
         #[command(subcommand)]
         command: Option<ve_tos_cli::TosCommand>,
     },
-    /// A-Drive commands (high-level + utilities)
+    /// A-Drive commands (high-level + low-level + utilities)
     #[command(name = "ve-adrive")]
     ADrive {
         #[command(flatten)]
@@ -316,15 +316,18 @@ fn maybe_print_adrive_grouped_help(effective_args: &[String]) -> bool {
         None => return false,
     };
 
-    let after_adrive: Vec<&String> = effective_args[(adrive_idx + 1)..].iter().collect();
+    let after_adrive = &effective_args[(adrive_idx + 1)..];
     if after_adrive.is_empty() {
         return true;
     }
-    if after_adrive.len() == 1 {
-        let arg = after_adrive[0].as_str();
-        return arg == "--help" || arg == "-h" || arg == "help";
+    let commands = recovered_command_tokens(after_adrive);
+    if !matches!(commands.as_slice(), [] | ["help"]) {
+        return false;
     }
-    false
+    // [Review Fix #HelpLayersGlobals] Reuse Clap validation so global values are skipped
+    // without treating unknown flags or a leaf help request as root help.
+    matches!(Cli::try_parse_from(effective_args), Err(error)
+        if error.kind() == clap::error::ErrorKind::DisplayHelp)
 }
 
 fn maybe_print_language_help(effective_args: &[String]) -> bool {
@@ -420,9 +423,15 @@ fn print_english_help_without_language(effective_args: &[String]) {
 
 fn display_help_text_for_args(effective_args: &[String]) -> Result<String, clap::Error> {
     match Cli::try_parse_from(effective_args) {
-        Err(err) if matches!(err.kind(), ClapErrorKind::DisplayHelp) => Ok(
-            display_help_text_with_registry_examples(effective_args, &err),
-        ),
+        Err(err) if matches!(err.kind(), ClapErrorKind::DisplayHelp) => {
+            // [Review Fix #CommandDisplay4] Exact translation catalogs match
+            // source templates, so resolve executable names after localization.
+            let help = help_text_with_registry_examples(effective_args, err.to_string());
+            Ok(contextualized_help_text(
+                effective_args,
+                &localize_clap_help_zh(&help),
+            ))
+        }
         Err(err) => Err(err),
         Ok(_) => Ok(String::new()),
     }
@@ -516,6 +525,31 @@ fn help_translations_zh_longest_first() -> &'static [(&'static str, &'static str
 }
 
 const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    (ve_adrive_cli::cli::high_level::USERMETA_HELP, "用户元数据使用 key=value#key2=value2 或字符串值 JSON 对象。键仅接受 ASCII 字母、数字、连字符、下划线，忽略大小写，ids-* 为保留字段。空值会被存储，不表示删除。容量由服务端校验。cp 仅对本地上传文件生效，不修改目录标记，不支持远端源。"),
+    ("Incrementally update file user metadata", "增量更新文件用户元数据"),
+    ("Exact file URI: adrive://instance/space/path", "精确文件 URI：adrive://instance/space/path"),
+    ("Resolve Instance and Space names to IDs", "将实例和 Space 名称解析为 ID"),
+    ("Incrementally set user metadata; omitted keys are preserved", "增量设置用户元数据；保留未指定的键"),
+    ("User metadata for local uploads: key=value#key2=value2 or JSON; directory markers are unchanged", "本地上传用户元数据：key=value#key2=value2 或 JSON；不修改目录标记"),
+    ("User metadata: key=value#key2=value2 or a JSON object of strings", "用户元数据：key=value#key2=value2 或字符串值 JSON 对象"),
+    (ve_adrive_cli::cli::high_level::GROUP_SPACE_LISTING_HELP, "OAuth Space 集合：user（默认）或 group。OAuth group 列举将 RootSpace 合入 data.spaces，按 SpaceID 去重并置顶；每行增加 is_root，root 计入 --max-keys；一旦通过 RootSpace 识别，沿 CLI 续页游标翻页时只返回一次，包括 --max-keys 1。若 RootSpace 首次出现前，同 ID 已在此前逻辑页作为普通 Space 返回，无法追溯重分类。未返回 RootSpace 时正常列举其他 Space。JSON/YAML/XML 保留真实 owner_type；未使用 --query 的 table/CSV/Markdown 将 root 行的 owner_type 显示为小写 root，普通行保持原值。data.root_space 保留兼容，统计与清单仅使用合并去重后的 data.spaces，不要另加 root。CLI group 游标记录 root 已返回状态、服务端 marker 和部分页重放位置；游标不含凭据，必须原样用于同一 Instance 和 owner 集合，不可解析、拼接、修改或跨集合复用。仍接受旧 raw 服务 marker；新分页请使用 CLI 返回的 data.next_marker。列举不是快照；其他鉴权模式、user 集合和 AK/SK 分页保持原行为。"),
+    ("File core APIs", "文件核心 API"),
+    ("Search and read document chunks", "检索和读取文档片段"),
+    ("Search document chunks in a Space directory", "检索 Space 目录内的文档片段"),
+    ("Read indexed chunks of one file version", "读取指定文件版本的已索引片段"),
+    ("ADrive URI with Instance and Space IDs; conflicts with explicit selectors", "包含实例 ID 和 Space ID 的 ADrive URI；不能与显式选择器混用"),
+    ("Instance ID; required with explicit selectors", "实例 ID；使用显式选择器时必填"),
+    ("Space ID; required with explicit selectors", "Space ID；使用显式选择器时必填"),
+    ("Directory inside the Space; defaults to the root", "Space 内的目录；默认根目录"),
+    ("Search text; nonempty after trimming, at most 100 UTF-8 bytes", "检索文本；去除首尾空白后非空，最多 100 个 UTF-8 字节"),
+    ("Maximum returned chunks, 1 through 100", "返回片段数上限，范围 1～100"),
+    ("Search only direct children; by default include subdirectories", "只检索直接子文件；默认包含子目录"),
+    ("Exact file path inside the Space", "Space 内的精确文件路径"),
+    ("File version from the same search hit, passed back unchanged", "同一条检索命中的文件版本，原样传回"),
+    ("Comma-separated nonnegative chunk ordinals, at most 20 without duplicates", "逗号分隔的非负片号，最多 20 个且不重复"),
+    ("Inclusive ordinal range START-END, at most 20 chunks", "片号闭区间 START-END，最多 20 片"),
+    (ve_adrive_cli::cli::chunk::CHUNK_HELP, "在一个 Space 内检索和读取已索引文档片段。需要当前 OAuth 用户和 file:read 权限；不切换身份或修改索引。空结果不代表索引就绪。--text 为检索文本；全局 --query 仍是 JMESPath 输出过滤器。"),
+    (ve_adrive_cli::cli::chunk::CHUNK_READ_HELP, "使用同一条命中的实例、Space、FilePath、ETag 和片号。--ordinals 与 --range 二选一（闭区间），最多 20 个非负片号。旧版本可能返回 404，请重新检索，不替换版本。ChunkTruncated 表示源文档未完整索引，扩读相邻片段不能恢复未索引内容。"),
     // [Review Fix #ShareTransferDocs2] Help rendering translates blank-line paragraphs independently.
     ("The OS resolves user-selected destination and checkpoint directory aliases before the CLI pins them; downloaded subpaths reject traversal, symlinks/reparse points and case/Unicode or file/directory collisions with Conflict (exit 9). Resume compares resolved roots and verifies completed local sizes/digests; changes fail with Conflict. No --path selects all shared roots; a single-file share is selected automatically, while folders require --recursive. Directory contents map like cp by default; --include-parent retains the selected directory name. For a whole-Space share, omitting --path or using --path / selects the entire Space and requires --recursive. It preserves the full Space-relative hierarchy; --include-parent adds no wrapper because the Space root has no basename. A selected subdirectory keeps the cp layout rules. Multiple roots with colliding contents fail safely; use --include-parent to preserve distinct root names instead of guessing new names. --include and --exclude match cp relative source paths. Default parallelism is 16 files, 4 directory listings and 4 ranges per file; --batch-concurrency, --list-concurrency and --multipart-concurrency override these positive values.", "操作系统先解析用户指定的目标目录及 checkpoint 目录别名，再固定实际根目录；下载子路径拒绝穿越、符号链接/reparse 点、大小写及 Unicode 或文件/目录冲突，返回 Conflict（退出码 9）。恢复时比较解析后的根目录，并验证已完成本地文件大小和摘要；变化时返回 Conflict。不传 --path 时选择全部分享根；单文件自动选中，目录需要 --recursive。默认与 cp 一样复制目录内容；--include-parent 保留选中目录名。整 Space 分享省略 --path 或使用 --path / 时选择整个 Space，且需要 --recursive；保留完整空间相对层级。Space 根没有 basename，因此 --include-parent 不增加包装目录；选中子目录时仍遵循 cp 布局。多个根目录的内容同名时安全拒绝；用 --include-parent 保留不同根目录名，不猜测重命名。--include 和 --exclude 按 cp 的源相对路径匹配。默认并发为 16 个文件、4 个目录列举和每文件 4 个 Range；--batch-concurrency、--list-concurrency 和 --multipart-concurrency 可用正整数覆盖。"),
     ("Overwrite defaults to force, matching cp. --force and legacy --overwrite select force; --no-clobber skips existing ordinary files, and --overwrite-strategy newer replaces only older destinations. Replacements publish only after verification. --checkpoint [FILE] enables recovery; a bare flag uses a stable task path under ~/.tos/checkpoints/ve-adrive, --checkpoint-dir overrides that directory, and FILE preserves the legacy explicit path. --resume uses the saved selection and policy, revalidates completed files and restores verified partial ranges. Keep selection, filters, layout and overwrite policy unchanged; old checkpoints with the directory-name layout need --include-parent. New remote files are not added during resume. Keep the checkpoint JSON together with its .completed/ completion-ledger directory and .parts/ directory when retaining or moving recovery state; completed entries in the main JSON are not updated after every file.", "覆盖策略默认 force，与 cp 一致。--force 和兼容的 --overwrite 选择 force；--no-clobber 跳过已有普通文件，--overwrite-strategy newer 仅替换较旧目标。校验完成后才发布替换文件。--checkpoint [FILE] 启用恢复；裸参数使用 ~/.tos/checkpoints/ve-adrive 下的稳定任务路径，--checkpoint-dir 覆盖目录，FILE 保留旧显式路径写法。--resume 使用保存的选择和策略，重新验证已完成文件，并恢复已验证的部分 Range。选择、过滤、目录布局和覆盖策略须保持一致；保留目录名布局的旧 checkpoint 需使用 --include-parent。恢复不加入新增远端文件。保存或迁移恢复状态时须同时保留 checkpoint JSON、.completed/ 增量账本目录和 .parts/ 目录；主 JSON 的 completed 不会逐文件实时更新。"),
@@ -575,7 +609,6 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Path to config TOML", "配置 TOML 路径"),
     ("Path to credentials TOML", "凭据 TOML 路径"),
     ("Confirm share cancellation", "确认分享取消操作"),
-    ("Share Links:", "分享链接："),
 
     // [Review Fix #LiveDocs1] Keep approved page/API mapping, local-root and rejection rules visible in Chinese help/Describe.
     ("Management ShareUrl uses the server ShareURL unless share-endpoint is configured. Override precedence: --share-endpoint > selected profile share_endpoint > ADRIVE_SHARE_ENDPOINT > legacy ADRIVE_SHARE_BASE_URL; overrides append /share/<encoded ShareID> without adding an Instance label or password. Without a server URL or override, the successful ShareID is retained, ShareUrl is omitted and ShareUrlWarning explains the missing URL; the API endpoint is never used to construct it. Create/get may retain the server URL pwd query for authorized delivery; list/update remove all query parameters and omit passwords. Standard IDS receiver hosts map between idsapp/idsapi and idsapp-boe/idsapi-boe under volces.com, preserving the Instance label, scheme and port. Share pages, receiver APIs and download addresses support HTTP and HTTPS without protocol upgrades. Custom receiver APIs use --endpoint. Anonymous receivers derive APIs from page URLs without account config; explicit OAuth uses the selected profile API or --endpoint.", "管理结果的 ShareUrl 默认使用服务端 ShareURL；配置 share-endpoint 时覆盖。优先级：--share-endpoint > 所选 profile 的 share_endpoint > ADRIVE_SHARE_ENDPOINT > 旧变量 ADRIVE_SHARE_BASE_URL；覆盖值后拼接 /share/<编码后的 ShareID>，不添加实例前缀或密码。服务端 URL 和覆盖值均缺失时，保留成功的 ShareID，省略 ShareUrl，并以 ShareUrlWarning 提示缺失；不使用 API endpoint 推导页面 URL。create/get 可保留服务端 URL 的 pwd 查询参数供授权交付；list/update 移除全部查询参数且不返回密码。接收端标准 IDS 域名在 volces.com 下按 idsapp/idsapi、idsapp-boe/idsapi-boe 对应，保留实例前缀、协议和端口。分享页面、接收 API 及下载地址支持 HTTP 和 HTTPS，不自动升级协议。自定义接收 API 使用 --endpoint。匿名接收从页面 URL 推导 API，不读取账户配置；显式 OAuth 使用所选 profile 的 API 或 --endpoint。"),
@@ -788,8 +821,8 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("x-only-put-delete-marker header", "x-only-put-delete-marker 请求头"),
     ("x-parent-inode-id header", "x-parent-inode-id 请求头"),
     (
-        "A-Drive commands (high-level + utilities)",
-        "A-Drive 命令（高阶命令与工具）",
+        "A-Drive commands (high-level + low-level + utilities)",
+        "A-Drive 命令（高阶、低阶命令与工具）",
     ),
     ("ACL value", "ACL 值"),
     (
@@ -936,6 +969,20 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
         "Content-MD5 request header for JSON body",
         "JSON 正文的 Content-MD5 请求头",
     ),
+    // [Review Fix #ProtocolHelp] Translate the corrected metadata protocol options.
+    ("Explicit Content-Type update (REPLACE_NEW preserves omitted values)", "显式更新 Content-Type；省略时按元数据更新策略处理"),
+    ("Metadata replacement mode (REPLACE_NEW merges supplied values; REPLACE replaces all)", "元数据更新策略（REPLACE_NEW 合并指定值；REPLACE 全量替换）"),
+    // [Review Fix #ProtocolHelp] Localize corrected request semantics and units.
+    ("Unique tag (x-tos-unique-tag)", "唯一 tag（x-tos-unique-tag）"),
+    ("Custom metadata, encoded once", "自定义元数据，编码一次"),
+    ("Nonnegative TTL days; 0 clears expiration", "非负整数 TTL 天数；0 清除过期设置"),
+    ("Object TTL in nonnegative integer days (0 clears expiration)", "对象 TTL，单位为非负整数天数（0 清除过期设置）"),
+    // [Review Fix #ProtocolQueryConstants] Describe resolved query names in both languages.
+    ("Recursive delete flag (recursive query)", "递归删除参数（recursive）"),
+    ("Skip trash flag (skipTrash query)", "跳过回收站参数（skipTrash）"),
+    ("Compatibility seconds value; must agree with --time (x-tos-modify-timestamp)", "兼容的秒数参数，必须与 --time 一致（x-tos-modify-timestamp）"),
+    ("Fractional nanoseconds in 0..999999999 (x-tos-modify-timestamp-ns)", "秒内纳秒数，范围 0..999999999（x-tos-modify-timestamp-ns）"),
+    ("Get object file status (alias of stat)", "获取对象文件状态（stat 的别名）"),
     ("Content-Type header", "Content-Type 请求头"),
     ("Continuation token", "续传 token"),
     ("Continuation token for listing tasks", "列出任务时使用的续传 token"),
@@ -1589,10 +1636,6 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ),
     ("Timestamp (RFC3339 or Unix epoch)", "时间戳（RFC3339 或 Unix 时间戳）"),
     (
-        "Tip: use the dedicated tos-cli, ve-tos-cli, and ve-adrive-cli binaries for direct invocation.",
-        "提示：直接调用时请使用专用的 tos-cli、ve-tos-cli 和 ve-adrive-cli 二进制。",
-    ),
-    (
         "Tool names come from skills, e.g. `tos_ls` for `tos ls` and `tos_cp` for `tos cp`.",
         "工具名称来自 Skill，例如 `tos ls` 对应 `tos_ls`，`tos cp` 对应 `tos_cp`。",
     ),
@@ -1717,9 +1760,10 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
         "Use credentials managed by the unified authentication integration",
         "使用统一登录集成管理的凭证",
     ),
+    // [Review Fix #4] Keep localized help aligned with the optional login field.
     (
-        "ADrive Instance ID to authorize. Overrides profile default_instance and ADRIVE_DEFAULT_INSTANCE; required if neither fallback is configured",
-        "要授权的 ADrive Instance ID。覆盖 profile default_instance 和 ADRIVE_DEFAULT_INSTANCE；两者均未配置时必填",
+        "ADrive Instance ID to authorize. Overrides profile default_instance and ADRIVE_DEFAULT_INSTANCE; when unset, the authorization server selects the Instance",
+        "要授权的 ADrive Instance ID。覆盖 profile default_instance 和 ADRIVE_DEFAULT_INSTANCE；未设置时由授权服务器选择 Instance",
     ),
     (
         "OAuth Authorization Server base URL. Overrides profile auth_endpoint and ADRIVE_AUTH_ENDPOINT; defaults to the effective endpoint",
@@ -3209,7 +3253,7 @@ fn print_chinese_help(effective_args: &[String]) {
         return;
     }
     match display_help_text_for_args(&sanitized_args) {
-        Ok(help) => print!("{}", localize_clap_help_zh(&help)),
+        Ok(help) => print!("{}", restore_help_environment_values(&help)),
         Err(err)
             if matches!(
                 err.kind(),
@@ -3353,25 +3397,19 @@ fn adrive_grouped_help_zh() -> String {
     let _ = writeln!(output, "ADrive CLI - 面向 Agent\n");
     let _ = writeln!(output, "用法:\n  {prefix} <命令> [选项]\n");
     append_adrive_capability_group_zh(&mut output, "高阶命令", "high_level");
-    // [Review Fix #ShareHelp1] The grouped Chinese renderer must include every share leaf from the registry.
-    append_adrive_capability_group_zh(&mut output, "分享链接", "share");
+    append_adrive_capability_group_zh(&mut output, "低阶命令", "low_level");
     append_adrive_capability_group_zh(&mut output, "能力 / 工具", "utilities");
     append_adrive_target_syntax_zh(&mut output);
     append_root_common_options_zh(&mut output);
     append_adrive_unified_auth_zh(&mut output, &prefix);
     append_help_language_section_zh(&mut output);
     append_adrive_examples_zh(&mut output, &prefix);
-    translate_help_phrases_zh(&output)
+    translate_help_phrases_zh(&output).replace("ve-adrive-cli", &prefix)
 }
 
 fn append_tos_usage_zh(output: &mut String, prefix: &str) {
     let _ = writeln!(output, "用法:");
-    let _ = writeln!(output, "  {prefix} <命令> [选项]");
-    if prefix == "ve-tos-cli" {
-        let _ = writeln!(output, "  ve-storage-uni-cli ve-tos <命令> [选项]\n");
-    } else {
-        let _ = writeln!(output, "  ve-tos-cli <命令> [选项]\n");
-    }
+    let _ = writeln!(output, "  {prefix} <命令> [选项]\n");
 }
 
 fn append_tos_category_zh(output: &mut String, title: &str, category: &str) {
@@ -3399,24 +3437,34 @@ fn append_byted_capability_group_zh(output: &mut String, title: &str, group: &st
 
 fn append_adrive_capability_group_zh(output: &mut String, title: &str, group: &str) {
     let _ = writeln!(output, "{title}:");
+    let mut roots = std::collections::BTreeSet::new();
     for row in ve_adrive_cli::registry::capabilities()
         .iter()
-        .filter(|row| adrive_group_matches(row.group, group))
+        .filter(|row| adrive_group_matches(row, group))
     {
         let command = row
             .command
             .strip_prefix("ve-adrive ")
             .unwrap_or(row.command);
-        let _ = writeln!(output, "  {:<22} {}", command, row.description);
+        let root = command.split_whitespace().next().unwrap_or(command);
+        // [Review Fix #HelpLayers] Root help lists namespaces once; leaf help owns their actions.
+        if !roots.insert(root) {
+            continue;
+        }
+        let description = match root {
+            "share" => "Manage and receive share links",
+            "chunk" => "Search and read document chunks",
+            _ => row.description,
+        };
+        let _ = writeln!(output, "  {:<22} {}", root, description);
     }
     output.push('\n');
 }
 
-fn adrive_group_matches(row_group: &str, target_group: &str) -> bool {
-    matches!(
-        (row_group, target_group),
-        ("High-Level", "high_level") | ("Capabilities / Utilities", "utilities")
-    ) || row_group == target_group
+fn adrive_group_matches(row: &ve_adrive_cli::registry::CapabilityRow, target_group: &str) -> bool {
+    row.layer.replace('-', "_") == target_group
+        || (row.layer == "utility" && target_group == "utilities")
+        || row.group == target_group
 }
 
 fn append_tos_target_syntax_zh(output: &mut String) {
@@ -3667,7 +3715,12 @@ fn direct_tool_args(args: Vec<String>, tool: &str) -> Vec<String> {
 
 fn maybe_print_direct_version(args: &[String], binary_name: &str) -> bool {
     if args.len() == 2 && matches!(args[1].as_str(), "--version" | "-V") {
-        println!("{} {}", binary_name, env!("CARGO_PKG_VERSION"));
+        // [Review Fix #5] ADrive has its own release version; TOS uses the root version.
+        let version = match binary_name {
+            "ve-adrive-cli" => ve_adrive_cli::CLI_VERSION,
+            _ => env!("CARGO_PKG_VERSION"),
+        };
+        println!("{binary_name} {version}");
         return true;
     }
     false
@@ -3845,7 +3898,7 @@ fn configure_example_prefixes(invocation_surface: InvocationSurface) {
     }
 }
 
-fn handle_parse_error(effective_args: &[String], err: clap::Error) -> Cli {
+fn handle_parse_error(effective_args: &[String], mut err: clap::Error) -> Cli {
     if matches!(err.kind(), ClapErrorKind::DisplayHelp) {
         print_display_help_with_registry_examples(effective_args, &err);
         std::process::exit(0);
@@ -3863,6 +3916,7 @@ fn handle_parse_error(effective_args: &[String], err: clap::Error) -> Cli {
     if maybe_emit_adrive_describe_recovery(effective_args) {
         std::process::exit(0);
     }
+    contextualize_parse_error(effective_args, &mut err);
     if is_byted_tos_invocation(effective_args) {
         // [Review Fix #1] New `tos` parse errors follow the Agent envelope contract.
         emit_parse_error(effective_args, "byted-tos", &err);
@@ -3880,10 +3934,33 @@ fn handle_parse_error(effective_args: &[String], err: clap::Error) -> Cli {
     err.exit();
 }
 
+fn contextualize_parse_error(effective_args: &[String], err: &mut clap::Error) {
+    use clap::error::{ContextKind, ContextValue};
+
+    // [Review Fix #ErrorEntry1] Rewrite only generated usage, preserving quoted
+    // user input and the share URL sanitizer's exact input matching.
+    if let Some(ContextValue::StyledStr(usage)) = err.get(ContextKind::Usage) {
+        let usage = contextualized_help_text(effective_args, &usage.to_string());
+        err.insert(ContextKind::Usage, ContextValue::StyledStr(usage.into()));
+    }
+    // [Review Fix #ErrorEntry4] MissingSubcommand stores the generated command
+    // path in InvalidSubcommand; other error kinds store user input there.
+    if err.kind() == ClapErrorKind::MissingSubcommand {
+        if let Some(ContextValue::String(command)) = err.get(ContextKind::InvalidSubcommand) {
+            let command = contextualized_help_text(effective_args, command);
+            err.insert(
+                ContextKind::InvalidSubcommand,
+                ContextValue::String(command),
+            );
+        }
+    }
+}
+
 // [Review Fix #TOS-HelpExamples] Keep generated/derived low-level help aligned
 // with ADrive by appending registry examples when clap structs lack after_help.
 fn print_display_help_with_registry_examples(effective_args: &[String], err: &clap::Error) {
     let help = display_help_text_with_registry_examples(effective_args, err);
+    let help = restore_help_environment_values(&help);
     if err.use_stderr() {
         eprint!("{help}");
     } else {
@@ -3895,7 +3972,11 @@ fn display_help_text_with_registry_examples(
     effective_args: &[String],
     err: &clap::Error,
 ) -> String {
-    let mut help = contextualized_help_text(effective_args, &err.to_string());
+    let help = contextualized_help_text(effective_args, &err.to_string());
+    help_text_with_registry_examples(effective_args, help)
+}
+
+fn help_text_with_registry_examples(effective_args: &[String], mut help: String) -> String {
     if !help.contains("Examples:") {
         if let Some(examples) = tos_registry_help_examples(effective_args) {
             if !examples.is_empty() {
@@ -3937,12 +4018,12 @@ fn help_uses_language_for_command_behavior(help: &str) -> bool {
 }
 
 fn contextualized_help_text(effective_args: &[String], help: &str) -> String {
+    use tos_core::agent::command_display::render_help_template;
     if is_byted_tos_invocation(effective_args) {
         let prefix =
             std::env::var(BYTED_TOS_EXAMPLE_PREFIX_ENV).unwrap_or_else(|_| "tos-cli".to_string());
-        let help = help
-            .replace("ve-storage-uni-cli ve-tos", &prefix)
-            .replace("ve-tos-cli", &prefix)
+        let help = render_help_template(help, "ve-tos", &prefix);
+        let help = render_help_template(&help, "tos", &prefix)
             .replace("ve-tos-specific", "TOS-specific")
             .replace("[profile.ve-tos]", "[profile.tos]")
             .replace("[default.ve-tos]", "[default.tos]")
@@ -3952,29 +4033,106 @@ fn contextualized_help_text(effective_args: &[String], help: &str) -> String {
             .replace("staging.ve-tos.", "staging.tos.")
             // [Review Fix #11] ByteCloud `tos` parses profile/output through
             // BYTE_TOS_* guards, so its help must not advertise legacy TOS_*.
-            .replace("[env: TOS_PROFILE=]", "[env: BYTE_TOS_PROFILE=]")
-            .replace("[env: TOS_OUTPUT=]", "[env: BYTE_TOS_OUTPUT=]")
             .replace("For `ve-tos`", "For `tos`");
+        let help = byted_help_environment_names(&help);
         let help = strip_control_plane_global_help(&help);
         return strip_byted_tos_unsupported_help(&help);
     }
     if is_tos_invocation(effective_args) {
         let prefix =
             std::env::var(TOS_EXAMPLE_PREFIX_ENV).unwrap_or_else(|_| "ve-tos-cli".to_string());
-        let help = help.replace("ve-tos-cli", &prefix);
+        let help = render_help_template(help, "ve-tos", &prefix);
         return strip_psm_global_help(&help);
     }
     if is_adrive_invocation(effective_args) {
         let prefix = std::env::var(ADRIVE_EXAMPLE_PREFIX_ENV)
             .unwrap_or_else(|_| "ve-adrive-cli".to_string());
         // [Review Fix #ShareHelp3] Clap renders the unified usage path even inside the dedicated wrapper.
-        let help = help
-            .replace("ve-storage-uni-cli ve-adrive", &prefix)
-            .replace("ve-adrive-cli", &prefix);
+        let help = render_help_template(help, "ve-adrive", &prefix);
         let help = strip_control_plane_global_help(&help);
         return strip_psm_global_help(&help);
     }
     help.to_string()
+}
+
+fn byted_help_environment_names(help: &str) -> String {
+    // [Review Fix #CommandDisplay11] Rename only the annotation header;
+    // preserve its real value, including embedded command-like text.
+    let names = [
+        ("[env: TOS_PROFILE]", "[env: BYTE_TOS_PROFILE]"),
+        ("[env: TOS_OUTPUT]", "[env: BYTE_TOS_OUTPUT]"),
+        ("[环境变量: TOS_PROFILE]", "[环境变量: BYTE_TOS_PROFILE]"),
+        ("[环境变量: TOS_OUTPUT]", "[环境变量: BYTE_TOS_OUTPUT]"),
+        ("[env: TOS_PROFILE=", "[env: BYTE_TOS_PROFILE="),
+        ("[env: TOS_OUTPUT=", "[env: BYTE_TOS_OUTPUT="),
+        ("[环境变量: TOS_PROFILE=", "[环境变量: BYTE_TOS_PROFILE="),
+        ("[环境变量: TOS_OUTPUT=", "[环境变量: BYTE_TOS_OUTPUT="),
+    ];
+    help.split_inclusive('\n')
+        .map(|line| {
+            let trimmed = line.trim_start();
+            for (source, target) in names {
+                if let Some(value) = trimmed.strip_prefix(source) {
+                    return format!("{}{target}{value}", &line[..line.len() - trimmed.len()]);
+                }
+            }
+            line.to_string()
+        })
+        .collect()
+}
+
+fn restore_help_environment_values(help: &str) -> String {
+    // [Review Fix #CommandDisplay12] Clap hides values while templates are
+    // transformed. Restore opaque values once, after every display operation.
+    let mut rendered = String::with_capacity(help.len());
+    let mut remaining = help;
+    while let Some(start) = ["[env: ", "[环境变量: "]
+        .iter()
+        .filter_map(|marker| remaining.find(marker))
+        .min()
+    {
+        rendered.push_str(&remaining[..start]);
+        let annotation = &remaining[start..];
+        let Some(end) = annotation.find(']') else {
+            rendered.push_str(annotation);
+            return rendered;
+        };
+        let (label, name) = annotation[..end].split_once(": ").unwrap();
+        if help_environment_names().contains(name) {
+            let value = std::env::var_os(name).unwrap_or_default();
+            rendered.push_str(&format!("{label}: {name}={}]", value.to_string_lossy()));
+        } else {
+            rendered.push_str(&annotation[..=end]);
+        }
+        remaining = &annotation[end + 1..];
+    }
+    rendered.push_str(remaining);
+    rendered
+}
+
+fn help_environment_names() -> &'static std::collections::BTreeSet<String> {
+    use clap::Args;
+    static NAMES: OnceLock<std::collections::BTreeSet<String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        // Use the original argument policy before root-level masking, so an
+        // explicitly hidden value is never exposed by the final printer.
+        let arguments = GlobalArgs::augment_args(clap::Command::new("help"));
+        let mut names: std::collections::BTreeSet<String> = arguments
+            .get_arguments()
+            .filter(|argument| !argument.is_hide_env_values_set())
+            .filter_map(|argument| argument.get_env())
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        for (shared, public) in [
+            ("TOS_PROFILE", "BYTE_TOS_PROFILE"),
+            ("TOS_OUTPUT", "BYTE_TOS_OUTPUT"),
+        ] {
+            if names.contains(shared) {
+                names.insert(public.to_string());
+            }
+        }
+        names
+    })
 }
 
 fn strip_control_plane_global_help(help: &str) -> String {
@@ -4013,11 +4171,21 @@ fn byte_tos_recursive_list_help(help: &str) -> String {
                 "Recursive listing mode: auto, flat, or hierarchical",
                 "Recursive listing mode: hierarchical only",
             )
+            // [Review Fix #Baseline3] Chinese help is localized before this
+            // ByteTOS-only filter, so narrow the translated description too.
+            .replace(
+                "递归列举模式：auto、flat 或 hierarchical",
+                "递归列举模式：仅支持 hierarchical",
+            )
             // [Review Fix #25] clap -h renders enum values inline, unlike
             // --help's expanded bullets; narrow that form as well.
             .replace(
                 "[possible values: auto, flat, hierarchical]",
                 "[possible values: hierarchical]",
+            )
+            .replace(
+                "[可选值: auto, flat, hierarchical]",
+                "[可选值: hierarchical]",
             )
         } else {
             line.to_string()
@@ -4217,17 +4385,21 @@ fn maybe_emit_adrive_describe_recovery(effective_args: &[String]) -> bool {
     let mut data = if command == "ve-adrive" {
         serde_json::json!({
             "tool": "ve-adrive",
-            "version": env!("CARGO_PKG_VERSION"),
-            "description": "ADrive CLI high-level file operations and agent utilities",
+            "version": ve_adrive_cli::CLI_VERSION,
+            "description": "ADrive CLI file workflows, share links, document Chunk APIs and agent utilities",
             "uri_format": "adrive://instance/space/folder/file",
-            "implemented_layers": ["high_level", "utilities", "share"],
+            "implemented_layers": ["high_level", "low_level", "utilities"],
             "unimplemented_layers": ["raw_api_execution"],
             "groups": [
-                {"name":"share","command":"ve-adrive share","description":"Manage and receive share links"},
                 {
                     "name": "high_level",
                     "command": "ve-adrive",
-                    "description": "File management operations with adrive:// URI and flag targets"
+                    "description": "File management and share-link workflows with URI and flag targets"
+                },
+                {
+                    "name": "low_level",
+                    "command": "ve-adrive chunk",
+                    "description": "Document chunk API operations"
                 },
                 {
                     "name": "utilities",
@@ -4344,13 +4516,52 @@ fn has_separate_option_value(argument: &str, next: Option<&String>) -> bool {
 
 #[cfg(test)]
 mod command_identity_tests {
-    use super::{recovered_command_path, tool_position};
+    #[test]
+    fn presentation_vocabulary_covers_registered_command_roots() {
+        use clap::CommandFactory;
+        for service in super::Cli::command().get_subcommands() {
+            for command in service.get_subcommands() {
+                assert!(
+                    tos_core::agent::command_display::is_command_root(command.get_name()),
+                    "missing presentation root {} {}",
+                    service.get_name(),
+                    command.get_name()
+                );
+            }
+        }
+    }
+    use super::{maybe_print_adrive_grouped_help, recovered_command_path, tool_position};
 
     fn strings(arguments: &[&str]) -> Vec<String> {
         arguments
             .iter()
             .map(|argument| (*argument).into())
             .collect()
+    }
+
+    #[test]
+    fn adrive_root_help_accepts_globals_without_hiding_leaf_help_or_invalid_flags() {
+        for args in [
+            vec![
+                "cli",
+                "ve-adrive",
+                "--profile",
+                "share",
+                "--output",
+                "json",
+                "--help",
+            ],
+            vec!["cli", "--profile", "chunk", "ve-adrive", "--help"],
+        ] {
+            assert!(maybe_print_adrive_grouped_help(&strings(&args)));
+        }
+        for args in [
+            vec!["cli", "ve-adrive", "share", "--help"],
+            vec!["cli", "ve-adrive", "chunk", "search", "--help"],
+            vec!["cli", "ve-adrive", "--unsupported-root-flag", "--help"],
+        ] {
+            assert!(!maybe_print_adrive_grouped_help(&strings(&args)));
+        }
     }
 
     #[test]
@@ -4374,6 +4585,27 @@ mod command_identity_tests {
             ]);
             assert_eq!(tool_position(&arguments, "ve-adrive"), Some(3), "{option}");
             assert_eq!(tool_position(&arguments, "byted-tos"), None, "{option}");
+        }
+    }
+
+    #[test]
+    fn adrive_describe_identity_skips_auth_mode_values() {
+        for options in [vec!["--auth-mode", "aksk"], vec!["--auth-mode=aksk"]] {
+            for after_command in [false, true] {
+                let mut arguments = strings(&["cli", "ve-adrive"]);
+                if after_command {
+                    arguments.extend(strings(&["file", "set-meta"]));
+                }
+                arguments.extend(strings(&options));
+                if !after_command {
+                    arguments.extend(strings(&["file", "set-meta"]));
+                }
+                arguments.push("--describe".into());
+                assert_eq!(
+                    recovered_command_path(&arguments, "ve-adrive"),
+                    "ve-adrive file set-meta"
+                );
+            }
         }
     }
 
@@ -4634,6 +4866,7 @@ fn flag_takes_value(flag: &str) -> bool {
     matches!(
         flag,
         "--output"
+            | "--auth-mode"
             | "-o"
             | "--query"
             | "--profile"
@@ -4712,7 +4945,7 @@ fn emit_parse_error(effective_args: &[String], tool: &str, err: &clap::Error) {
     use tos_core::agent::error::ExitCode;
 
     let exit_code = ExitCode::ValidationError;
-    let public_tool = public_tool_name(tool);
+    let public_tool = public_invocation_prefix(tool);
     // [Review Fix #1] Parse-time errors now also expose the Agent decision
     // fields required by the stable schema.
     let suggested_action = format!("validate arguments, then run {public_tool} <command> --help");
@@ -4743,6 +4976,32 @@ fn emit_parse_error(effective_args: &[String], tool: &str, err: &clap::Error) {
         "{}",
         serde_json::to_string_pretty(&value).unwrap_or_default()
     );
+}
+
+fn public_invocation_prefix(tool: &str) -> String {
+    tos_core::agent::command_display::invocation_prefix(public_tool_name(tool))
+}
+
+fn contextualize_error_commands(
+    tool: &str,
+    mut error: tos_core::agent::envelope::ErrorDetail,
+) -> tos_core::agent::envelope::ErrorDetail {
+    let canonical_prefix = format!("{} ", public_tool_name(tool));
+    let invocation_prefix = public_invocation_prefix(tool);
+    error.suggested_action = error.suggested_action.map(|action| {
+        tos_core::agent::command_display::diagnostic_action(&action, public_tool_name(tool))
+    });
+    // [Review Fix #ErrorEntry2] Repair commands are executable instructions;
+    // canonical machine identifiers and opaque upstream messages stay intact.
+    for command in [&mut error.fix_command, &mut error.doctor_hint]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(suffix) = command.strip_prefix(&canonical_prefix) {
+            *command = format!("{invocation_prefix} {suffix}");
+        }
+    }
+    error
 }
 
 fn sanitize_share_parse_error(arguments: &[String], tool: &str, mut message: String) -> String {
@@ -4850,7 +5109,10 @@ async fn handle_byted_tos(global: GlobalArgs, command: tos_cli::TosCliCommand) {
                 doctor_hint: Some("tos doctor".to_string()),
                 docs_url: None,
             };
-            let mut envelope = Envelope::<()>::failed(command_path, error_detail);
+            let mut envelope = Envelope::<()>::failed(
+                command_path,
+                contextualize_error_commands("tos", error_detail),
+            );
             if let Some(request_id) = request_id {
                 envelope = envelope.with_request_id(request_id);
             }
@@ -5081,8 +5343,10 @@ async fn handle_tos(global: GlobalArgs, command: Option<ve_tos_cli::TosCommand>)
                 doctor_hint: guidance.doctor_hint,
                 docs_url: Some("https://www.volcengine.com/docs/6349".to_string()),
             };
-            let mut envelope =
-                Envelope::<()>::failed(ve_tos_cli::command_path(&command), error_detail);
+            let mut envelope = Envelope::<()>::failed(
+                ve_tos_cli::command_path(&command),
+                contextualize_error_commands("ve-tos", error_detail),
+            );
             if let Some(request_id) = request_id {
                 envelope = envelope.with_request_id(request_id);
             }
@@ -5113,8 +5377,10 @@ async fn handle_tos_inner(
             return Ok(0);
         }
         return Err(tos_core::agent::error::CliError::ValidationError(
-            "`ve-tos` requires a subcommand; use `ve-tos --help` or `ve-tos --describe`"
-                .to_string(),
+            tos_core::agent::command_display::render_template(
+                "`ve-tos` requires a subcommand; use `ve-tos --help` or `ve-tos --describe`",
+                "ve-tos",
+            ),
         ));
     }
 
@@ -5498,7 +5764,10 @@ async fn handle_adrive(
                 doctor_hint: guidance.doctor_hint,
                 docs_url: None,
             };
-            let mut envelope = Envelope::<()>::failed(command_path, error_detail);
+            let mut envelope = Envelope::<()>::failed(
+                command_path,
+                contextualize_error_commands("ve-adrive", error_detail),
+            );
             // [Review Fix #12] Error request IDs come only from the terminal
             // traced response; a terminal no-response failure keeps the ULID.
             if let Some(request_id) = request_id {
@@ -5528,6 +5797,12 @@ async fn handle_adrive_inner(
     command: &ve_adrive_cli::ADriveCommand,
 ) -> Result<i32, tos_core::agent::error::CliError> {
     match command {
+        ve_adrive_cli::ADriveCommand::File(group) => {
+            ve_adrive_cli::handler::file::handle_file_command(global, auth, group).await
+        }
+        ve_adrive_cli::ADriveCommand::Chunk(group) => {
+            ve_adrive_cli::handler::chunk::handle_chunk_command(global, auth, group).await
+        }
         ve_adrive_cli::ADriveCommand::Cp(_)
         | ve_adrive_cli::ADriveCommand::Mv(_)
         | ve_adrive_cli::ADriveCommand::Sync(_)

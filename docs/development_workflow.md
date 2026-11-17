@@ -50,6 +50,29 @@ update every applicable user-facing discovery surface in the same change:
 If a surface is not applicable, record that conclusion in the implementation
 review instead of silently skipping it.
 
+CLI-generated error Usage and repair/diagnostic commands must use the active
+entrypoint: `ve-adrive-cli`, `ve-tos-cli`, `tos-cli`, or the corresponding unified
+invocation. Keep structured command identifiers canonical and preserve quoted
+user input, upstream error text, and externally owned commands such as `ve login`.
+Verify these boundaries with `tests/error_entrypoint_regression.py` against all
+four binaries when changing shared error rendering. Include self-emitted batch
+failure envelopes with `tests/batch_transfer_breadth_regression.py`; they can
+bypass the root error handler.
+
+Use `tos_core::agent::command_display` for trusted CLI-authored instructions.
+Render templates before inserting user paths, server diagnostics, IDs or tokens;
+do not replace command names in whole error messages or business JSON. Metadata
+prose must be localized before rendering entrypoints. Canonical selectors such
+as `--name "ve-tos bucket create"`, schema literals and completion registrations
+remain machine values. `tests/command_presentation_regression.py` covers offline
+Doctor checks, validation, cross-service remediation, plans and discovery across
+all six dedicated/unified service combinations. Keep the presentation root
+vocabulary aligned with the Clap tree via the root library consistency test.
+Clap hides environment values while help is localized and reformatted; the
+final printer restores registered environment values in one pass. Never parse
+user values using annotation delimiters, because values can contain brackets,
+newlines, command spellings or annotation-shaped text themselves.
+
 ## Escalating the process
 
 When the task size is unclear, begin with the small-bug workflow. Escalate only when investigation reveals a public contract change, cross-module impact, security-sensitive behavior, migration requirement, or another concrete risk that the lightweight workflow cannot cover.

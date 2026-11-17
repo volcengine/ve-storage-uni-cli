@@ -2026,16 +2026,9 @@ pub fn describe_tos_group() -> Value {
 pub fn grouped_help_text(global_options: &str) -> String {
     // [Review Fix #4] Render grouped help from registry so `ve-tos` help and describe output cannot drift.
     let command_prefix = tos_example_prefix();
-    let mut output = String::from("TOS Object Storage CLI — Agent-Native\n\nUsage:\n");
-    if command_prefix == "ve-tos-cli" {
-        output.push_str(
-            "  ve-tos-cli <command> [options]\n  ve-storage-uni-cli ve-tos <command> [options]\n\n",
-        );
-    } else {
-        output.push_str(
-            "  ve-storage-uni-cli ve-tos <command> [options]\n  ve-tos-cli <command> [options]\n\n",
-        );
-    }
+    let mut output = format!(
+        "TOS Object Storage CLI — Agent-Native\n\nUsage:\n  {command_prefix} <command> [options]\n\n"
+    );
     for (title, category) in [
         ("High-Level Commands", "high_level"),
         ("Low-Level API — Core", "core"),
@@ -2315,12 +2308,13 @@ fn tos_filter_examples(command: &str) -> Vec<String> {
 }
 
 pub fn public_tos_example(example: &str) -> String {
-    let prefix = tos_example_prefix();
-    let with_public_pipeline = example
-        .replace(" | ve-tos ", &format!(" | {prefix} "))
-        .replace("ve-tos-cli ", &format!("{prefix} "))
-        .replace("ve-storage-uni-cli ve-tos ", &format!("{prefix} "));
-    public_tos_command(&with_public_pipeline)
+    // [Review Fix #CommandDisplay7] Only executable pipeline prefixes change;
+    // canonical selectors such as --name "ve-tos bucket create" remain exact.
+    example
+        .split(" | ")
+        .map(public_tos_command)
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 fn command_root_group(command: &str) -> Option<&str> {

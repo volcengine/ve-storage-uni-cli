@@ -85,7 +85,7 @@ pub async fn handle_config_command(
 
     let Some(action) = action else {
         return Err(CliError::ValidationError(
-            "`ve-tos config` requires a subcommand; use `ve-tos config --help` or `ve-tos config --describe`".to_string(),
+            crate::handler::common::public_tos_template("`ve-tos config` requires a subcommand; use `ve-tos config --help` or `ve-tos config --describe`"),
         ));
     };
 
@@ -580,8 +580,8 @@ async fn handle_init(global: &GlobalArgs, profile: Option<&str>) -> Result<i32, 
         "message": format!(
             "Config file written to {}. Edit it or run '{}' to fill in credentials, then verify with '{}'.",
             path.display(),
-            public_config_command("ve-tos config set <KEY> <VALUE>"),
-            public_config_command("ve-tos config show")
+            public_config_example("ve-tos config set <KEY> <VALUE>"),
+            public_config_example("ve-tos config show")
         ),
     });
 
@@ -1096,7 +1096,10 @@ fn validate_auth_mode_route(path: &[String], active_binary: Binary) -> Result<()
     }
     if path.len() == 3 && Binary::parse(&path[1]) == Some(Binary::Adrive) {
         return Err(CliError::ValidationError(
-            "auth_mode for adrive is only supported by ve-adrive; use `ve-adrive config set auth_mode <aksk|oauth|unified>`".to_string(),
+            tos_core::agent::command_display::render_template(
+                "auth_mode for adrive is only supported by ve-adrive; use `ve-adrive config set auth_mode <aksk|oauth|unified>`",
+                "ve-adrive",
+            ),
         ));
     }
     let namespace = path.get(1).map(String::as_str).unwrap_or("shared");
@@ -1111,8 +1114,12 @@ fn reject_unsupported_tos_control_endpoint(path: &[String]) -> Result<(), CliErr
         // plane. Reject new ByteCloud `tos` writes instead of creating a
         // hidden config value that `ve-tos config show` intentionally omits.
         return Err(CliError::ValidationError(
-            "control_endpoint is only supported by ve-tos; use `ve-tos config set control_endpoint <value>`"
-                .to_string(),
+            // [Review Fix #CommandDisplay3] This recommends another service,
+            // so select its entrypoint rather than the current ByteTOS entry.
+            tos_core::agent::command_display::render_template(
+                "control_endpoint is only supported by ve-tos; use `ve-tos config set control_endpoint <value>`",
+                "ve-tos",
+            ),
         ));
     }
     Ok(())

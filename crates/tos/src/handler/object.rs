@@ -50,7 +50,7 @@ pub async fn handle_object_command(
 
     let Some(action) = action else {
         return Err(CliError::ValidationError(
-            "`ve-tos object` requires a subcommand; use `ve-tos object --help` or `ve-tos object --describe`".to_string(),
+            crate::handler::common::public_tos_template("`ve-tos object` requires a subcommand; use `ve-tos object --help` or `ve-tos object --describe`"),
         ));
     };
 
@@ -146,6 +146,8 @@ pub async fn handle_object_command(
         }
     }
 
+    // [Review Fix #ProtocolValidation] Reject malformed protocol inputs before credentials or IO.
+    validate_object_protocol(action)?;
     let runtime = build_runtime(global)?;
     let client = runtime.client(global, "tos")?;
 
@@ -917,17 +919,7 @@ async fn handle_batch_delete(
         "ve-tos object batch-delete",
         Method::POST,
         &bucket,
-        build_query(&[
-            ("delete", Some(String::new())),
-            (
-                "queryRecursive",
-                args.recursive.then_some("true".to_string()),
-            ),
-            (
-                "querySkipTrash",
-                args.skip_trash.then_some("true".to_string()),
-            ),
-        ]),
+        batch_delete_query(args),
         {
             let mut headers = json_headers();
             insert_optional_header(&mut headers, "Content-MD5", args.content_md5.clone());
@@ -937,6 +929,15 @@ async fn handle_batch_delete(
     )
     .await?;
     output_result(global, &result)
+}
+
+// [Review Fix #BatchDeleteQuery] Use protocol values rather than server Go constant identifiers.
+fn batch_delete_query(args: &ObjectBatchDeleteArgs) -> BTreeMap<String, String> {
+    build_query(&[
+        ("delete", Some(String::new())),
+        ("recursive", args.recursive.then_some("true".to_string())),
+        ("skipTrash", args.skip_trash.then_some("true".to_string())),
+    ])
 }
 
 async fn handle_list(
@@ -1070,7 +1071,8 @@ async fn handle_status(
         Method::GET,
         &bucket,
         &key,
-        marker_query(&["status"]),
+        // [Review Fix #ProtocolStatus] GetFileStatus is routed by the stat marker.
+        marker_query(&["stat"]),
         BTreeMap::new(),
         None,
     )
@@ -1088,10 +1090,8 @@ async fn handle_set_meta(
         args.bucket.as_deref(),
         args.key.as_deref(),
     )?;
-    let body = parse_json_or_kv(&args.meta);
-    let mut headers = json_headers();
-    insert_optional_header(&mut headers, "x-unique-tag", args.unique_tag.clone());
-    insert_optional_header(&mut headers, "Content-Type", args.content_type.clone());
+    // [Review Fix #ProtocolMeta] SetObjectMeta consumes headers and no JSON body.
+    let headers = object_metadata_headers(args)?;
     let result = core::execute_object_request(
         client,
         "ve-tos object set-meta",
@@ -1100,10 +1100,10 @@ async fn handle_set_meta(
         &key,
         build_query(&[
             ("metadata", Some(String::new())),
-            ("queryVersionID", args.version_id.clone()),
+            ("versionId", args.version_id.clone()),
         ]),
         headers,
-        Some(serde_json::to_vec(&body).map_err(CliError::Json)?),
+        None,
     )
     .await?;
     output_result(global, &result)
@@ -1119,17 +1119,8 @@ async fn handle_set_time(
         args.bucket.as_deref(),
         args.key.as_deref(),
     )?;
-    let mut headers = json_headers();
-    insert_optional_header(
-        &mut headers,
-        "x-modify-timestamp",
-        args.modify_timestamp.clone(),
-    );
-    insert_optional_header(
-        &mut headers,
-        "x-modify-timestamp-ns",
-        args.modify_timestamp_ns.clone(),
-    );
+    // [Review Fix #ProtocolTime] Send validated seconds and fractional nanoseconds as headers.
+    let headers = object_time_headers(args)?;
     let result = core::execute_object_request(
         client,
         "ve-tos object set-time",
@@ -1138,7 +1129,7 @@ async fn handle_set_time(
         &key,
         marker_query(&["time"]),
         headers,
-        Some(serde_json::to_vec(&json!({ "time": args.time })).map_err(CliError::Json)?),
+        None,
     )
     .await?;
     output_result(global, &result)
@@ -1162,10 +1153,11 @@ async fn handle_set_expires(
         &key,
         build_query(&[
             ("objectExpires", Some(String::new())),
-            ("queryVersionID", args.version_id.clone()),
+            ("versionId", args.version_id.clone()),
         ]),
         json_headers(),
-        Some(serde_json::to_vec(&json!({ "expires": args.expires })).map_err(CliError::Json)?),
+        // [Review Fix #ProtocolExpires] The server requires numeric ObjectExpires in TTL days.
+        Some(serde_json::to_vec(&object_expires_body(&args.expires)?).map_err(CliError::Json)?),
     )
     .await?;
     output_result(global, &result)
@@ -1191,7 +1183,7 @@ async fn handle_append(
         "append-last-time",
         args.append_last_time.clone(),
     );
-    insert_optional_query(&mut query, "queryVersionID", args.version_id.clone());
+    insert_optional_query(&mut query, "versionId", args.version_id.clone());
     let mut headers = BTreeMap::new();
     insert_optional_header(&mut headers, "Content-Type", args.content_type.clone());
     insert_optional_header(&mut headers, "Content-MD5", args.content_md5.clone());
@@ -1293,7 +1285,7 @@ async fn handle_seal_append(
         "offset",
         args.offset.map(|value| value.to_string()),
     );
-    insert_optional_query(&mut query, "queryVersionID", args.version_id.clone());
+    insert_optional_query(&mut query, "versionId", args.version_id.clone());
     let mut headers = BTreeMap::new();
     insert_acl_headers(
         &mut headers,
@@ -1338,7 +1330,7 @@ async fn handle_modify(
     let body_input = classify_body_input(&args.body)?;
     let mut query = marker_query(&["modify"]);
     query.insert("offset".to_string(), args.offset.to_string());
-    insert_optional_query(&mut query, "queryVersionID", args.version_id.clone());
+    insert_optional_query(&mut query, "versionId", args.version_id.clone());
     let mut headers = BTreeMap::new();
     insert_optional_header(&mut headers, "Content-Type", args.content_type.clone());
     insert_optional_header(&mut headers, "Content-MD5", args.content_md5.clone());
@@ -1450,7 +1442,7 @@ async fn handle_restore(
         &key,
         build_query(&[
             ("restore", Some(String::new())),
-            ("queryVersionID", args.version_id.clone()),
+            ("versionId", args.version_id.clone()),
         ]),
         headers,
         Some(serde_json::to_vec(&json!({ "days": args.days })).map_err(CliError::Json)?),
@@ -1470,7 +1462,7 @@ async fn handle_get_acl(
         args.key.as_deref(),
     )?;
     let mut query = marker_query(&["acl"]);
-    insert_optional_query(&mut query, "queryVersionID", args.version_id.clone());
+    insert_optional_query(&mut query, "versionId", args.version_id.clone());
     let result = core::execute_object_request(
         client,
         "ve-tos object get-acl",
@@ -1505,7 +1497,7 @@ async fn handle_set_acl(
         &key,
         build_query(&[
             ("acl", Some(String::new())),
-            ("queryVersionID", args.version_id.clone()),
+            ("versionId", args.version_id.clone()),
         ]),
         headers,
         None,
@@ -1525,7 +1517,7 @@ async fn handle_get_tagging(
         args.key.as_deref(),
     )?;
     let mut query = marker_query(&["tagging"]);
-    insert_optional_query(&mut query, "queryVersionID", args.version_id.clone());
+    insert_optional_query(&mut query, "versionId", args.version_id.clone());
     let result = core::execute_object_request(
         client,
         "ve-tos object get-tagging",
@@ -1558,7 +1550,7 @@ async fn handle_set_tagging(
         &bucket,
         &key,
         marker_query(&["tagging"]),
-        parse_json_or_kv(&args.tags),
+        object_tagging_body(&args.tags)?,
     )
     .await
 }
@@ -1650,7 +1642,7 @@ async fn handle_get_symlink(
         &key,
         build_query(&[
             ("symlink", Some(String::new())),
-            ("queryVersionID", args.version_id.clone()),
+            ("versionId", args.version_id.clone()),
         ]),
         BTreeMap::new(),
         None,
@@ -1777,26 +1769,26 @@ async fn handle_fetch(
     client: &TosClient,
     args: &ObjectFetchArgs,
 ) -> Result<(), CliError> {
-    // [Review Fix #8] FetchObject body 需要包含可选的 StorageClass 和 Meta 字段
-    let mut body = serde_json::Map::new();
-    body.insert("URL".to_string(), json!(args.source_url));
-    if let Some(ref sc) = args.storage_class {
-        body.insert("StorageClass".to_string(), json!(sc));
-    }
-    if let Some(ref meta) = args.meta {
-        body.insert("Meta".to_string(), json!(meta));
-    }
-    execute_json_object_action(
-        global,
+    // [Review Fix #ProtocolFetch] Fetch metadata and storage class are external request headers.
+    let mut headers = metadata_headers(args.meta.as_deref())?;
+    headers.extend(json_headers());
+    insert_optional_header(
+        &mut headers,
+        "x-tos-storage-class",
+        args.storage_class.clone(),
+    );
+    let result = core::execute_object_request(
         client,
         "ve-tos object fetch",
         Method::POST,
         &args.bucket.require()?,
         &args.key,
         marker_query(&["fetch"]),
-        serde_json::Value::Object(body),
+        headers,
+        Some(serde_json::to_vec(&json!({"URL": args.source_url})).map_err(CliError::Json)?),
     )
-    .await
+    .await?;
+    output_result(global, &result)
 }
 
 async fn handle_set_retention(
@@ -2031,6 +2023,7 @@ fn insert_object_copy_metadata_directive_header(
     insert_optional_header(headers, "x-tos-metadata-directive", value);
 }
 
+// [Review Fix #ProtocolVersion] Object version queries use the wire name versionId, never the Go identifier queryVersionID.
 fn insert_optional_query(query: &mut BTreeMap<String, String>, key: &str, value: Option<String>) {
     if let Some(value) = value {
         query.insert(key.to_string(), value);
@@ -2081,11 +2074,266 @@ fn json_headers() -> BTreeMap<String, String> {
     BTreeMap::from([("content-type".to_string(), "application/json".to_string())])
 }
 
-fn parse_json_or_kv(input: &str) -> Value {
-    read_json_input(input).unwrap_or_else(|_| parse_kv_pairs(input))
+// [Review Fix #ProtocolInput] Reject malformed pairs and non-string metadata instead of silently changing them.
+fn protocol_string_map(input: &str) -> Result<BTreeMap<String, String>, CliError> {
+    let parsed = match read_json_input(input) {
+        Ok(parsed) => parsed,
+        Err(_) if !input.trim_start().starts_with(['{', '[']) && input.contains('=') => {
+            let mut entries = serde_json::Map::new();
+            for pair in input.split('&') {
+                let (key, value) = pair.split_once('=').ok_or_else(|| {
+                    CliError::ValidationError("expected key=value pairs separated by &".into())
+                })?;
+                if key.is_empty() || entries.insert(key.into(), json!(value)).is_some() {
+                    return Err(CliError::ValidationError(
+                        "keys must be nonempty and unique".into(),
+                    ));
+                }
+            }
+            Value::Object(entries)
+        }
+        Err(_) => {
+            return Err(CliError::ValidationError(
+                "expected a JSON string map or key=value pairs".into(),
+            ))
+        }
+    };
+    let entries = parsed
+        .as_object()
+        .ok_or_else(|| CliError::ValidationError("expected a JSON string map".into()))?;
+    entries
+        .iter()
+        .map(|(key, value)| {
+            let value = value.as_str().ok_or_else(|| {
+                CliError::ValidationError("metadata and tag values must be strings".into())
+            })?;
+            if key.is_empty() {
+                return Err(CliError::ValidationError("keys must not be empty".into()));
+            }
+            Ok((key.clone(), value.into()))
+        })
+        .collect()
+}
+
+// [Review Fix #ProtocolEncoding] Encode raw UTF-8 and literal percent signs exactly once for SDK-compatible metadata.
+fn encode_metadata_component(raw: &str) -> String {
+    let mut encoded = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn metadata_headers(input: Option<&str>) -> Result<BTreeMap<String, String>, CliError> {
+    let mut headers = BTreeMap::new();
+    if let Some(input) = input {
+        for (key, value) in protocol_string_map(input)? {
+            let name = format!(
+                "x-tos-meta-{}",
+                encode_metadata_component(&key).to_ascii_lowercase()
+            );
+            if headers
+                .insert(name, encode_metadata_component(&value))
+                .is_some()
+            {
+                return Err(CliError::ValidationError(
+                    "metadata keys must be unique ignoring case".into(),
+                ));
+            }
+        }
+    }
+    Ok(headers)
+}
+
+fn object_metadata_headers(args: &ObjectSetMetaArgs) -> Result<BTreeMap<String, String>, CliError> {
+    let mut headers = metadata_headers(Some(&args.meta))?;
+    if !matches!(args.metadata_directive.as_str(), "REPLACE_NEW" | "REPLACE") {
+        return Err(CliError::ValidationError(
+            "metadata directive must be REPLACE_NEW or REPLACE".into(),
+        ));
+    }
+    headers.insert(
+        "x-tos-metadata-directive".into(),
+        args.metadata_directive.clone(),
+    );
+    insert_optional_header(&mut headers, "x-tos-unique-tag", args.unique_tag.clone());
+    insert_optional_header(&mut headers, "content-type", args.content_type.clone());
+    for (name, value) in &headers {
+        reqwest::header::HeaderValue::from_str(value)
+            .map_err(|_| CliError::ValidationError(format!("invalid value for {name}")))?;
+    }
+    Ok(headers)
+}
+
+// [Review Fix #ProtocolTime] Avoid floating-point rounding and retain all nine fractional second digits.
+fn protocol_timestamp(input: &str) -> Result<(i64, u32), CliError> {
+    let invalid = || {
+        CliError::ValidationError(
+            "expected nonnegative Unix epoch seconds or RFC3339 timestamp".into(),
+        )
+    };
+    let (seconds, nanoseconds) = if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(input)
+    {
+        (timestamp.timestamp(), timestamp.timestamp_subsec_nanos())
+    } else {
+        let (whole, fraction) = input.split_once('.').unwrap_or((input, ""));
+        if whole.is_empty()
+            || !whole.bytes().all(|byte| byte.is_ascii_digit())
+            || fraction.len() > 9
+            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+            || (input.contains('.') && fraction.is_empty())
+        {
+            return Err(invalid());
+        }
+        let seconds = whole.parse::<i64>().map_err(|_| invalid())?;
+        let nanoseconds = if fraction.is_empty() {
+            0
+        } else {
+            fraction.parse::<u32>().map_err(|_| invalid())? * 10_u32.pow(9 - fraction.len() as u32)
+        };
+        (seconds, nanoseconds)
+    };
+    if seconds < 0 || nanoseconds >= 1_000_000_000 {
+        return Err(invalid());
+    }
+    Ok((seconds, nanoseconds))
+}
+
+fn object_time_headers(args: &ObjectSetTimeArgs) -> Result<BTreeMap<String, String>, CliError> {
+    let (seconds, mut nanoseconds) = protocol_timestamp(&args.time)?;
+    if let Some(alias) = &args.modify_timestamp {
+        if alias.parse::<i64>().ok() != Some(seconds) {
+            return Err(CliError::ValidationError(
+                "--modify-timestamp conflicts with --time".into(),
+            ));
+        }
+    }
+    if let Some(alias) = &args.modify_timestamp_ns {
+        let alias = alias
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value < 1_000_000_000)
+            .ok_or_else(|| {
+                CliError::ValidationError("--modify-timestamp-ns must be in 0..999999999".into())
+            })?;
+        if args.time.contains('.') && alias != nanoseconds {
+            return Err(CliError::ValidationError(
+                "--modify-timestamp-ns conflicts with --time".into(),
+            ));
+        }
+        nanoseconds = alias;
+    }
+    Ok(BTreeMap::from([
+        ("x-tos-modify-timestamp".into(), seconds.to_string()),
+        ("x-tos-modify-timestamp-ns".into(), nanoseconds.to_string()),
+    ]))
+}
+
+// [Review Fix #ProtocolExpiresDays] ObjectExpires is a TTL in days; timestamps change its meaning.
+fn object_expires_body(input: &str) -> Result<Value, CliError> {
+    if input.is_empty() || !input.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(CliError::ValidationError(
+            "--expires requires nonnegative integer TTL days; 0 clears the TTL".into(),
+        ));
+    }
+    let days = input.parse::<i64>().map_err(|_| {
+        CliError::ValidationError("--expires must fit a nonnegative signed 64-bit integer".into())
+    })?;
+    Ok(json!({"ObjectExpires": days}))
+}
+
+// [Review Fix #ProtocolTags] Keep canonical JSON accepted and normalize shorthand into TagSet.Tags.
+fn object_tagging_body(input: &str) -> Result<Value, CliError> {
+    if let Ok(body) = read_json_input(input) {
+        if let Some(tags) = body
+            .get("TagSet")
+            .and_then(|set| set.get("Tags"))
+            .and_then(Value::as_array)
+        {
+            validate_object_tags(tags)?;
+            return Ok(body);
+        }
+    }
+    let tags: Vec<Value> = protocol_string_map(input)?
+        .into_iter()
+        .map(|(key, value)| json!({"Key": key, "Value": value}))
+        .collect();
+    validate_object_tags(&tags)?;
+    Ok(json!({"TagSet": {"Tags": tags}}))
+}
+
+// [Review Fix #ProtocolTagValidation] Apply count and duplicate checks equally to JSON and shorthand tags.
+fn validate_object_tags(tags: &[Value]) -> Result<(), CliError> {
+    const MAX_OBJECT_TAGS: usize = 10;
+    if tags.is_empty() || tags.len() > MAX_OBJECT_TAGS {
+        return Err(CliError::ValidationError(
+            "object tagging requires between 1 and 10 tags".into(),
+        ));
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    for tag in tags {
+        let key = tag
+            .get("Key")
+            .and_then(Value::as_str)
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| {
+                CliError::ValidationError("each tag requires a nonempty string Key".into())
+            })?;
+        if tag.get("Value").and_then(Value::as_str).is_none() {
+            return Err(CliError::ValidationError(
+                "each tag requires a string Value".into(),
+            ));
+        }
+        if !keys.insert(key) {
+            return Err(CliError::ValidationError(
+                "object tag keys must be unique".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_fetch_url(source: &str) -> Result<(), CliError> {
+    let url = reqwest::Url::parse(source)
+        .map_err(|_| CliError::ValidationError("invalid source URL".into()))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(CliError::ValidationError(
+            "source URL must use HTTP or HTTPS".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_object_protocol(action: &ObjectAction) -> Result<(), CliError> {
+    match action {
+        ObjectAction::SetMeta(args) => {
+            object_metadata_headers(args)?;
+        }
+        ObjectAction::SetTime(args) => {
+            object_time_headers(args)?;
+        }
+        ObjectAction::SetExpires(args) => {
+            object_expires_body(&args.expires)?;
+        }
+        ObjectAction::SetTagging(args) => {
+            object_tagging_body(&args.tags)?;
+        }
+        ObjectAction::Fetch(args) => {
+            validate_fetch_url(&args.source_url)?;
+            metadata_headers(args.meta.as_deref())?;
+        }
+        ObjectAction::CreateFetchTask(args) => validate_fetch_url(&args.source_url)?,
+        _ => {}
+    }
+    Ok(())
 }
 
 fn dry_run_object_action(action: &ObjectAction) -> Result<DryRunResult, CliError> {
+    validate_object_protocol(action)?;
     if let ObjectAction::Upload(args) = action {
         let target = object_target_preview(
             args.uri.as_deref(),
@@ -2247,7 +2495,7 @@ fn object_dry_run_meta(
                 args.key.as_deref(),
             )?,
             "medium",
-            true,
+            false,
         ),
         ObjectAction::SetTime(args) => (
             "ve-tos object set-time",
@@ -2258,7 +2506,7 @@ fn object_dry_run_meta(
                 args.key.as_deref(),
             )?,
             "medium",
-            true,
+            false,
         ),
         ObjectAction::SetExpires(args) => (
             "ve-tos object set-expires",
@@ -2592,7 +2840,7 @@ fn describe_object_action(action: &ObjectAction) -> CommandDescription {
         ObjectAction::Status(_) => (
             "ve-tos object status",
             "GetFileStatus",
-            "Get object processing status alias",
+            "Get object file status (alias of stat)",
             RiskLevel::Low,
             false,
         ),
@@ -3164,17 +3412,12 @@ fn describe_object_action(action: &ObjectAction) -> CommandDescription {
                 "Fixed marker query",
             ),
             parameter(
-                "queryRecursive",
+                "recursive",
                 ParameterLocation::Query,
                 false,
                 "Recursive delete",
             ),
-            parameter(
-                "querySkipTrash",
-                ParameterLocation::Query,
-                false,
-                "Skip trash",
-            ),
+            parameter("skipTrash", ParameterLocation::Query, false, "Skip trash"),
             parameter(
                 "Content-MD5",
                 ParameterLocation::Header,
@@ -3204,13 +3447,13 @@ fn describe_object_action(action: &ObjectAction) -> CommandDescription {
                 "Fixed marker query",
             ),
             parameter(
-                "queryVersionID",
+                "versionId",
                 ParameterLocation::Query,
                 false,
                 "Target object version",
             ),
             parameter(
-                "x-unique-tag",
+                "x-tos-unique-tag",
                 ParameterLocation::Header,
                 false,
                 "Unique tag",
@@ -3222,10 +3465,16 @@ fn describe_object_action(action: &ObjectAction) -> CommandDescription {
                 "Content type",
             ),
             parameter(
-                "meta(body)",
-                ParameterLocation::Body,
+                "x-tos-meta-*",
+                ParameterLocation::Header,
                 true,
-                "Metadata payload",
+                "Custom metadata, encoded once",
+            ),
+            parameter(
+                "x-tos-metadata-directive",
+                ParameterLocation::Header,
+                true,
+                "REPLACE_NEW (default) or REPLACE",
             ),
         ]),
         ObjectAction::SetTime(_) => Some(vec![
@@ -3233,13 +3482,13 @@ fn describe_object_action(action: &ObjectAction) -> CommandDescription {
             parameter("object", ParameterLocation::Path, true, "Object key"),
             parameter("time", ParameterLocation::Query, true, "Fixed marker query"),
             parameter(
-                "x-modify-timestamp",
+                "x-tos-modify-timestamp",
                 ParameterLocation::Header,
-                false,
+                true,
                 "Modify timestamp",
             ),
             parameter(
-                "x-modify-timestamp-ns",
+                "x-tos-modify-timestamp-ns",
                 ParameterLocation::Header,
                 false,
                 "Modify timestamp ns",
@@ -3255,10 +3504,16 @@ fn describe_object_action(action: &ObjectAction) -> CommandDescription {
                 "Fixed marker query",
             ),
             parameter(
-                "queryVersionID",
+                "versionId",
                 ParameterLocation::Query,
                 false,
                 "Target object version",
+            ),
+            parameter(
+                "ObjectExpires",
+                ParameterLocation::Body,
+                true,
+                "Nonnegative TTL days; 0 clears expiration",
             ),
         ]),
         ObjectAction::Append(_) => Some(vec![
@@ -3278,7 +3533,7 @@ fn describe_object_action(action: &ObjectAction) -> CommandDescription {
                 "Append last time",
             ),
             parameter(
-                "queryVersionID",
+                "versionId",
                 ParameterLocation::Query,
                 false,
                 "Target object version",
@@ -3394,7 +3649,7 @@ fn describe_object_action(action: &ObjectAction) -> CommandDescription {
             parameter("seal", ParameterLocation::Query, true, "Fixed marker query"),
             parameter("offset", ParameterLocation::Query, false, "Append offset"),
             parameter(
-                "queryVersionID",
+                "versionId",
                 ParameterLocation::Query,
                 false,
                 "Target object version",
@@ -3466,7 +3721,7 @@ fn describe_object_action(action: &ObjectAction) -> CommandDescription {
             ),
             parameter("offset", ParameterLocation::Query, true, "Modify offset"),
             parameter(
-                "queryVersionID",
+                "versionId",
                 ParameterLocation::Query,
                 false,
                 "Target object version",
@@ -3564,7 +3819,7 @@ fn describe_object_action(action: &ObjectAction) -> CommandDescription {
                 "Fixed marker query",
             ),
             parameter(
-                "queryVersionID",
+                "versionId",
                 ParameterLocation::Query,
                 false,
                 "Target object version",
@@ -3580,19 +3835,14 @@ fn describe_object_action(action: &ObjectAction) -> CommandDescription {
         ObjectAction::Status(_) => Some(vec![
             parameter("bucket", ParameterLocation::Path, true, "Bucket name"),
             parameter("object", ParameterLocation::Path, true, "Object key"),
-            parameter(
-                "status",
-                ParameterLocation::Query,
-                true,
-                "Fixed marker query",
-            ),
+            parameter("stat", ParameterLocation::Query, true, "Fixed marker query"),
         ]),
         ObjectAction::SetAcl(_) => Some(vec![
             parameter("bucket", ParameterLocation::Path, true, "Bucket name"),
             parameter("object", ParameterLocation::Path, true, "Object key"),
             parameter("acl", ParameterLocation::Query, true, "Fixed marker query"),
             parameter(
-                "queryVersionID",
+                "versionId",
                 ParameterLocation::Query,
                 false,
                 "Target object version",
@@ -3604,7 +3854,7 @@ fn describe_object_action(action: &ObjectAction) -> CommandDescription {
             parameter("object", ParameterLocation::Path, true, "Object key"),
             parameter("acl", ParameterLocation::Query, true, "Fixed marker query"),
             parameter(
-                "queryVersionID",
+                "versionId",
                 ParameterLocation::Query,
                 false,
                 "Target object version",
@@ -3620,7 +3870,7 @@ fn describe_object_action(action: &ObjectAction) -> CommandDescription {
                 "Fixed marker query",
             ),
             parameter(
-                "queryVersionID",
+                "versionId",
                 ParameterLocation::Query,
                 false,
                 "Target object version",
@@ -3711,7 +3961,7 @@ fn describe_object_action(action: &ObjectAction) -> CommandDescription {
             parameter("bucket", ParameterLocation::Path, true, "Bucket name"),
             parameter("object", ParameterLocation::Path, true, "Object key"),
             parameter(
-                "queryVersionID",
+                "versionId",
                 ParameterLocation::Query,
                 false,
                 "Target object version",
@@ -3884,21 +4134,16 @@ fn describe_object_action(action: &ObjectAction) -> CommandDescription {
                 true,
                 "Fixed marker query",
             ),
+            parameter("URL", ParameterLocation::Body, true, "Source URL"),
             parameter(
-                "source_url(body)",
-                ParameterLocation::Body,
-                true,
-                "Source URL",
-            ),
-            parameter(
-                "storage_class(body)",
-                ParameterLocation::Body,
+                "x-tos-storage-class",
+                ParameterLocation::Header,
                 false,
                 "Storage class",
             ),
             parameter(
-                "meta(body)",
-                ParameterLocation::Body,
+                "x-tos-meta-*",
+                ParameterLocation::Header,
                 false,
                 "Custom metadata",
             ),
@@ -3995,6 +4240,257 @@ pub fn describe_object_group() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(clap::Parser)]
+    struct ProtocolTestCli {
+        #[command(flatten)]
+        object: ObjectCommand,
+    }
+
+    fn protocol_action(arguments: &[&str]) -> ObjectAction {
+        use clap::Parser;
+        ProtocolTestCli::try_parse_from(std::iter::once("object").chain(arguments.iter().copied()))
+            .expect("valid test command")
+            .object
+            .action
+            .expect("object action")
+    }
+
+    #[test]
+    fn object_protocol_metadata_and_time_have_no_body() {
+        for arguments in [
+            vec!["set-meta", "tos://bucket/key", "--meta", "name=value"],
+            vec![
+                "set-time",
+                "tos://bucket/key",
+                "--time",
+                "2026-01-01T00:00:00.123Z",
+            ],
+        ] {
+            let preview = dry_run_object_action(&protocol_action(&arguments)).unwrap();
+            assert!(
+                preview.warnings.is_empty(),
+                "header-only operations have no body"
+            );
+        }
+    }
+
+    #[test]
+    fn object_protocol_rejects_invalid_values_during_dry_run() {
+        for arguments in [
+            vec!["set-meta", "tos://bucket/key", "--meta", r#"{"name":12}"#],
+            vec!["set-meta", "tos://bucket/key", "--meta", "invalid"],
+            vec!["set-time", "tos://bucket/key", "--time", "not-a-time"],
+            vec![
+                "set-time",
+                "tos://bucket/key",
+                "--time",
+                "1700000000",
+                "--modify-timestamp",
+                "1700000001",
+            ],
+            vec!["set-expires", "tos://bucket/key", "--expires", "not-a-time"],
+            vec!["set-tagging", "tos://bucket/key", "--tags", "invalid"],
+            vec![
+                "fetch",
+                "--bucket",
+                "bucket",
+                "--key",
+                "key",
+                "--source-url",
+                "file:///etc/passwd",
+            ],
+        ] {
+            assert!(
+                dry_run_object_action(&protocol_action(&arguments)).is_err(),
+                "must reject invalid protocol input: {arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_protocol_metadata_preserves_explicit_percent_and_unicode() {
+        let action = protocol_action(&[
+            "set-meta",
+            "tos://bucket/key",
+            "--meta",
+            r#"{"Name":"中文 %2F+ x"}"#,
+        ]);
+        let ObjectAction::SetMeta(args) = action else {
+            panic!("metadata action")
+        };
+        let headers = object_metadata_headers(&args).unwrap();
+        assert_eq!(
+            headers["x-tos-meta-name"],
+            "%E4%B8%AD%E6%96%87%20%252F%2B%20x"
+        );
+        assert_eq!(headers["x-tos-metadata-directive"], "REPLACE_NEW");
+        assert!(!headers.contains_key("content-type"));
+        assert!(metadata_headers(Some("Name=one&name=two")).is_err());
+    }
+
+    #[test]
+    fn object_protocol_metadata_has_one_explicit_content_type() {
+        let action = protocol_action(&[
+            "set-meta",
+            "tos://bucket/key",
+            "--meta",
+            "k=v",
+            "--content-type",
+            "text/plain",
+            "--metadata-directive",
+            "REPLACE",
+        ]);
+        let ObjectAction::SetMeta(args) = action else {
+            panic!("metadata action")
+        };
+        let headers = object_metadata_headers(&args).unwrap();
+        assert_eq!(headers["content-type"], "text/plain");
+        assert_eq!(headers["x-tos-metadata-directive"], "REPLACE");
+        assert_eq!(
+            headers
+                .keys()
+                .filter(|name| name.eq_ignore_ascii_case("content-type"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn object_protocol_timestamp_preserves_nanoseconds_and_offsets() {
+        assert_eq!(
+            protocol_timestamp("1700000000.123456789").unwrap(),
+            (1700000000, 123456789)
+        );
+        assert_eq!(
+            protocol_timestamp("2023-11-15T06:13:20.123456789+08:00").unwrap(),
+            (1700000000, 123456789)
+        );
+        assert_eq!(
+            protocol_timestamp("9223372036854775807").unwrap(),
+            (i64::MAX, 0)
+        );
+        for invalid in [
+            "-1",
+            "9223372036854775808",
+            "1.1234567890",
+            "1.",
+            "NaN",
+            "1969-12-31T23:59:59Z",
+        ] {
+            assert!(protocol_timestamp(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn object_protocol_time_aliases_agree_or_fail() {
+        let action = protocol_action(&[
+            "set-time",
+            "tos://bucket/key",
+            "--time",
+            "1700000000",
+            "--modify-timestamp",
+            "1700000000",
+            "--modify-timestamp-ns",
+            "123",
+        ]);
+        let ObjectAction::SetTime(mut args) = action else {
+            panic!("time action")
+        };
+        let headers = object_time_headers(&args).unwrap();
+        assert_eq!(headers["x-tos-modify-timestamp"], "1700000000");
+        assert_eq!(headers["x-tos-modify-timestamp-ns"], "123");
+        for invalid in ["1000000000", "-1"] {
+            args.modify_timestamp_ns = Some(invalid.to_string());
+            assert!(object_time_headers(&args).is_err());
+        }
+    }
+
+    #[test]
+    fn object_protocol_expires_uses_numeric_ttl_days() {
+        assert_eq!(
+            object_expires_body("7").unwrap(),
+            json!({"ObjectExpires": 7})
+        );
+        assert_eq!(
+            object_expires_body("0").unwrap(),
+            json!({"ObjectExpires": 0})
+        );
+        assert_eq!(
+            object_expires_body("9223372036854775807").unwrap(),
+            json!({"ObjectExpires": i64::MAX})
+        );
+        for invalid in [
+            "2023-11-14T22:13:20Z",
+            "1.5",
+            "-1",
+            "9223372036854775808",
+            "NaN",
+        ] {
+            assert!(
+                object_expires_body(invalid).is_err(),
+                "invalid TTL days: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_protocol_tagging_normalizes_maps_and_preserves_canonical_body() {
+        let expected = json!({"TagSet": {"Tags": [{"Key": "env", "Value": "dev"}]}});
+        assert_eq!(object_tagging_body("env=dev").unwrap(), expected);
+        assert_eq!(object_tagging_body(r#"{"env":"dev"}"#).unwrap(), expected);
+        assert_eq!(
+            object_tagging_body(&expected.to_string()).unwrap(),
+            expected
+        );
+        assert!(object_tagging_body(r#"{"TagSet":{"Tags":[{"Key":"env","Value":4}]}}"#).is_err());
+    }
+
+    #[test]
+    fn object_protocol_tagging_rejects_empty_duplicate_and_excess_entries() {
+        for invalid in [
+            r#"{"TagSet":{"Tags":[]}}"#,
+            r#"{"TagSet":{"Tags":[{"Key":"env","Value":"a"},{"Key":"env","Value":"b"}]}}"#,
+        ] {
+            assert!(object_tagging_body(invalid).is_err());
+        }
+        let tags: Vec<Value> = (0..11)
+            .map(|index| json!({"Key": format!("key{index}"), "Value": "v"}))
+            .collect();
+        assert!(object_tagging_body(&json!({"TagSet":{"Tags": tags}}).to_string()).is_err());
+        let shorthand = (0..11)
+            .map(|index| format!("key{index}=v"))
+            .collect::<Vec<_>>()
+            .join("&");
+        assert!(object_tagging_body(&shorthand).is_err());
+    }
+
+    #[test]
+    fn object_protocol_batch_delete_uses_wire_query_names() {
+        let action = protocol_action(&[
+            "batch-delete",
+            "--bucket",
+            "bucket",
+            "--keys",
+            "one,two",
+            "--recursive",
+            "--skip-trash",
+        ]);
+        let ObjectAction::BatchDelete(mut args) = action else {
+            panic!("batch delete action")
+        };
+        assert_eq!(
+            batch_delete_query(&args),
+            BTreeMap::from([
+                ("delete".into(), "".into()),
+                ("recursive".into(), "true".into()),
+                ("skipTrash".into(), "true".into()),
+            ])
+        );
+        args.recursive = false;
+        args.skip_trash = false;
+        assert_eq!(batch_delete_query(&args), marker_query(&["delete"]));
+    }
 
     #[test]
     fn build_object_retention_body_uses_documented_json_schema() {

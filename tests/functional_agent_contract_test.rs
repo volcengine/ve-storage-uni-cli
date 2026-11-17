@@ -334,16 +334,20 @@ fn share_group_describe_is_structured_and_unauthenticated() {
 }
 
 #[test]
-fn adrive_root_help_lists_all_share_actions_in_both_languages() {
+fn adrive_share_help_lists_all_actions_in_both_languages() {
+    // [Review Fix #Baseline2] Root help lists namespaces by layer; verify
+    // action discovery in the share namespace's own help instead.
     for language in ["en", "zh"] {
-        let output = cli(&["ve-adrive", "--help", "--language", language]);
+        let output = cli(&["ve-adrive", "share", "--help", "--language", language]);
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         for action in [
             "create", "get", "list", "update", "cancel", "inspect", "files", "view", "download",
         ] {
             assert!(
-                stdout.contains(&format!("share {action}")),
+                stdout
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(action)),
                 "language={language}, missing {action}"
             );
         }

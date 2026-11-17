@@ -46,6 +46,10 @@ enum Source {
     Id,
     StyleName,
     JobId,
+    // [Review Fix #AdvancedJobSelectors] Job type is a required value, not a flag.
+    JobType,
+    // [Review Fix #DatasetBindingSelectors] Binding reads require a URI selector.
+    Uri,
     Alias,
     Accelerator,
     AcceleratorId,
@@ -64,7 +68,6 @@ enum Source {
 enum QuerySpec {
     Flag(&'static str),
     Param(&'static str, Source),
-    Key(Source),
 }
 
 #[derive(Clone, Debug)]
@@ -249,6 +252,7 @@ where
     }
 
     let Some(action) = action else {
+        let group = crate::handler::common::public_tos_template(group);
         return Err(CliError::ValidationError(format!(
             "`{group}` requires a subcommand; use `{group} --help` or `{group} --describe`"
         )));
@@ -261,7 +265,7 @@ where
     if op.spec.has_body && op.body.is_none() {
         return Err(CliError::ValidationError(format!(
             "{} requires --config for JSON body",
-            op.spec.command
+            crate::handler::common::public_tos_template(op.spec.command)
         )));
     }
     if global.dry_run {
@@ -277,7 +281,10 @@ where
     let result = match op.spec.endpoint {
         EndpointKind::DataPlane => {
             let bucket = op.bucket.as_deref().ok_or_else(|| {
-                CliError::ValidationError(format!("{} requires --bucket", op.spec.command))
+                CliError::ValidationError(format!(
+                    "{} requires --bucket",
+                    crate::handler::common::public_tos_template(op.spec.command)
+                ))
             })?;
             if op.spec.path == "/{bucket}" {
                 core::execute_bucket_request(
@@ -354,6 +361,7 @@ fn current_advanced_command_path(group: &str) -> String {
         tokens.push(arg.as_str());
     }
     for len in (1..=tokens.len()).rev() {
+        // [Review Fix #CommandDisplay8] Registry lookup keys are canonical IDs.
         let candidate = format!("ve-tos {}", tokens[..len].join(" "));
         if crate::registry::capability_row_for_command(&candidate, false).is_some()
             || crate::registry::find_command_tree_entry(&candidate).is_some()
@@ -641,7 +649,10 @@ fn data_process_operation(
                 "CreateAuditJobs",
                 Method::POST,
                 "/{bucket}",
-                &[QuerySpec::Flag("audit_jobs"), QuerySpec::Flag("job_type")],
+                &[
+                    QuerySpec::Flag("audit_jobs"),
+                    QuerySpec::Param("job_type", Source::JobType),
+                ],
                 true,
             ),
             a,
@@ -652,7 +663,10 @@ fn data_process_operation(
                 "CreateDocProcessJobs",
                 Method::POST,
                 "/{bucket}",
-                &[QuerySpec::Flag("doc_jobs"), QuerySpec::Flag("job_type")],
+                &[
+                    QuerySpec::Flag("doc_jobs"),
+                    QuerySpec::Param("job_type", Source::JobType),
+                ],
                 true,
             ),
             a,
@@ -663,7 +677,10 @@ fn data_process_operation(
                 "CreateFileProcessJobs",
                 Method::POST,
                 "/{bucket}",
-                &[QuerySpec::Flag("file_jobs"), QuerySpec::Flag("job_type")],
+                &[
+                    QuerySpec::Flag("file_jobs"),
+                    QuerySpec::Param("job_type", Source::JobType),
+                ],
                 true,
             ),
             a,
@@ -674,7 +691,10 @@ fn data_process_operation(
                 "CreateMediaProcessJobs",
                 Method::POST,
                 "/{bucket}",
-                &[QuerySpec::Flag("media_jobs"), QuerySpec::Flag("job_type")],
+                &[
+                    QuerySpec::Flag("media_jobs"),
+                    QuerySpec::Param("job_type", Source::JobType),
+                ],
                 true,
             ),
             a,
@@ -686,8 +706,9 @@ fn data_process_operation(
                 Method::GET,
                 "/{bucket}",
                 &[
-                    QuerySpec::Flag("job_type"),
-                    QuerySpec::Param("job_id", Source::Id),
+                    QuerySpec::Param("job_type", Source::JobType),
+                    // [Review Fix #AdvancedJobSelectors] Accept --job-id and preserve --id fallback.
+                    QuerySpec::Param("job_id", Source::JobId),
                 ],
                 false,
             ),
@@ -699,7 +720,7 @@ fn data_process_operation(
                 "ListDataProcessJobs",
                 Method::GET,
                 "/{bucket}",
-                &[QuerySpec::Flag("job_type")],
+                &[QuerySpec::Param("job_type", Source::JobType)],
                 false,
             ),
             a,
@@ -796,7 +817,11 @@ fn object_set_operation(
                 "DeleteObjectSet",
                 Method::DELETE,
                 "/{bucket}",
-                &[QuerySpec::Flag("objectset")],
+                // [Review Fix #ObjectSetSelectors] Select the required object set explicitly.
+                &[
+                    QuerySpec::Flag("objectset"),
+                    QuerySpec::Param("ObjectSetName", Source::ObjectSetName),
+                ],
                 false,
             ),
             a,
@@ -809,7 +834,8 @@ fn object_set_operation(
                 "/{bucket}",
                 &[
                     QuerySpec::Flag("objectset-lifecycle"),
-                    QuerySpec::Key(Source::ObjectSetName),
+                    // [Review Fix #ObjectSetSelectors] The service reads a named query parameter.
+                    QuerySpec::Param("ObjectSetName", Source::ObjectSetName),
                 ],
                 false,
             ),
@@ -854,7 +880,11 @@ fn object_set_operation(
                 "GetObjectSet",
                 Method::GET,
                 "/{bucket}",
-                &[QuerySpec::Flag("objectset")],
+                // [Review Fix #ObjectSetSelectors] Select the required object set explicitly.
+                &[
+                    QuerySpec::Flag("objectset"),
+                    QuerySpec::Param("ObjectSetName", Source::ObjectSetName),
+                ],
                 false,
             ),
             a,
@@ -865,7 +895,11 @@ fn object_set_operation(
                 "GetObjectSetEndPoint",
                 Method::GET,
                 "/{bucket}",
-                &[QuerySpec::Flag("objectsetendpoint")],
+                // [Review Fix #ObjectSetSelectors] Select the required object set explicitly.
+                &[
+                    QuerySpec::Flag("objectsetendpoint"),
+                    QuerySpec::Param("ObjectSetName", Source::ObjectSetName),
+                ],
                 false,
             ),
             a,
@@ -878,7 +912,8 @@ fn object_set_operation(
                 "/{bucket}",
                 &[
                     QuerySpec::Flag("objectset-lifecycle"),
-                    QuerySpec::Key(Source::ObjectSetName),
+                    // [Review Fix #ObjectSetSelectors] The service reads a named query parameter.
+                    QuerySpec::Param("ObjectSetName", Source::ObjectSetName),
                 ],
                 false,
             ),
@@ -901,7 +936,11 @@ fn object_set_operation(
                 "GetObjectSetQuota",
                 Method::GET,
                 "/{bucket}",
-                &[QuerySpec::Flag("objectsetquota")],
+                // [Review Fix #ObjectSetSelectors] Select the required object set explicitly.
+                &[
+                    QuerySpec::Flag("objectsetquota"),
+                    QuerySpec::Param("ObjectSetName", Source::ObjectSetName),
+                ],
                 false,
             ),
             a,
@@ -923,7 +962,11 @@ fn object_set_operation(
                 "GetObjectSetStorage",
                 Method::GET,
                 "/{bucket}",
-                &[QuerySpec::Flag("objectsetstorage")],
+                // [Review Fix #ObjectSetSelectors] Select the required object set explicitly.
+                &[
+                    QuerySpec::Flag("objectsetstorage"),
+                    QuerySpec::Param("ObjectSetName", Source::ObjectSetName),
+                ],
                 false,
             ),
             a,
@@ -934,7 +977,11 @@ fn object_set_operation(
                 "GetObjectSetTagging",
                 Method::GET,
                 "/{bucket}",
-                &[QuerySpec::Flag("objectsettagging")],
+                // [Review Fix #ObjectSetSelectors] Select the required object set explicitly.
+                &[
+                    QuerySpec::Flag("objectsettagging"),
+                    QuerySpec::Param("ObjectSetName", Source::ObjectSetName),
+                ],
                 false,
             ),
             a,
@@ -980,7 +1027,8 @@ fn object_set_operation(
                 "/{bucket}",
                 &[
                     QuerySpec::Flag("objectset-lifecycle"),
-                    QuerySpec::Key(Source::ObjectSetName),
+                    // [Review Fix #ObjectSetSelectors] The service reads a named query parameter.
+                    QuerySpec::Param("ObjectSetName", Source::ObjectSetName),
                 ],
                 true,
             ),
@@ -1003,7 +1051,11 @@ fn object_set_operation(
                 "PutObjectSetQuota",
                 Method::PUT,
                 "/{bucket}",
-                &[QuerySpec::Flag("objectsetquota")],
+                // [Review Fix #ObjectSetSelectors] Select the required object set explicitly.
+                &[
+                    QuerySpec::Flag("objectsetquota"),
+                    QuerySpec::Param("ObjectSetName", Source::ObjectSetName),
+                ],
                 true,
             ),
             a,
@@ -1715,7 +1767,8 @@ fn dataset_operation(
                 Method::DELETE,
                 "/datasetbinding",
                 &[],
-                false,
+                // [Review Fix #DatasetBindingBody] DELETE carries DatasetName and URI JSON.
+                true,
             ),
             a,
         ),
@@ -1737,7 +1790,11 @@ fn dataset_operation(
                 "GetDatasetBinding",
                 Method::GET,
                 "/datasetbinding",
-                &[],
+                // [Review Fix #DatasetBindingSelectors] Match the service query selectors.
+                &[
+                    QuerySpec::Param("datasetname", Source::Name),
+                    QuerySpec::Param("uri", Source::Uri),
+                ],
                 false,
             ),
             a,
@@ -1748,7 +1805,8 @@ fn dataset_operation(
                 "ListDatasetBindings",
                 Method::GET,
                 "/datasetbindings",
-                &[],
+                // [Review Fix #DatasetBindingSelectors] Match the service query selectors.
+                &[QuerySpec::Param("datasetname", Source::Name)],
                 false,
             ),
             a,
@@ -2078,18 +2136,20 @@ fn build_operation(
             QuerySpec::Param(name, source) => {
                 query.insert(
                     (*name).to_string(),
-                    source_value(*source, args, region_fallback)?.to_string(),
-                );
-            }
-            QuerySpec::Key(source) => {
-                query.insert(
-                    source_value(*source, args, region_fallback)?.to_string(),
-                    String::new(),
+                    // [Review Fix #AdvancedQueryCompatibility] Existing query-only selectors remain valid.
+                    protocol_parameter_value(name, *source, args, region_fallback)?.to_string(),
                 );
             }
         }
     }
     append_kv_pairs(&mut query, &args.query, "--query")?;
+    // [Review Fix #AdvancedProtocolValidation] Overrides must not erase selectors.
+    validate_protocol_query(&spec, &query)?;
+    if spec.api == "DeleteDatasetBinding" && args.config.is_none() {
+        return Err(CliError::ValidationError(
+            "missing required --config".to_string(),
+        ));
+    }
 
     let mut headers = BTreeMap::new();
     if let Some(content_md5) = &args.content_md5 {
@@ -2114,9 +2174,7 @@ fn build_operation(
                 // naturally put Tag in the JSON body. Keep the public CLI
                 // ergonomic but reject ambiguous mismatches.
                 Some(existing_tag) if existing_tag != &tag => {
-                    return Err(CliError::ValidationError(format!(
-                        "ve-tos data-process set-template --query tag={existing_tag} conflicts with body Tag={tag}"
-                    )));
+                    return Err(CliError::ValidationError(format!("{} data-process set-template --query tag={existing_tag} conflicts with body Tag={tag}", crate::handler::common::public_tos_template("ve-tos"))));
                 }
                 Some(_) => {}
                 None => {
@@ -2180,6 +2238,10 @@ fn advanced_body(
     if spec.api == "PutDataProcessTemplate" {
         return data_process_template_body(body);
     }
+    // [Review Fix #DatasetBindingBody] Validate destructive binding selectors locally.
+    if spec.api == "DeleteDatasetBinding" {
+        return dataset_binding_delete_body(body);
+    }
     if spec.api == "CreateDataset" {
         return dataset_create_body(body);
     }
@@ -2190,6 +2252,7 @@ fn parse_json_object_body(
     body: Vec<u8>,
     command: &str,
 ) -> Result<serde_json::Map<String, Value>, CliError> {
+    let command = crate::handler::common::public_tos_template(command);
     let json_body: Value = serde_json::from_slice(&body).map_err(|err| {
         CliError::ValidationError(format!("{command} request body must be valid JSON: {err}"))
     })?;
@@ -2210,13 +2273,17 @@ fn access_point_create_body(body: Vec<u8>) -> Result<Vec<u8>, CliError> {
     if let Some(origin) = map.get_mut("NetworkOrigin") {
         let Some(origin_text) = origin.as_str() else {
             return Err(CliError::ValidationError(
-                "ve-tos ap create requires NetworkOrigin to be a string".into(),
+                crate::handler::common::public_tos_template(
+                    "ve-tos ap create requires NetworkOrigin to be a string",
+                ),
             ));
         };
         let normalized = origin_text.trim().to_ascii_lowercase();
         if normalized != "vpc" && normalized != "internet" {
             return Err(CliError::ValidationError(
-                "ve-tos ap create requires NetworkOrigin to be `vpc` or `internet`".into(),
+                crate::handler::common::public_tos_template(
+                    "ve-tos ap create requires NetworkOrigin to be `vpc` or `internet`",
+                ),
             ));
         }
         *origin = Value::String(normalized);
@@ -2228,10 +2295,7 @@ fn image_style_separator_body(body: Vec<u8>) -> Result<Vec<u8>, CliError> {
     let mut map = parse_json_object_body(body, "ve-tos data-process set-image-style-separator")?;
     if let Some(legacy) = map.remove("Separators") {
         if map.contains_key("Separator") {
-            return Err(CliError::ValidationError(
-                "ve-tos data-process set-image-style-separator cannot use both Separator and Separators"
-                    .into(),
-            ));
+            return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos data-process set-image-style-separator cannot use both Separator and Separators")));
         }
         // [Review Fix #ImageStyleSeparator] Older tests used the SDK-internal
         // map shape. The service schema is Separator: []string, so convert that
@@ -2240,9 +2304,7 @@ fn image_style_separator_body(body: Vec<u8>) -> Result<Vec<u8>, CliError> {
             Value::Object(entries) => entries.keys().cloned().map(Value::String).collect(),
             Value::Array(items) => items,
             _ => {
-                return Err(CliError::ValidationError(
-                    "ve-tos data-process set-image-style-separator requires Separators to be an object or array".into(),
-                ))
+                return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos data-process set-image-style-separator requires Separators to be an object or array")))
             }
         };
         map.insert("Separator".to_string(), Value::Array(separators));
@@ -2269,13 +2331,12 @@ fn image_style_separator_body(body: Vec<u8>) -> Result<Vec<u8>, CliError> {
 fn data_process_template_body(body: Vec<u8>) -> Result<Vec<u8>, CliError> {
     let mut map = parse_json_object_body(body, "ve-tos data-process set-template")?;
     let tag = map.get("Tag").and_then(Value::as_str).ok_or_else(|| {
-        CliError::ValidationError("ve-tos data-process set-template requires Tag".into())
+        CliError::ValidationError(crate::handler::common::public_tos_template(
+            "ve-tos data-process set-template requires Tag",
+        ))
     })?;
     if !matches!(tag, "Transcode" | "AudioConvert" | "Watermark") {
-        return Err(CliError::ValidationError(
-            "ve-tos data-process set-template requires Tag to be Transcode, AudioConvert, or Watermark"
-                .into(),
-        ));
+        return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos data-process set-template requires Tag to be Transcode, AudioConvert, or Watermark")));
     }
     if tag == "Transcode" {
         if !map.contains_key("TranscodeConfig") {
@@ -2290,10 +2351,7 @@ fn data_process_template_body(body: Vec<u8>) -> Result<Vec<u8>, CliError> {
         match map.get("TranscodeConfig") {
             Some(Value::Object(_)) => {}
             _ => {
-                return Err(CliError::ValidationError(
-                    "ve-tos data-process set-template requires TranscodeConfig object when Tag=Transcode"
-                        .into(),
-                ));
+                return Err(CliError::ValidationError(crate::handler::common::public_tos_template("ve-tos data-process set-template requires TranscodeConfig object when Tag=Transcode")));
             }
         }
     }
@@ -2303,7 +2361,8 @@ fn data_process_template_body(body: Vec<u8>) -> Result<Vec<u8>, CliError> {
 fn data_process_template_tag(body: &[u8]) -> Result<String, CliError> {
     let json_body: Value = serde_json::from_slice(body).map_err(|err| {
         CliError::ValidationError(format!(
-            "ve-tos data-process set-template request body must be valid JSON: {err}"
+            "{} data-process set-template request body must be valid JSON: {err}",
+            crate::handler::common::public_tos_template("ve-tos")
         ))
     })?;
     json_body
@@ -2311,7 +2370,9 @@ fn data_process_template_tag(body: &[u8]) -> Result<String, CliError> {
         .and_then(Value::as_str)
         .map(ToString::to_string)
         .ok_or_else(|| {
-            CliError::ValidationError("ve-tos data-process set-template requires Tag".into())
+            CliError::ValidationError(crate::handler::common::public_tos_template(
+                "ve-tos data-process set-template requires Tag",
+            ))
         })
 }
 
@@ -2335,6 +2396,7 @@ fn validate_string_array_field(
     required: bool,
     command: &str,
 ) -> Result<(), CliError> {
+    let command = crate::handler::common::public_tos_template(command);
     let Some(value) = map.get(field) else {
         if required {
             return Err(CliError::ValidationError(format!(
@@ -2361,6 +2423,7 @@ fn validate_string_map_field(
     field: &str,
     command: &str,
 ) -> Result<(), CliError> {
+    let command = crate::handler::common::public_tos_template(command);
     let Some(value) = map.get(field) else {
         return Ok(());
     };
@@ -2384,12 +2447,14 @@ fn accelerator_create_body(
 ) -> Result<Vec<u8>, CliError> {
     let mut json_body: Value = serde_json::from_slice(&body).map_err(|err| {
         CliError::ValidationError(format!(
-            "ve-tos accelerator create request body must be valid JSON: {err}"
+            "{} accelerator create request body must be valid JSON: {err}",
+            crate::handler::common::public_tos_template("ve-tos")
         ))
     })?;
     let Value::Object(map) = &mut json_body else {
         return Err(CliError::ValidationError(format!(
-            "ve-tos accelerator create request body must be a JSON object"
+            "{} accelerator create request body must be a JSON object",
+            crate::handler::common::public_tos_template("ve-tos")
         )));
     };
     insert_or_validate_json_string(map, "Region", region)?;
@@ -2408,9 +2473,7 @@ fn insert_or_validate_json_string(
 ) -> Result<(), CliError> {
     match map.get(field).and_then(Value::as_str) {
         Some(existing) if existing == value => Ok(()),
-        Some(existing) => Err(CliError::ValidationError(format!(
-            "ve-tos accelerator create has conflicting {field}: --config uses `{existing}` but CLI/profile resolves `{value}`"
-        ))),
+        Some(existing) => Err(CliError::ValidationError(format!("{} accelerator create has conflicting {field}: --config uses `{existing}` but CLI/profile resolves `{value}`", crate::handler::common::public_tos_template("ve-tos")))),
         None => {
             map.insert(field.to_string(), Value::String(value.to_string()));
             Ok(())
@@ -2459,6 +2522,14 @@ fn source_value<'a>(
             "--job-id/--id",
             args.job_id.as_deref().or(args.id.as_deref()),
         ),
+        // [Review Fix #AdvancedJobSelectors] Preserve the established --query escape hatch.
+        Source::JobType => (
+            "--job-type",
+            args.job_type
+                .as_deref()
+                .or_else(|| query_value(args, "job_type")),
+        ),
+        Source::Uri => ("--query uri=...", query_value(args, "uri")),
         Source::Alias => ("--alias", args.alias.as_deref()),
         Source::Accelerator => ("--accelerator", args.accelerator.as_deref()),
         Source::AcceleratorId => ("--accelerator-id", args.accelerator_id.as_deref()),
@@ -2473,6 +2544,74 @@ fn source_value<'a>(
         Source::Object => ("--object", args.object.as_deref()),
     };
     value.ok_or_else(|| CliError::ValidationError(format!("missing required {name}")))
+}
+
+// [Review Fix #AdvancedProtocolValidation] Check final values after --query overrides.
+fn validate_protocol_query(
+    spec: &AdvancedSpec,
+    query: &BTreeMap<String, String>,
+) -> Result<(), CliError> {
+    for selector in ["job_type", "job_id", "ObjectSetName", "datasetname", "uri"] {
+        let is_required = spec
+            .query
+            .iter()
+            .any(|item| matches!(item, QuerySpec::Param(name, _) if *name == selector));
+        if is_required
+            && query
+                .get(selector)
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(CliError::ValidationError(format!(
+                "missing nonempty required query parameter {selector}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+// [Review Fix #AdvancedQueryCompatibility] Limit fallback to the corrected selectors.
+fn protocol_parameter_value<'a>(
+    name: &str,
+    source: Source,
+    args: &'a GenericArgs,
+    region_fallback: Option<&'a str>,
+) -> Result<&'a str, CliError> {
+    source_value(source, args, region_fallback).or_else(|error| {
+        if matches!(
+            name,
+            "job_type" | "job_id" | "ObjectSetName" | "datasetname" | "uri"
+        ) {
+            query_value(args, name).ok_or(error)
+        } else {
+            Err(error)
+        }
+    })
+}
+
+// [Review Fix #DatasetBindingSelectors] Match append_kv_pairs's last-value semantics.
+fn query_value<'a>(args: &'a GenericArgs, name: &str) -> Option<&'a str> {
+    args.query.iter().rev().find_map(|pair| {
+        pair.split_once('=')
+            .filter(|(key, _)| *key == name)
+            .map(|(_, value)| value)
+    })
+}
+
+// [Review Fix #DatasetBindingBody] Reject missing, mistyped, or empty DELETE selectors.
+fn dataset_binding_delete_body(body: Vec<u8>) -> Result<Vec<u8>, CliError> {
+    let selectors = parse_json_object_body(body, "ve-tos dataset delete-binding")?;
+    for field in ["DatasetName", "URI"] {
+        if selectors
+            .get(field)
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(CliError::ValidationError(format!(
+                "dataset delete-binding requires nonempty string {field} in --config"
+            )));
+        }
+    }
+    serialize_json_object_body(selectors)
 }
 
 fn append_kv_pairs(
@@ -2594,12 +2733,6 @@ fn parameters(spec: &AdvancedSpec) -> Vec<CommandParameter> {
                 ParameterLocation::Query,
                 true,
                 "Documented query parameter",
-            )),
-            QuerySpec::Key(_) => params.push(parameter(
-                "object-set-name",
-                ParameterLocation::Query,
-                true,
-                "Object set name as query key",
             )),
         }
     }
@@ -3164,5 +3297,186 @@ mod tests {
             err.to_string().contains("TemplateId"),
             "unexpected error: {err}"
         );
+    }
+
+    // [Review Fix #AdvancedProtocol] Regressions cover selectors before transport.
+    #[test]
+    fn protocol_job_actions_send_job_type_values() {
+        for make_action in [
+            DataProcessAction::CreateAuditJob as fn(GenericArgs) -> DataProcessAction,
+            DataProcessAction::CreateDocJob,
+            DataProcessAction::CreateFileJob,
+            DataProcessAction::CreateMediaJob,
+            DataProcessAction::ListJobs,
+        ] {
+            let mut args = generic_args();
+            args.bucket = Some("demo-bucket".into());
+            args.job_type = Some("Transcode".into());
+            let operation =
+                data_process_operation(&make_action(args), None).expect("job operation");
+            assert_eq!(operation.query["job_type"], "Transcode");
+        }
+    }
+
+    #[test]
+    fn protocol_get_job_accepts_job_id_and_legacy_id() {
+        for (job_id, id, expected) in [
+            (Some("job-1"), None, "job-1"),
+            (None, Some("legacy-1"), "legacy-1"),
+            (Some("job-1"), Some("legacy-1"), "job-1"),
+        ] {
+            let mut args = generic_args();
+            args.bucket = Some("demo-bucket".into());
+            args.job_type = Some("Transcode".into());
+            args.job_id = job_id.map(str::to_string);
+            args.id = id.map(str::to_string);
+            let operation = data_process_operation(&DataProcessAction::GetJob(args), None)
+                .expect("get job operation");
+            assert_eq!(operation.query["job_type"], "Transcode");
+            assert_eq!(operation.query["job_id"], expected);
+        }
+    }
+
+    #[test]
+    fn protocol_jobs_require_nonempty_job_type() {
+        for job_type in [None, Some(""), Some("   ")] {
+            let mut args = generic_args();
+            args.bucket = Some("demo-bucket".into());
+            args.job_type = job_type.map(str::to_string);
+            assert!(data_process_operation(&DataProcessAction::ListJobs(args), None).is_err());
+        }
+    }
+
+    #[test]
+    fn protocol_object_set_actions_send_named_selector() {
+        for make_action in [
+            ObjectSetAction::Get as fn(GenericArgs) -> ObjectSetAction,
+            ObjectSetAction::Delete,
+            ObjectSetAction::GetEndpoint,
+            ObjectSetAction::GetQuota,
+            ObjectSetAction::GetStorage,
+            ObjectSetAction::GetTagging,
+            ObjectSetAction::SetQuota,
+            ObjectSetAction::GetLifecycle,
+            ObjectSetAction::SetLifecycle,
+            ObjectSetAction::DeleteLifecycle,
+        ] {
+            let mut args = generic_args();
+            args.bucket = Some("demo-bucket".into());
+            args.object_set_name = Some("images/a &b/".into());
+            let operation =
+                object_set_operation(&make_action(args), None).expect("object set operation");
+            assert_eq!(operation.query["ObjectSetName"], "images/a &b/");
+            assert!(!operation.query.contains_key("images/a &b/"));
+        }
+    }
+
+    #[test]
+    fn protocol_object_set_requires_selector() {
+        let mut args = generic_args();
+        args.bucket = Some("demo-bucket".into());
+        assert!(object_set_operation(&ObjectSetAction::Get(args), None).is_err());
+    }
+
+    #[test]
+    fn protocol_dataset_binding_get_and_list_send_dataset_name() {
+        let mut args = generic_args();
+        args.name = Some("dataset_one".into());
+        args.query = vec!["uri=tos://demo-bucket/images/?x=1&y=2".into()];
+        let get = dataset_operation(&DatasetAction::GetBinding(args), None)
+            .expect("get binding operation");
+        assert_eq!(get.query["datasetname"], "dataset_one");
+        assert_eq!(get.query["uri"], "tos://demo-bucket/images/?x=1&y=2");
+        let mut args = generic_args();
+        args.name = Some("dataset_one".into());
+        let list = dataset_operation(&DatasetAction::ListBindings(args), None)
+            .expect("list binding operation");
+        assert_eq!(list.query["datasetname"], "dataset_one");
+    }
+
+    #[test]
+    fn protocol_dataset_get_binding_requires_uri() {
+        let mut args = generic_args();
+        args.name = Some("dataset_one".into());
+        assert!(dataset_operation(&DatasetAction::GetBinding(args), None).is_err());
+    }
+
+    #[test]
+    fn protocol_dataset_delete_binding_keeps_and_validates_body() {
+        let mut args = generic_args();
+        args.config =
+            Some(r#"{"DatasetName":"dataset_one","URI":"tos://demo-bucket/images/"}"#.into());
+        let operation = dataset_operation(&DatasetAction::DeleteBinding(args), None)
+            .expect("delete binding operation");
+        let body: Value =
+            serde_json::from_slice(operation.body.as_ref().expect("body")).expect("JSON body");
+        assert_eq!(body["DatasetName"], "dataset_one");
+        assert_eq!(body["URI"], "tos://demo-bucket/images/");
+        for config in [
+            None,
+            Some("{}"),
+            Some("[]"),
+            Some("not-json"),
+            Some(r#"{"DatasetName":"dataset_one","URI":""}"#),
+        ] {
+            let mut args = generic_args();
+            args.config = config.map(str::to_string);
+            assert!(dataset_operation(&DatasetAction::DeleteBinding(args), None).is_err());
+        }
+    }
+
+    #[test]
+    fn protocol_describe_and_dryrun_match_query_contract() {
+        let mut args = generic_args();
+        args.bucket = Some("demo-bucket".into());
+        args.object_set_name = Some("images/".into());
+        let operation = object_set_operation(&ObjectSetAction::GetLifecycle(args), None)
+            .expect("lifecycle operation");
+        let description = describe_action(&operation);
+        let parameters = description.parameters.expect("parameters");
+        assert!(parameters
+            .iter()
+            .any(|parameter| parameter.name == "ObjectSetName" && parameter.required));
+        let plan = dry_run(&operation).plan.join("\n");
+        assert!(plan.contains(r#""ObjectSetName":"images/""#));
+    }
+
+    #[test]
+    fn protocol_preserves_query_only_selectors() {
+        let mut args = generic_args();
+        args.bucket = Some("demo-bucket".into());
+        args.query = vec!["ObjectSetName=images/".into()];
+        let operation = object_set_operation(&ObjectSetAction::Get(args), None)
+            .expect("query-only object set selector");
+        assert_eq!(operation.query["ObjectSetName"], "images/");
+
+        let mut args = generic_args();
+        args.query = vec![
+            "datasetname=dataset_one".into(),
+            "uri=tos://demo-bucket/images/".into(),
+        ];
+        let operation = dataset_operation(&DatasetAction::GetBinding(args), None)
+            .expect("query-only binding selectors");
+        assert_eq!(operation.query["datasetname"], "dataset_one");
+
+        let mut args = generic_args();
+        args.bucket = Some("demo-bucket".into());
+        args.query = vec!["job_type=Transcode".into()];
+        let operation = data_process_operation(&DataProcessAction::ListJobs(args), None)
+            .expect("query-only job type");
+        assert_eq!(operation.query["job_type"], "Transcode");
+    }
+
+    #[test]
+    fn protocol_rejects_empty_selector_overrides() {
+        let mut args = generic_args();
+        args.bucket = Some("demo-bucket".into());
+        args.job_type = Some("Transcode".into());
+        args.query = vec!["job_type=".into()];
+        assert!(data_process_operation(&DataProcessAction::ListJobs(args), None).is_err());
+        let mut args = generic_args();
+        args.name = Some("dataset_one".into());
+        args.query = vec!["uri=tos://demo-bucket/".into(), "uri= ".into()];
+        assert!(dataset_operation(&DatasetAction::GetBinding(args), None).is_err());
     }
 }

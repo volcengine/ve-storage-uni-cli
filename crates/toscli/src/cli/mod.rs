@@ -221,7 +221,6 @@ pub fn print_grouped_help() {
 
 Usage:
   tos-cli <command> [options]
-  ve-storage-uni-cli tos <command> [options]
 
 High-Level Commands:
   cp            Copy local files, TOS objects, or prefixes
@@ -306,14 +305,5 @@ Run 'tos-cli doctor' for environment diagnostics.
 fn contextualized_grouped_help(help: &str) -> String {
     let prefix =
         std::env::var(TOS_CLI_EXAMPLE_PREFIX_ENV).unwrap_or_else(|_| "tos-cli".to_string());
-    if prefix == "tos-cli" {
-        return help.to_string();
-    }
-    help.replace(
-        "  tos-cli <command> [options]\n  ve-storage-uni-cli tos <command> [options]",
-        "  __TOS_PRIMARY__ <command> [options]\n  __TOS_SECONDARY__ <command> [options]",
-    )
-    .replace("tos-cli ", &format!("{prefix} "))
-    .replace("__TOS_PRIMARY__", &prefix)
-    .replace("__TOS_SECONDARY__", "tos-cli")
+    help.replace("tos-cli ", &format!("{prefix} "))
 }

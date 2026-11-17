@@ -14,8 +14,13 @@
  * limitations under the License.
  */
 
+/// Version of the `ve-adrive-cli` core package.
+pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+mod chunk_metadata;
 pub mod cli;
 pub mod domain;
+mod file_metadata;
 pub mod handler;
 pub mod registry;
 

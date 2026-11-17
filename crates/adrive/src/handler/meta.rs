@@ -24,6 +24,9 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
+use tos_core::agent::command_display::{
+    invocation_prefix, render_template, render_template_with_prefix,
+};
 use tos_core::agent::dryrun::{DryRunResult, Impact};
 use tos_core::agent::envelope::Envelope;
 use tos_core::agent::error::CliError;
@@ -104,6 +107,34 @@ const ADRIVE_DEFAULT_BATCH_REPORT_DIR: &str = "~/.tos/reports/ve-adrive";
 
 // Exact owner catalog: identifiers inside each full phrase remain unchanged.
 const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    (crate::cli::high_level::USERMETA_HELP, "用户元数据使用 key=value#key2=value2 或字符串值 JSON 对象。键仅接受 ASCII 字母、数字、连字符、下划线，忽略大小写，ids-* 为保留字段。空值会被存储，不表示删除。容量由服务端校验。cp 仅对本地上传文件生效，不修改目录标记，不支持远端源。"),
+    ("Incrementally update file user metadata", "增量更新文件用户元数据"),
+    ("Exact file URI: adrive://instance/space/path", "精确文件 URI：adrive://instance/space/path"),
+    ("Resolve Instance and Space names to IDs", "将实例和 Space 名称解析为 ID"),
+    ("Incrementally set user metadata; omitted keys are preserved", "增量设置用户元数据；保留未指定的键"),
+    ("User metadata for local uploads: key=value#key2=value2 or JSON; directory markers are unchanged", "本地上传用户元数据：key=value#key2=value2 或 JSON；不修改目录标记"),
+    ("User metadata: key=value#key2=value2 or a JSON object of strings", "用户元数据：key=value#key2=value2 或字符串值 JSON 对象"),
+    ("requires one adrive://instance/space/file URI; --by-name resolves instance/space names to IDs before execution", "需要一个 adrive://instance/space/file URI；--by-name 在执行前将实例和 Space 名称解析为 ID"),
+    ("incremental Meta patch: omitted keys remain, empty strings retain keys, file content is unchanged", "增量更新 Meta：保留未指定的键，空字符串保留该键，文件内容不变"),
+    // [Review Fix #GroupSpaceDocs2] Localize the shared source used by ls help and registry metadata.
+    (crate::cli::high_level::GROUP_SPACE_LISTING_HELP, "OAuth Space 集合：user（默认）或 group。OAuth group 列举将 RootSpace 合入 data.spaces，按 SpaceID 去重并置顶；每行增加 is_root，root 计入 --max-keys；一旦通过 RootSpace 识别，沿 CLI 续页游标翻页时只返回一次，包括 --max-keys 1。若 RootSpace 首次出现前，同 ID 已在此前逻辑页作为普通 Space 返回，无法追溯重分类。未返回 RootSpace 时正常列举其他 Space。JSON/YAML/XML 保留真实 owner_type；未使用 --query 的 table/CSV/Markdown 将 root 行的 owner_type 显示为小写 root，普通行保持原值。data.root_space 保留兼容，统计与清单仅使用合并去重后的 data.spaces，不要另加 root。CLI group 游标记录 root 已返回状态、服务端 marker 和部分页重放位置；游标不含凭据，必须原样用于同一 Instance 和 owner 集合，不可解析、拼接、修改或跨集合复用。仍接受旧 raw 服务 marker；新分页请使用 CLI 返回的 data.next_marker。列举不是快照；其他鉴权模式、user 集合和 AK/SK 分页保持原行为。"),
+    ("File core APIs", "文件核心 API"),
+    ("Search and read document chunks", "检索和读取文档片段"),
+    ("Search document chunks in a Space directory", "检索 Space 目录内的文档片段"),
+    ("Read indexed chunks of one file version", "读取指定文件版本的已索引片段"),
+    ("ADrive URI with Instance and Space IDs; conflicts with explicit selectors", "包含实例 ID 和 Space ID 的 ADrive URI；不能与显式选择器混用"),
+    ("Instance ID; required with explicit selectors", "实例 ID；使用显式选择器时必填"),
+    ("Space ID; required with explicit selectors", "Space ID；使用显式选择器时必填"),
+    ("Directory inside the Space; defaults to the root", "Space 内的目录；默认根目录"),
+    ("Search text; nonempty after trimming, at most 100 UTF-8 bytes", "检索文本；去除首尾空白后非空，最多 100 个 UTF-8 字节"),
+    ("Maximum returned chunks, 1 through 100", "返回片段数上限，范围 1～100"),
+    ("Search only direct children; by default include subdirectories", "只检索直接子文件；默认包含子目录"),
+    ("Exact file path inside the Space", "Space 内的精确文件路径"),
+    ("File version from the same search hit, passed back unchanged", "同一条检索命中的文件版本，原样传回"),
+    ("Comma-separated nonnegative chunk ordinals, at most 20 without duplicates", "逗号分隔的非负片号，最多 20 个且不重复"),
+    ("Inclusive ordinal range START-END, at most 20 chunks", "片号闭区间 START-END，最多 20 片"),
+    (crate::cli::chunk::CHUNK_HELP, "在一个 Space 内检索和读取已索引文档片段。需要当前 OAuth 用户和 file:read 权限；不切换身份或修改索引。空结果不代表索引就绪。--text 为检索文本；全局 --query 仍是 JMESPath 输出过滤器。"),
+    (crate::cli::chunk::CHUNK_READ_HELP, "使用同一条命中的实例、Space、FilePath、ETag 和片号。--ordinals 与 --range 二选一（闭区间），最多 20 个非负片号。旧版本可能返回 404，请重新检索，不替换版本。ChunkTruncated 表示源文档未完整索引，扩读相邻片段不能恢复未索引内容。"),
     // [Review Fix #ShareTransferDocs2] Help rendering translates blank-line paragraphs independently.
     ("The OS resolves user-selected destination and checkpoint directory aliases before the CLI pins them; downloaded subpaths reject traversal, symlinks/reparse points and case/Unicode or file/directory collisions with Conflict (exit 9). Resume compares resolved roots and verifies completed local sizes/digests; changes fail with Conflict. No --path selects all shared roots; a single-file share is selected automatically, while folders require --recursive. Directory contents map like cp by default; --include-parent retains the selected directory name. Multiple roots with colliding contents fail safely; use --include-parent to preserve distinct root names instead of guessing new names. --include and --exclude match cp relative source paths. Default parallelism is 16 files, 4 directory listings and 4 ranges per file; --batch-concurrency, --list-concurrency and --multipart-concurrency override these positive values.", "操作系统先解析用户指定的目标目录及 checkpoint 目录别名，再固定实际根目录；下载子路径拒绝穿越、符号链接/reparse 点、大小写及 Unicode 或文件/目录冲突，返回 Conflict（退出码 9）。恢复时比较解析后的根目录，并验证已完成本地文件大小和摘要；变化时返回 Conflict。不传 --path 时选择全部分享根；单文件自动选中，目录需要 --recursive。默认与 cp 一样复制目录内容；--include-parent 保留选中目录名。整 Space 分享省略 --path 或使用 --path / 时选择整个 Space，且需要 --recursive；保留完整空间相对层级。Space 根没有 basename，因此 --include-parent 不增加包装目录；选中子目录时仍遵循 cp 布局。多个根目录的内容同名时安全拒绝；用 --include-parent 保留不同根目录名，不猜测重命名。--include 和 --exclude 按 cp 的源相对路径匹配。默认并发为 16 个文件、4 个目录列举和每文件 4 个 Range；--batch-concurrency、--list-concurrency 和 --multipart-concurrency 可用正整数覆盖。"),
     ("Overwrite defaults to force, matching cp. --force and legacy --overwrite select force; --no-clobber skips existing ordinary files, and --overwrite-strategy newer replaces only older destinations. Replacements publish only after verification. --checkpoint [FILE] enables recovery; a bare flag uses a stable task path under ~/.tos/checkpoints/ve-adrive, --checkpoint-dir overrides that directory, and FILE preserves the legacy explicit path. --resume uses the saved selection and policy, revalidates completed files and restores verified partial ranges. Keep selection, filters, layout and overwrite policy unchanged; old checkpoints with the directory-name layout need --include-parent. New remote files are not added during resume. Keep the checkpoint JSON together with its .completed/ completion-ledger directory and .parts/ directory when retaining or moving recovery state; completed entries in the main JSON are not updated after every file.", "覆盖策略默认 force，与 cp 一致。--force 和兼容的 --overwrite 选择 force；--no-clobber 跳过已有普通文件，--overwrite-strategy newer 仅替换较旧目标。校验完成后才发布替换文件。--checkpoint [FILE] 启用恢复；裸参数使用 ~/.tos/checkpoints/ve-adrive 下的稳定任务路径，--checkpoint-dir 覆盖目录，FILE 保留旧显式路径写法。--resume 使用保存的选择和策略，重新验证已完成文件，并恢复已验证的部分 Range。选择、过滤、目录布局和覆盖策略须保持一致；保留目录名布局的旧 checkpoint 需使用 --include-parent。恢复不加入新增远端文件。保存或迁移恢复状态时须同时保留 checkpoint JSON、.completed/ 增量账本目录和 .parts/ 目录；主 JSON 的 completed 不会逐文件实时更新。"),
@@ -137,7 +168,6 @@ const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Path to config TOML", "配置 TOML 路径"),
     ("Path to credentials TOML", "凭据 TOML 路径"),
     ("Confirm share cancellation", "确认分享取消操作"),
-    ("Share Links:", "分享链接："),
 
     // [Review Fix #ShareReviewDocs] Translate the planning/input contract instead of falling back to English.
     (crate::cli::share::SHARE_DRY_RUN_HELP, "Download --dry-run 仅通过只读分享 info/token/list/get 元数据请求，枚举全部选中分页和递归目录，或验证保存的恢复快照及已完成本地文件摘要。返回 selection.Manifest、PlanComplete=true、FileCount、DirectoryCount、TotalBytes、SkippedCount、Conflicts，以及预计 report_path、manifest_path、checkpoint_path。完整计划有本地冲突时退出 9，并保留计划。DownloadsIssued=0、LocalWrites=false：不签发下载 URL、不取内容、不创建目录或临时文件，不写 checkpoint、锁、report 或 manifest。MetadataResponses 统计收到的元数据响应；未统计网络尝试次数，因此 NetworkRequests=null。SnapshotGuaranteed=false：检查后远端内容和本地路径仍可能变化。文件大小缺失或为负数时校验失败（退出码 6）；显式 0 是有效空文件。OAuth 预演禁用自动刷新，避免凭据及认证锁写入。token 已过期、距到期 60 秒内或收到 401 时，先正常执行 ve-adrive --profile <profile> share inspect <share-url> --auth-mode oauth 刷新，再重试。规划不获取 checkpoint 锁；已有普通锁文件可能正被使用。实际执行会重新检查并加锁。"),
@@ -347,7 +377,7 @@ const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Inspect authentication status or manage OAuth. Unified uses the same-name external profile, ignores local AK/SK and OAuth credentials, and delegates login/logout to `ve login` / `ve logout`", "查看鉴权状态或管理 OAuth。Unified 使用同名外部 profile，忽略本地 AK/SK 和 OAuth 凭证，并将登录/登出交由 `ve login` / `ve logout`"),
     ("Per-invocation override: --auth-mode <MODE>; supported values are aksk, oauth, or unified. ADRIVE_AUTH_MODE supplies the environment value", "单次调用覆盖：--auth-mode <MODE>；支持值为 aksk、oauth 或 unified。环境变量由 ADRIVE_AUTH_MODE 提供"),
     ("Authentication action: status (default), login, or logout", "鉴权操作：status（默认）、login 或 logout"),
-    ("OAuth login Instance; required unless the selected profile or ADRIVE_DEFAULT_INSTANCE supplies it", "OAuth 登录 Instance；除非所选 profile 或 ADRIVE_DEFAULT_INSTANCE 已提供，否则必填"),
+    ("Optional OAuth login Instance; overrides the selected profile and ADRIVE_DEFAULT_INSTANCE, otherwise the authorization server selects it", "可选的 OAuth 登录 Instance；覆盖所选 profile 和 ADRIVE_DEFAULT_INSTANCE，未设置时由授权服务器选择"),
     ("OAuth Authorization Server for login; defaults to the effective endpoint after command/profile/environment Auth overrides", "OAuth 登录授权服务器；优先使用命令行、profile 和认证环境变量，未设置时回退到有效 endpoint"),
     ("Human-readable device name shown during OAuth authorization", "OAuth 授权期间显示的人类可读设备名称"),
     ("Unified uses the same-name external profile, ignores local AK/SK and OAuth credentials, and delegates login/logout to `ve login` / `ve logout`", "Unified 使用同名外部 profile，忽略本地 AK/SK 和 OAuth 凭证，并将登录/登出交由 `ve login` / `ve logout`"),
@@ -380,7 +410,9 @@ const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("execution stderr; auto-enabled on TTY, disabled by --no-progress or --quiet, forced by --progress", "执行进度输出到 stderr；TTY 上自动启用，--no-progress 或 --quiet 禁用，--progress 强制启用"),
     ("listing stderr; auto-enabled on TTY, disabled by --no-list-echo or --quiet, forced by --list-echo", "列举回显输出到 stderr；TTY 上自动启用，--no-list-echo 或 --quiet 禁用，--list-echo 强制启用"),
     ("stable task fingerprint plus atomic lock when the command supports checkpoint state", "命令支持 checkpoint 状态时使用稳定任务指纹和原子锁"),
-    ("ADrive Low-Level CLI is not implemented; High-Level commands wrap IDS API actions directly", "ADrive Low-Level CLI 尚未实现；High-Level 命令直接封装 IDS API 操作"),
+    ("Low-Level commands expose document Chunk APIs; raw API execution remains unimplemented", "低阶命令提供文档 Chunk API；原始 API 执行仍未实现"),
+    ("Document chunk API operations", "文档片段 API 操作"),
+    ("File management and share-link workflows with URI and flag targets", "支持 URI 和显式选择器的文件管理及分享工作流"),
     ("Quote ADrive paths that contain spaces or shell metacharacters: ve-adrive cp 'adrive://inst/space/path with space.txt' ./out.txt", "包含空格或 shell 元字符的 ADrive 路径需要加引号：ve-adrive cp 'adrive://inst/space/path with space.txt' ./out.txt"),
     ("JMESPath literals inside --query use backticks; keep the expression inside single quotes in POSIX shells.", "--query 内的 JMESPath 字面量使用反引号；在 POSIX shell 中请将表达式放在单引号内。"),
     ("Use --output json when piping ADrive output into jq or another parser.", "将 ADrive 输出通过管道传给 jq 或其他解析器时，请使用 --output json。"),
@@ -403,7 +435,7 @@ const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("serve uses the same live registry data but does not read the exported Markdown skill directory", "serve 使用相同的 live registry 数据，但不读取导出的 Markdown Skill 目录"),
     // [Review Fix #ADriveZh5] Root/config/raw Describe and Skill usage prose
     // lives outside capability rows but must share the exact owner catalog.
-    ("ADrive CLI high-level file operations and agent utilities", "ADrive CLI 高层文件操作与 Agent 工具"),
+    ("ADrive CLI file workflows, share links, document Chunk APIs and agent utilities", "ADrive CLI 文件工作流、分享链接、文档 Chunk API 与 Agent 工具"),
     ("File management operations with adrive:// URI and flag targets", "使用 adrive:// URI 和 flags 目标的文件管理操作"),
     ("Discovery, configuration, diagnostics, completion, skill, API passthrough, and MCP utilities", "发现、配置、诊断、补全、Skill、API passthrough 和 MCP 工具"),
     ("Guarded ADrive utility API planning; direct raw execution is not implemented yet", "受保护的 ADrive 工具 API 规划；暂不支持直接执行原始 API"),
@@ -434,6 +466,7 @@ const ADRIVE_HIGH_LEVEL_SEMANTICS: &[(&str, &[&str])] = &[
             "adrive://instance/space/path -> local path downloads with get_file and atomic local persist",
             "adrive://instance/space/path -> adrive://instance/space/path copies with copy_file where service-side copy is available",
             "recursive transfers enumerate folders first and honor include/exclude filters",
+            crate::cli::high_level::USERMETA_HELP,
         ],
     ),
     (
@@ -500,7 +533,7 @@ const ADRIVE_HIGH_LEVEL_SEMANTICS: &[(&str, &[&str])] = &[
         &["adrive://instance/space/folder -> read-only list_files traversal filtered by name, size, and mtime"],
     ),
     ("cat", &["adrive://instance/space/file -> get_file body streamed to stdout"]),
-    ("put", &["stdin -> adrive://instance/space/file upload; multipart is used above the configured threshold"]),
+    ("put", &["stdin -> adrive://instance/space/file upload; multipart is used above the configured threshold", crate::cli::high_level::USERMETA_HELP]),
     (
         "mkdir",
         &["adrive://instance/space/folder -> create_folder; --parents creates missing parent folders as needed"],
@@ -705,6 +738,12 @@ fn capability_group_rows(rows: &[CapabilityRow]) -> Vec<Value> {
             "high-level",
             "ve-adrive",
             "File management operations with adrive:// URI support",
+        ),
+        (
+            "Low-Level Commands",
+            "low-level",
+            "ve-adrive chunk",
+            "Document chunk API operations",
         ),
         (
             "Capabilities / Utilities",
@@ -1019,14 +1058,16 @@ fn skill_definitions() -> Vec<SkillDefinition> {
 
 fn skill_definitions_for_language(language: DocumentationLanguage) -> Vec<SkillDefinition> {
     let mut definitions = skill_definitions();
-    if matches!(language, DocumentationLanguage::Zh) {
-        for definition in &mut definitions {
+    for definition in &mut definitions {
+        if matches!(language, DocumentationLanguage::Zh) {
             definition.description = localized_skill_description_zh(definition);
             definition.input_schema = localized_input_schema(&definition.input_schema, language);
             // [Review Fix #ADriveZh6] Skill usage is human-facing metadata too;
             // localizing only descriptions and schemas leaves Chinese output mixed.
             definition.usage = localized_skill_usage_zh(&definition.usage);
         }
+        definition.description = render_template(&definition.description, "ve-adrive");
+        render_adrive_documentation(&mut definition.input_schema);
     }
     definitions
 }
@@ -1053,10 +1094,12 @@ fn localized_skill_description_zh(skill: &SkillDefinition) -> String {
 }
 
 fn localized_input_schema(schema: &Value, language: DocumentationLanguage) -> Value {
-    match language {
+    let mut localized = match language {
         DocumentationLanguage::En => schema.clone(),
         DocumentationLanguage::Zh => localize_schema_descriptions_zh(schema),
-    }
+    };
+    render_adrive_documentation(&mut localized);
+    localized
 }
 
 fn localize_schema_descriptions_zh(value: &Value) -> Value {
@@ -1108,6 +1151,81 @@ enum ADriveMetadataContext {
 /// owner catalog.
 pub fn localize_adrive_auth_documentation_zh(value: &mut Value) {
     localize_adrive_metadata_value_zh(value, ADriveMetadataContext::Structured);
+}
+
+/// Render trusted ADrive documentation after localization for the active entrypoint.
+/// Preserves command IDs, schema literals and completion registrations.
+/// The caller must supply CLI-owned metadata, never upstream or user-owned content.
+pub fn render_adrive_documentation(value: &mut Value) {
+    let is_schema = value.get("properties").is_some();
+    render_adrive_metadata(
+        value,
+        ADriveMetadataContext::Structured,
+        is_schema,
+        &invocation_prefix("ve-adrive"),
+    );
+}
+
+fn render_adrive_metadata(
+    value: &mut Value,
+    context: ADriveMetadataContext,
+    is_schema: bool,
+    prefix: &str,
+) {
+    // [Review Fix #CommandDisplay3] Reuse the catalog's explicit prose contexts
+    // and protect schema literals instead of replacing a serialized payload.
+    if context == ADriveMetadataContext::Machine {
+        return;
+    }
+    match value {
+        Value::String(text) if context == ADriveMetadataContext::HumanText => {
+            *text = render_template_with_prefix(text, "ve-adrive", prefix);
+        }
+        Value::Array(items) => {
+            for item in items {
+                let item_context = adrive_array_item_context(context, item);
+                render_adrive_metadata(item, item_context, is_schema, prefix);
+            }
+        }
+        Value::Object(fields) => {
+            for (key, child) in fields {
+                if is_adrive_display_contract_field(key) || is_schema && key == "examples" {
+                    continue;
+                }
+                let child_is_schema =
+                    is_schema || matches!(key.as_str(), "schema" | "input_schema" | "inputSchema");
+                let child_context = adrive_child_metadata_context(context, key, child);
+                render_adrive_metadata(child, child_context, child_is_schema, prefix);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_adrive_display_contract_field(key: &str) -> bool {
+    matches!(
+        key,
+        "examples"
+            | "output_filter_examples"
+            | "related_commands"
+            | "actions"
+            | "default"
+            | "const"
+            | "enum"
+            | "registered_command_names"
+            | "mode_resolution"
+            | "script"
+            | "request"
+            | "request_plan"
+            | "headers"
+            | "query"
+            | "body"
+            | "payload"
+            | "config"
+            | "value"
+            | "values"
+            | "argv"
+    )
 }
 
 fn localize_adrive_metadata_value_zh(value: &mut Value, context: ADriveMetadataContext) {
@@ -1252,6 +1370,7 @@ fn public_capability_row(row: &CapabilityRow) -> Value {
         .iter()
         .map(|example| public_adrive_example(example))
         .collect::<Vec<_>>());
+    render_adrive_documentation(&mut value);
     value
 }
 
@@ -1266,12 +1385,13 @@ fn public_adrive_command(command: &str) -> String {
 }
 
 fn public_adrive_example(example: &str) -> String {
-    let prefix = adrive_example_prefix();
-    let with_public_pipeline = example
-        .replace(" | ve-adrive ", &format!(" | {prefix} "))
-        .replace("ve-adrive-cli ", &format!("{prefix} "))
-        .replace("ve-storage-uni-cli ve-adrive ", &format!("{prefix} "));
-    public_adrive_command(&with_public_pipeline)
+    // [Review Fix #CommandDisplay6] Keep canonical selector arguments intact;
+    // only executable command prefixes in a trusted pipeline are rendered.
+    example
+        .split(" | ")
+        .map(public_adrive_command)
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 fn adrive_example_prefix() -> String {
@@ -1298,7 +1418,9 @@ fn skill_input_schema(row: &CapabilityRow) -> Value {
         if row.command == "ve-adrive share view" && parameter.name == "raw" {
             continue;
         }
-        let mut schema = if row.command.starts_with("ve-adrive share ") {
+        let mut schema = if row.command.starts_with("ve-adrive chunk ") {
+            crate::chunk_metadata::parameter_schema(parameter.name)
+        } else if row.command.starts_with("ve-adrive share ") {
             crate::share_metadata::parameter_schema(row.command, parameter.name)
         } else {
             json!({"type":parameter_schema_type(parameter.name)})
@@ -1409,6 +1531,7 @@ fn is_boolean_parameter(name: &str) -> bool {
     matches!(
         name,
         "password-stdin"
+            | "no-recursive"
             | "checkpoint"
             | "overwrite"
             | "resume"
@@ -1614,6 +1737,7 @@ fn skill_index_markdown(
                 DocumentationLanguage::En => skill.description.clone(),
                 DocumentationLanguage::Zh => localized_skill_description_zh(skill),
             };
+            let description = render_template(&description, "ve-adrive");
             body.push_str(&format!(
                 "- [{}](./{}/{}/SKILL.md): `{}` - {}\n",
                 skill.name,
@@ -1650,6 +1774,7 @@ fn skill_markdown(
     } else {
         skill.description.clone()
     };
+    let description = render_template(&description, "ve-adrive");
     // [Review Fix #Skill2] Resolve every displayed command at export time;
     // canonical registry IDs and MCP names remain stable across entrypoints.
     let public_command = public_adrive_example(&skill.command);
@@ -1672,16 +1797,17 @@ fn skill_markdown(
         },
         root,
     );
-    markdown.push_str(&share_skill_semantics_markdown(skill, language));
+    markdown.push_str(&command_skill_semantics_markdown(skill, language));
     markdown
 }
 
-fn share_skill_semantics_markdown(
+fn command_skill_semantics_markdown(
     skill: &SkillDefinition,
     language: DocumentationLanguage,
 ) -> String {
     let Some(mut described) =
         crate::share_metadata::describe_share_command(&skill.internal_command)
+            .or_else(|| crate::chunk_metadata::describe(&skill.internal_command))
     else {
         return String::new();
     };
@@ -1689,6 +1815,7 @@ fn share_skill_semantics_markdown(
     if matches!(language, DocumentationLanguage::Zh) {
         localize_adrive_auth_documentation_zh(&mut described);
     }
+    render_adrive_documentation(&mut described);
     let lines = described["semantics"]
         .as_array()
         .into_iter()
@@ -1778,9 +1905,11 @@ pub async fn handle_config_command(
     }
 
     let Some(action) = &cmd.action else {
-        return Err(CliError::ValidationError(
-            "`ve-adrive config` requires a subcommand; use `ve-adrive config --help`".to_string(),
-        ));
+        // [Review Fix #CommandDisplay8] Resolve this CLI-owned instruction before any user values are interpolated.
+        return Err(CliError::ValidationError(render_template(
+            "`ve-adrive config` requires a subcommand; use `ve-adrive config --help`",
+            "ve-adrive",
+        )));
     };
 
     if global.dry_run {
@@ -2178,8 +2307,10 @@ fn handle_config_dry_run(global: &GlobalArgs, action: &ConfigAction) -> Result<i
                 } else {
                     vec![]
                 },
+                // [Review Fix #CommandDisplay9] Choose the executable separately from the real profile name.
                 confirm_command: Some(format!(
-                    "ve-adrive-cli config init --profile {}",
+                    "{} config init --profile {}",
+                    invocation_prefix("ve-adrive"),
                     profile_name
                 )),
             }
@@ -2232,7 +2363,8 @@ fn handle_config_dry_run(global: &GlobalArgs, action: &ConfigAction) -> Result<i
                     vec![]
                 },
                 confirm_command: Some(format!(
-                    "ve-adrive-cli --profile {} config set {} {}",
+                    "{} --profile {} config set {} {}",
+                    invocation_prefix("ve-adrive"),
                     global.profile,
                     key,
                     redact_adrive_config_value(key, value)
@@ -2364,6 +2496,12 @@ fn describe_config_group() -> Value {
 /// Returns `None` when `command_path` is not an ADrive meta command handled by
 /// this module.
 pub fn describe_adrive_command_metadata(command_path: &str) -> Option<Value> {
+    if let Some(description) = crate::file_metadata::describe(command_path) {
+        return Some(description);
+    }
+    if let Some(description) = crate::chunk_metadata::describe(command_path) {
+        return Some(description);
+    }
     if let Some(mut description) = crate::share_metadata::describe_share_command(command_path) {
         if let Some(row) = find_capability(command_path) {
             description["examples"] = json!(row
@@ -2896,20 +3034,35 @@ fn build_mcp_server(global: &GlobalArgs) -> Result<tos_core::mcp::TosMcpServer, 
 }
 
 fn mcp_tool_entry(skill: SkillDefinition) -> tos_core::mcp::ToolEntry {
-    let can_write_locally = matches!(
+    let can_write = matches!(
         skill.internal_command.as_str(),
-        "ve-adrive share download" | "ve-adrive share files"
+        "ve-adrive file set-meta"
+            | "ve-adrive cp"
+            | "ve-adrive put"
+            | "ve-adrive ls"
+            | "ve-adrive du"
+            | "ve-adrive find"
+            | "ve-adrive crt"
+            | "ve-adrive mkdir"
+            | "ve-adrive config"
+            | "ve-adrive skill"
+            | "ve-adrive auth"
+            | "ve-adrive share create"
+            | "ve-adrive share update"
+            | "ve-adrive share download"
+            | "ve-adrive share files"
     );
-    let description = mcp_tool_description(&skill);
+    let description = render_template(&mcp_tool_description(&skill), "ve-adrive");
+    let mut input_schema = skill.input_schema.clone();
+    render_adrive_documentation(&mut input_schema);
     let mut entry = tos_core::mcp::ToolEntry::from_parts(
         skill.name,
         description,
-        skill.input_schema,
+        input_schema,
         matches!(skill.risk_level.as_str(), "high" | "critical"),
     );
-    if can_write_locally {
-        // [Review Fix #ShareFilesMcpWrite1] Explicit listing manifests also write locally, so files cannot promise read-only execution.
-        // [Review Fix #D02Docs] Keep annotation construction separate from server startup; non-destructive downloads still write files.
+    if can_write {
+        // 非破坏性操作也可能写入远端资源或本地文件，不能由风险等级推导只读属性。
         entry
             .tool
             .annotations
@@ -2920,6 +3073,14 @@ fn mcp_tool_entry(skill: SkillDefinition) -> tos_core::mcp::ToolEntry {
 }
 
 fn mcp_tool_description(skill: &SkillDefinition) -> String {
+    if skill.internal_command.starts_with("ve-adrive chunk ") {
+        return format!(
+            "Low-level document Chunk API. {} {} {}",
+            skill.description,
+            crate::cli::chunk::CHUNK_HELP,
+            crate::cli::chunk::CHUNK_READ_HELP
+        );
+    }
     // [Review Fix #WholeSpaceMcp] Advertise the broader root scope before callers plan existing typed selectors.
     if skill.internal_command == "ve-adrive share create" {
         return format!(
@@ -3273,6 +3434,12 @@ fn validate_mcp_argument_names(
     row: &CapabilityRow,
     arguments: &serde_json::Map<String, Value>,
 ) -> Result<(), CliError> {
+    if row.command.starts_with("ve-adrive file ") {
+        crate::file_metadata::validate_mcp_arguments(row.command, arguments)?;
+    }
+    if row.command.starts_with("ve-adrive chunk ") {
+        crate::chunk_metadata::validate_mcp_arguments(row.command, arguments)?;
+    }
     if row.command == "ve-adrive share view" && arguments.contains_key("raw") {
         return Err(CliError::ValidationError(
             "share view MCP supports structured previews only; --raw is CLI-only".into(),
@@ -3375,6 +3542,9 @@ fn share_parameter_accepts(schema: &Value, value: &Value) -> bool {
 }
 
 fn is_positional_parameter(command: &str, name: &str) -> bool {
+    if command.starts_with("ve-adrive chunk ") {
+        return name == "target";
+    }
     if command.starts_with("ve-adrive share ") {
         return matches!(
             name,
@@ -3387,7 +3557,14 @@ fn is_positional_parameter(command: &str, name: &str) -> bool {
             "ve-adrive cp" | "ve-adrive mv" | "ve-adrive sync",
             "source" | "destination"
         ) | (
-            "ve-adrive ls" | "ve-adrive crt" | "ve-adrive del" | "ve-adrive rm",
+            "ve-adrive ls"
+                | "ve-adrive du"
+                | "ve-adrive find"
+                | "ve-adrive crt"
+                | "ve-adrive del"
+                | "ve-adrive rm"
+                | "ve-adrive put"
+                | "ve-adrive file set-meta",
             "path"
         ) | ("ve-adrive api", "group" | "action")
             | ("ve-adrive completion", "shell")
@@ -3571,7 +3748,14 @@ async fn doctor_report(
     auth: &ADriveAuthArgs,
     args: &DoctorArgs,
 ) -> Result<DoctorReport, CliError> {
-    let checks = build_doctor_checks(global, auth, args).await?;
+    let mut checks = build_doctor_checks(global, auth, args).await?;
+    // [Review Fix #CommandDisplay4] Fix commands are executable instructions;
+    // rewrite their leading prefix only so profile names and other arguments stay exact.
+    for check in &mut checks {
+        if let Some(command) = &mut check.fix_command {
+            *command = public_adrive_command(command);
+        }
+    }
     let passed = checks.iter().filter(|c| c.status == "passed").count();
     let warnings = checks.iter().filter(|c| c.status == "warning").count();
     let failed = checks.iter().filter(|c| c.status == "failed").count();
@@ -3924,8 +4108,10 @@ fn auth_check_message(
     match (mode, is_ready, credentials.has_oauth_token()) {
         (AuthMode::Oauth, true, _) => "ADrive OAuth credentials are available".to_string(),
         (AuthMode::Oauth, false, true) => {
-            "ADrive OAuth credentials are present but cannot authenticate; run auth login"
-                .to_string()
+            render_template_with_prefix(
+                "ADrive OAuth credentials are present but cannot authenticate; run ve-adrive auth login",
+                "ve-adrive", &invocation_prefix("ve-adrive"),
+            )
         }
         (AuthMode::Oauth, false, false) => {
             "ADrive OAuth credentials are not configured".to_string()
@@ -4224,17 +4410,13 @@ fn principles_check() -> DoctorCheck {
         .iter()
         .map(|skill| skill.domain.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    // Skill domains use the business taxonomy (adrive-transfer/-shared/-admin),
+    // Skill domains use the business taxonomy (adrive-transfer/-chunk/-shared/-admin),
     // so compare coverage against `business_domains()` rather than command roots.
     let uncovered_skill_domains: Vec<&str> = business_domains()
         .into_iter()
         .filter(|domain| !skill_domains.contains(*domain))
         .collect();
-    let exposed_low_level: Vec<&str> = rows
-        .iter()
-        .filter(|row| normalize_facet(row.layer) == "low_level")
-        .map(|row| row.command)
-        .collect();
+    let exposed_low_level = unimplemented_low_level_commands(rows);
     let passed = missing_domain.is_empty()
         && destructive_without_force.is_empty()
         && uncovered_skill_domains.is_empty()
@@ -4266,6 +4448,20 @@ fn principles_check() -> DoctorCheck {
             ],
         }),
     }
+}
+
+fn unimplemented_low_level_commands(rows: &[CapabilityRow]) -> Vec<&str> {
+    rows.iter()
+        .filter(|row| normalize_facet(row.layer) == "low_level")
+        // [Review Fix #HelpLayers] Permit implemented File and Chunk APIs while guarding unknown raw commands.
+        .filter(|row| {
+            !crate::file_metadata::CAPABILITIES
+                .iter()
+                .chain(crate::chunk_metadata::CAPABILITIES)
+                .any(|implemented| implemented.command == row.command)
+        })
+        .map(|row| row.command)
+        .collect()
 }
 
 fn mcp_check() -> DoctorCheck {
@@ -4575,6 +4771,50 @@ mod tests {
     }
 
     #[test]
+    fn usermeta_mcp_writes_are_not_read_only_or_destructive() {
+        for command in [
+            "ve-adrive file set-meta",
+            "ve-adrive cp",
+            "ve-adrive put",
+            "ve-adrive crt",
+            "ve-adrive mkdir",
+            "ve-adrive ls",
+            "ve-adrive du",
+            "ve-adrive find",
+        ] {
+            let skill = skill_definitions()
+                .into_iter()
+                .find(|skill| skill.internal_command == command)
+                .unwrap();
+            let risk_level = find_capability(command).unwrap().risk_level;
+            assert_eq!(skill.risk_level, risk_level);
+            let entry = mcp_tool_entry(skill);
+            assert!(!entry.destructive);
+            assert_eq!(entry.tool.annotations.unwrap().read_only_hint, Some(false));
+        }
+    }
+
+    #[test]
+    fn mcp_read_targets_preserve_positional_paths() {
+        for command in ["ve-adrive ls", "ve-adrive du", "ve-adrive find"] {
+            let arguments = json!({"path": "adrive://inst/space/docs/"});
+            let argv = build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                command,
+                arguments.as_object().unwrap(),
+            )
+            .unwrap();
+            assert!(argv
+                .iter()
+                .any(|value| value == "adrive://inst/space/docs/"));
+            assert!(
+                !argv.iter().any(|value| value == "--path"),
+                "{command}: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
     fn share_files_manifest_writes_are_disclosed_in_mcp_annotations() {
         let skill = skill_definitions()
             .into_iter()
@@ -4874,9 +5114,10 @@ mod tests {
             (
                 "ve-adrive",
                 json!({
-                    "description": "ADrive CLI high-level file operations and agent utilities",
+                    "description": "ADrive CLI file workflows, share links, document Chunk APIs and agent utilities",
                     "groups": [
-                        {"description": "File management operations with adrive:// URI and flag targets"},
+                        {"description": "File management and share-link workflows with URI and flag targets"},
+                        {"description": "Document chunk API operations"},
                         {"description": "Discovery, configuration, diagnostics, completion, skill, API passthrough, and MCP utilities"},
                     ],
                 }),
@@ -4927,6 +5168,39 @@ mod tests {
             "missing Chinese metadata:\n{}",
             missing.into_iter().collect::<Vec<_>>().join("\n")
         );
+    }
+
+    #[test]
+    fn usermeta_mcp_schema_and_argv_preserve_metadata() {
+        for command in ["ve-adrive cp", "ve-adrive put", "ve-adrive file set-meta"] {
+            let row = find_capability(command).unwrap();
+            let schema = skill_input_schema(row);
+            assert_eq!(schema["properties"]["meta"]["type"], "string");
+        }
+        let arguments =
+            json!({"path":"adrive://inst/space/a.txt","meta":r#"{"note":"中文 + %20 #"}"#});
+        let argv = build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            "ve-adrive file set-meta",
+            arguments.as_object().unwrap(),
+        )
+        .unwrap();
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["set-meta", "adrive://inst/space/a.txt"]));
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["--meta", r#"{"note":"中文 + %20 #"}"#]));
+        let argv = build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            "ve-adrive put",
+            arguments.as_object().unwrap(),
+        )
+        .unwrap();
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["put", "adrive://inst/space/a.txt"]));
+        assert!(!argv.iter().any(|arg| arg == "--path"));
     }
 
     #[test]
@@ -4991,11 +5265,11 @@ mod tests {
     }
 
     #[test]
-    fn chinese_catalog_localizes_every_high_level_describe_document() {
+    fn chinese_catalog_localizes_every_resource_describe_document() {
         let mut missing = BTreeSet::new();
         for row in capabilities()
             .iter()
-            .filter(|row| row.layer == "high-level")
+            .filter(|row| matches!(row.layer, "high-level" | "low-level"))
         {
             let description =
                 crate::handler::high_level::describe_high_level_command_path(row.command)
@@ -5003,15 +5277,94 @@ mod tests {
                         serde_json::to_value(description).expect("serialize Describe")
                     })
                     .or_else(|| crate::share_metadata::describe_share_command(row.command))
-                    .expect("high-level registry command has Describe metadata");
+                    .or_else(|| crate::file_metadata::describe(row.command))
+                    .or_else(|| crate::chunk_metadata::describe(row.command))
+                    .expect("resource registry command has Describe metadata");
             let document = description;
             missing.extend(missing_describe_translations(row.command, &document));
         }
         assert!(
             missing.is_empty(),
-            "missing high-level Describe translations:\n{}",
+            "missing resource Describe translations:\n{}",
             missing.into_iter().collect::<Vec<_>>().join("\n")
         );
+    }
+
+    #[test]
+    fn command_layer_groups_preserve_share_and_expose_chunk() {
+        let groups = capability_group_rows(capabilities());
+        let low_level = groups
+            .iter()
+            .find(|group| group["layer"] == "low_level")
+            .unwrap();
+        assert_eq!(low_level["command_count"], 3);
+        assert_eq!(
+            low_level["commands"],
+            json!([
+                "ve-adrive file set-meta",
+                "ve-adrive chunk search",
+                "ve-adrive chunk read"
+            ])
+        );
+        let high_level = groups
+            .iter()
+            .find(|group| group["layer"] == "high_level")
+            .unwrap();
+        assert!(high_level["commands"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("ve-adrive share create")));
+        assert!(high_level_semantics().get("chunk").is_none());
+        assert_eq!(principles_check().status, "passed");
+        let skill = skill_definitions()
+            .into_iter()
+            .find(|skill| skill.internal_command == "ve-adrive chunk search")
+            .unwrap();
+        assert_eq!(skill.domain, "adrive-chunk");
+    }
+
+    #[test]
+    fn command_layer_principles_still_reject_unknown_low_level_commands() {
+        let mut unsupported = find_capability("ve-adrive chunk search").unwrap().clone();
+        unsupported.command = "ve-adrive chunk unsupported";
+        unsupported.layer = "low-level";
+        assert_eq!(
+            unimplemented_low_level_commands(&[unsupported]),
+            ["ve-adrive chunk unsupported"]
+        );
+    }
+
+    #[test]
+    fn chunk_mcp_schema_and_argv_preserve_typed_inputs() {
+        let row = find_capability("ve-adrive chunk read").unwrap();
+        let schema = skill_input_schema(row);
+        assert_eq!(schema["properties"]["ordinals"]["items"]["type"], "integer");
+        let args = json!({"target":"adrive://inst/space/a.txt","etag":"v","ordinals":[0,2]});
+        let argv = build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            row.command,
+            args.as_object().unwrap(),
+        )
+        .unwrap();
+        assert!(argv.windows(2).any(|pair| pair == ["--ordinals", "0"]));
+        assert!(argv.windows(2).any(|pair| pair == ["--ordinals", "2"]));
+        assert!(argv.contains(&"adrive://inst/space/a.txt".to_string()));
+        for invalid in [
+            json!({"target":"--endpoint"}),
+            json!({"ordinals":["0"]}),
+            json!({"ordinals":[0,0]}),
+            json!({"target":"adrive://i/s/a","instance":"other"}),
+            json!({"ordinals":[0],"range":"0-0"}),
+            json!({"target":"adrive://i/s/a","etag":"v","ordinals":[9223372036854775808u64]}),
+            json!({"target":"adrive://i/s/a","etag":"v","range":"0-20"}),
+        ] {
+            assert!(build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                row.command,
+                invalid.as_object().unwrap(),
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -5309,5 +5662,63 @@ secret_access_key = "ENC:not-valid"
             assert!(rendered.contains(expected), "describe missing {expected}");
         }
         assert_eq!(description["supports_dry_run"], json!(true));
+    }
+}
+
+#[cfg(test)]
+mod command_display_metadata_tests {
+    use super::*;
+
+    fn presentation_fixture() -> Value {
+        json!({
+            "command": "ve-adrive rb",
+            "description": "先运行 ve-adrive rm；then run ve-adrive doctor",
+            "related_commands": ["ve-adrive rm"],
+            "scenario_routing": {"cleanup": "use ve-adrive rm", "registered_command_names": "ve-adrive doctor"},
+            "input_schema": {"type": "object", "properties": {"target": {
+                "description": "use ve-adrive doctor", "default": "ve-adrive doctor",
+                "enum": ["ve-adrive doctor"], "examples": ["ve-adrive doctor"]
+            }}},
+            "request": {"body": {"description": "ve-adrive doctor"}},
+            "examples": ["ve-adrive ls | ve-adrive cat"],
+            "script": "ve-adrive doctor"
+        })
+    }
+
+    #[test]
+    fn renders_prose_after_localization_and_preserves_machine_and_user_values() {
+        let prefix = "ve-storage-uni-cli ve-adrive";
+        let mut document = presentation_fixture();
+        render_adrive_metadata(
+            &mut document,
+            ADriveMetadataContext::Structured,
+            false,
+            prefix,
+        );
+        assert_eq!(document["command"], "ve-adrive rb");
+        assert_eq!(
+            document["description"],
+            format!("先运行 {prefix} rm；then run {prefix} doctor")
+        );
+        assert_eq!(document["related_commands"][0], "ve-adrive rm");
+        assert_eq!(
+            document["scenario_routing"]["cleanup"],
+            format!("use {prefix} rm")
+        );
+        assert_eq!(
+            document["scenario_routing"]["registered_command_names"],
+            "ve-adrive doctor"
+        );
+        let target = &document["input_schema"]["properties"]["target"];
+        assert_eq!(target["description"], format!("use {prefix} doctor"));
+        assert_eq!(target["default"], "ve-adrive doctor");
+        assert_eq!(target["enum"][0], "ve-adrive doctor");
+        assert_eq!(target["examples"][0], "ve-adrive doctor");
+        assert_eq!(
+            document["request"]["body"]["description"],
+            "ve-adrive doctor"
+        );
+        assert_eq!(document["examples"][0], "ve-adrive ls | ve-adrive cat");
+        assert_eq!(document["script"], "ve-adrive doctor");
     }
 }

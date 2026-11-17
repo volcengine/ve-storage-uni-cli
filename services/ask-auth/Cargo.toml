@@ -1,0 +1,46 @@
+[package]
+name = "ask-auth"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Fail-closed bootstrap for the storage CLI ask authorization service"
+
+[[bin]]
+name = "ask-auth"
+path = "src/main.rs"
+
+[dependencies]
+tos-core = { path = "../../crates/tos-core" }
+libc = "0.2"
+axum = "0.8"
+futures = { workspace = true }
+reqwest = { workspace = true }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+base64 = "0.22"
+percent-encoding = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+uuid = { version = "1", features = ["v7"] }
+
+aes-gcm = { version = "0.10.3", features = ["zeroize"] }
+# [Review Fix #17] aes-gcm does not forward zeroize to expanded AES or GHASH/POLYVAL state.
+aes = { version = "=0.8.4", features = ["zeroize"] }
+ghash = { version = "=0.5.1", features = ["zeroize"] }
+polyval = { version = "=0.6.2", features = ["zeroize"] }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+zeroize = "1.8"
+subtle = "2.6"
+chrono = { workspace = true }
+# [Review Fix #18] SQLx 0.9 keeps RSA optional, avoiding its workspace-wide lazy_static spin conflict.
+sqlx = { version = "=0.9.0", default-features = false, features = ["mysql", "runtime-tokio", "tls-rustls-ring", "chrono", "json", "migrate"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
