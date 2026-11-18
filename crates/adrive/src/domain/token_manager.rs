@@ -27,6 +27,7 @@ use fs2::FileExt;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::time::Instant;
+use tos_core::agent::command_display::{invocation_prefix, render_template};
 use tos_core::agent::error::CliError;
 use tos_core::infra::config::DEFAULT_HTTP_MAX_RETRY_COUNT;
 use tos_core::infra::credentials::{CredentialsFile, StoredOAuthCredentials};
@@ -271,7 +272,8 @@ impl OAuthTokenManager {
     fn validate_refresh_allowed(&self) -> Result<(), CliError> {
         if !self.is_refresh_allowed {
             // [Review Fix #D02] Rotating/persisting tokens or creating an OAuth lock would violate a read-only download plan.
-            return Err(CliError::AuthFailed("[oauth_refresh_required] read-only dry-run requires a usable OAuth Access Token; allow refresh with a normal share inspect <share-url> --auth-mode oauth using the selected profile, then retry".into()));
+            // [Review Fix #ADriveDisplay2] A refresh instruction needs the active executable even in read-only plans.
+            return Err(CliError::AuthFailed(render_template("[oauth_refresh_required] read-only dry-run requires a usable OAuth Access Token; allow refresh with a normal ve-adrive share inspect <share-url> --auth-mode oauth using the selected profile, then retry", "ve-adrive")));
         }
         Ok(())
     }
@@ -560,8 +562,10 @@ fn failure_diagnostic(failure: &OAuthFailure) -> String {
 }
 
 fn login_required(message: &str) -> CliError {
+    // [Review Fix #ADriveDisplay3] Insert opaque failure text only after selecting the executable.
     CliError::AuthFailed(format!(
-        "[login_required] {message}; run ve-adrive auth login"
+        "[login_required] {message}; run {command} auth login",
+        command = invocation_prefix("ve-adrive")
     ))
 }
 
@@ -569,8 +573,10 @@ fn login_required_with_request(message: &str, request_id: Option<&str>) -> CliEr
     let request = request_id
         .map(|value| format!(" (RequestId: {value})"))
         .unwrap_or_default();
+    // [Review Fix #ADriveDisplay3] Keep failure text and request IDs outside template rewriting.
     CliError::AuthFailed(format!(
-        "[login_required] {message}{request}; run ve-adrive auth login"
+        "[login_required] {message}{request}; run {command} auth login",
+        command = invocation_prefix("ve-adrive")
     ))
 }
 

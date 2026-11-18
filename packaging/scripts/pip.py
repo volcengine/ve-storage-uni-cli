@@ -58,6 +58,7 @@ setup(distclass=BinaryDistribution, cmdclass={"bdist_wheel": PlatformWheel})
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True, help="Python package version")
+    parser.add_argument("--package", help="Generate only the named PyPI package")
     parser.add_argument(
         "--binary-dir",
         required=True,
@@ -214,7 +215,13 @@ def toml_value(value: object) -> str:
 def main() -> None:
     args = parse_args()
     config = json.loads(args.config.read_text(encoding="utf-8"))
-    for package in config["packages"]:
+    packages = [
+        package for package in config["packages"]
+        if args.package is None or package["name"] == args.package
+    ]
+    if not packages:
+        raise SystemExit(f"unknown PyPI package: {args.package}")
+    for package in packages:
         generate_package(args.out_dir, package, args.version, args.binary_dir)
 
 

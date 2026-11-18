@@ -677,6 +677,31 @@ pub struct ListFilesOutput {
     pub files: Vec<FileInfo>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct UpdateFileMetaInput {
+    #[serde(skip_serializing)]
+    pub instance_id: String,
+    #[serde(skip_serializing)]
+    pub space_id: String,
+    #[serde(skip_serializing)]
+    pub file_path: String,
+    pub meta: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct UpdateFileMetaOutput {
+    #[serde(skip)]
+    pub response_info: ResponseInfo,
+    #[serde(rename = "InstanceID")]
+    pub instance_id: String,
+    #[serde(rename = "SpaceID")]
+    pub space_id: String,
+    pub file_path: String,
+    pub updated_at: i64,
+}
+
 pub struct PutFileInput {
     pub instance_id: String,
     pub space_id: String,

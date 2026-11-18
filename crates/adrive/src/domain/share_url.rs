@@ -239,7 +239,7 @@ fn parse_password(query: Option<&str>) -> Result<Option<String>> {
 
 /// Decode percent escapes once; query mode also converts `+` to a space.
 /// Returns UTF-8 text or a sanitized error for malformed escapes/encoding.
-pub(super) fn decode_component(input: &str, is_query: bool) -> Result<String> {
+pub(crate) fn decode_component(input: &str, is_query: bool) -> Result<String> {
     let mut decoded = Vec::with_capacity(input.len());
     let mut bytes = input.bytes();
     while let Some(byte) = bytes.next() {

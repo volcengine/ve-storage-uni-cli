@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [Review Fix #Release104] Keep CLI crates and their shared dependency on the same release.
 [package]
 name = "tos-core"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 license = "Apache-2.0"
 description = "Shared configuration, output, transfer, agent, and MCP utilities for Volcengine storage CLIs"

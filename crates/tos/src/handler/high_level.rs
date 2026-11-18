@@ -65,7 +65,7 @@ use crate::cli::TosCommand;
 use crate::domain::{bucket, core};
 use crate::handler::common::{
     active_tos_config_binary, build_runtime, ensure_force_for_destructive, output_result,
-    output_result_with_columns, TosRuntime,
+    output_result_with_columns, public_tos_template, TosRuntime,
 };
 use crate::registry::{describe_command_metadata, enforce_registry_guards};
 
@@ -820,7 +820,7 @@ fn ensure_tos_write_destination(
     if !write_options.is_empty() && !destination.starts_with("tos://") {
         return Err(CliError::ValidationError(format!(
             "{}: --content-type, --storage-class, --acl, and --meta are only valid when the destination is tos://",
-            command
+            public_tos_template(command)
         )));
     }
     Ok(())
@@ -861,7 +861,7 @@ fn ensure_tos_upload_storage_class_supported_for_binary(
     }
     Err(CliError::ValidationError(format!(
         "{}: ByteTOS upload does not support --storage-class; PutObject/CreateMultipartUpload ignores x-tos-storage-class for object creation. Remove --storage-class or use a bucket default/lifecycle policy instead.",
-        command
+        public_tos_template(command)
     )))
 }
 
@@ -1748,9 +1748,9 @@ async fn execute_high_level_command(
                     ),
                 )?;
                 if outcome.is_skipped() {
-                    return Err(CliError::Conflict(
-                        "ve-tos mv copy was skipped; source was not deleted".to_string(),
-                    ));
+                    return Err(CliError::Conflict(public_tos_template(
+                        "ve-tos mv copy was skipped; source was not deleted",
+                    )));
                 }
                 fs::remove_file(&args.source)?;
             }
@@ -1848,7 +1848,9 @@ async fn execute_mkdir(
     let target = resolve_mkdir_target(args)?;
     let bucket = target.bucket;
     let key = target.key.ok_or_else(|| {
-        CliError::ValidationError("ve-tos mkdir requires tos://bucket/folder".to_string())
+        CliError::ValidationError(public_tos_template(
+            "ve-tos mkdir requires tos://bucket/folder",
+        ))
     })?;
     let keys = folder_keys_for_mkdir(&key, args.parents);
     let mut created = Vec::new();
@@ -2128,8 +2130,7 @@ async fn execute_rm(
         if delete_mode == Some(RecursiveDeleteMode::Direct) {
             if args.all_versions {
                 return Err(CliError::ValidationError(
-                    "ve-tos rm --recursive-delete-mode direct cannot be combined with --all-versions"
-                        .to_string(),
+                    public_tos_template("ve-tos rm --recursive-delete-mode direct cannot be combined with --all-versions"),
                 ));
             }
             scan_progress.finish_and_clear();
@@ -3125,15 +3126,14 @@ fn write_rm_hns_direct_manifest(
 
 fn rm_hns_direct_key<'a>(args: &RmArgs, target: &'a ParsedTosUri) -> Result<&'a str, CliError> {
     if args.include.is_some() || args.exclude.is_some() {
-        return Err(CliError::ValidationError(
-            "ve-tos rm --recursive-delete-mode direct does not support --include/--exclude".into(),
-        ));
+        return Err(CliError::ValidationError(public_tos_template(
+            "ve-tos rm --recursive-delete-mode direct does not support --include/--exclude",
+        )));
     }
     target.key.as_deref().ok_or_else(|| {
-        CliError::ValidationError(
-            "ve-tos rm --recursive-delete-mode direct requires an HNS directory object target"
-                .into(),
-        )
+        CliError::ValidationError(public_tos_template(
+            "ve-tos rm --recursive-delete-mode direct requires an HNS directory object target",
+        ))
     })
 }
 
@@ -3215,6 +3215,15 @@ fn tos_batch_error_detail(error: &CliError) -> tos_core::agent::envelope::ErrorD
     use tos_core::agent::envelope::{ErrorDetail, ErrorKind};
     use tos_core::agent::error::ExitCode;
     let semantics = error.agent_semantics();
+    // [Review Fix #DoctorEntry2] Envelope command IDs stay canonical, but the
+    // diagnostic command must use the executable of the active TOS surface.
+    let doctor_hint = if active_tos_config_binary() == Binary::Tos {
+        let prefix = std::env::var("VE_STORAGE_UNI_BYTED_TOS_EXAMPLE_PREFIX")
+            .unwrap_or_else(|_| "tos".to_string());
+        format!("{prefix} doctor")
+    } else {
+        crate::registry::public_tos_command("ve-tos doctor")
+    };
     ErrorDetail {
         status_code: semantics.status_code,
         code: semantics.code,
@@ -3232,10 +3241,12 @@ fn tos_batch_error_detail(error: &CliError) -> tos_core::agent::envelope::ErrorD
             _ => ErrorKind::Unknown,
         },
         category: semantics.category,
-        suggested_action: Some(semantics.suggested_action),
+        suggested_action: Some(tos_core::agent::command_display::diagnostic_action(
+            &semantics.suggested_action,
+            active_tos_config_binary().as_str(),
+        )),
         fix_command: None,
-        // [Review Fix #BatchDoctor] Shared handlers must name the active public CLI.
-        doctor_hint: Some(public_high_level_command("ve-tos doctor")),
+        doctor_hint: Some(doctor_hint),
         docs_url: None,
     }
 }
@@ -3422,7 +3433,8 @@ fn resolve_tos_recursive_delete_mode(
     {
         if let Some(mode) = args.recursive_delete_mode {
             return Err(CliError::ValidationError(format!(
-                "tos-cli recursive delete uses FNS-style planned object deletes; --recursive-delete-mode {} is not supported",
+                "{} recursive delete uses FNS-style planned object deletes; --recursive-delete-mode {} is not supported",
+                tos_core::agent::command_display::invocation_prefix("tos"),
                 recursive_delete_mode_name(mode)
             )));
         }
@@ -3434,7 +3446,8 @@ fn resolve_tos_recursive_delete_mode(
     if !is_hns_bucket {
         if let Some(mode) = args.recursive_delete_mode {
             return Err(CliError::ValidationError(format!(
-                "ve-tos rm --recursive-delete-mode {} is only supported for HNS buckets",
+                "{} --recursive-delete-mode {} is only supported for HNS buckets",
+                public_tos_template("ve-tos rm"),
                 recursive_delete_mode_name(mode)
             )));
         }
@@ -4138,9 +4151,9 @@ async fn execute_mv(
     )
     .await?;
     if outcome.is_skipped() {
-        return Err(CliError::Conflict(
-            "ve-tos mv copy was skipped; source was not deleted".to_string(),
-        ));
+        return Err(CliError::Conflict(public_tos_template(
+            "ve-tos mv copy was skipped; source was not deleted",
+        )));
     }
     if args.source.starts_with("tos://") {
         let source = parse_tos_uri(&args.source, false)?;
@@ -8074,7 +8087,8 @@ async fn ensure_same_region_remote_copy(
         .unwrap_or_default();
     if source_region != destination_region {
         return Err(CliError::ValidationError(format!(
-            "ve-tos cp remote copy only supports buckets in the same region: source bucket '{}' is '{}', destination bucket '{}' is '{}'; automatic cross-region dual-client streaming is not supported, use explicit download+upload or cat|put instead",
+            "{} remote copy only supports buckets in the same region: source bucket '{}' is '{}', destination bucket '{}' is '{}'; automatic cross-region dual-client streaming is not supported, use explicit download+upload or cat|put instead",
+            public_tos_template("ve-tos cp"),
             source_bucket, source_region, destination_bucket, destination_region
         )));
     }
@@ -9369,7 +9383,7 @@ fn streaming_batch_progress(enabled: bool, label: &'static str) -> Option<Progre
         ProgressStyle::with_template("{prefix} {spinner} {pos} item(s) processed ({elapsed})")
             .unwrap_or_else(|_| ProgressStyle::default_spinner()),
     );
-    bar.set_prefix(label);
+    bar.set_prefix(public_tos_template(label));
     // [Review Fix #6] `--no-manifest` streams discovery into execution, so the
     // total is intentionally unknown until the operation finishes.
     bar.enable_steady_tick(Duration::from_millis(200));
@@ -9407,7 +9421,7 @@ impl RemoteScanProgress {
             ProgressStyle::with_template("{prefix} {spinner} scanning {msg} ({elapsed})")
                 .unwrap_or_else(|_| ProgressStyle::default_spinner()),
         );
-        bar.set_prefix(label);
+        bar.set_prefix(public_tos_template(label));
         bar.set_message(target.clone());
         // [Review Fix #5] Remote batch commands need visible progress while
         // ListObjects/ListVersions is still discovering the delete/restore plan.
@@ -10108,7 +10122,9 @@ fn rm_operation(args: &RmArgs) -> Result<HighLevelOperation, CliError> {
 fn mkdir_operation(args: &MkdirArgs) -> Result<HighLevelOperation, CliError> {
     let target = resolve_mkdir_target(args)?;
     let key = target.key.as_deref().ok_or_else(|| {
-        CliError::ValidationError("ve-tos mkdir requires tos://bucket/folder".to_string())
+        CliError::ValidationError(public_tos_template(
+            "ve-tos mkdir requires tos://bucket/folder",
+        ))
     })?;
     let path = format!("tos://{}/{}", target.bucket, key);
     Ok(HighLevelOperation {
@@ -10187,7 +10203,9 @@ fn resolve_mkdir_target(args: &MkdirArgs) -> Result<ParsedTosUri, CliError> {
     )?;
     let mut target = parse_tos_uri(&path, false)?;
     let key = target.key.take().ok_or_else(|| {
-        CliError::ValidationError("ve-tos mkdir requires tos://bucket/folder".to_string())
+        CliError::ValidationError(public_tos_template(
+            "ve-tos mkdir requires tos://bucket/folder",
+        ))
     })?;
     target.key = Some(normalize_folder_key(&key)?);
     Ok(target)
@@ -10196,9 +10214,9 @@ fn resolve_mkdir_target(args: &MkdirArgs) -> Result<ParsedTosUri, CliError> {
 fn normalize_folder_key(key: &str) -> Result<String, CliError> {
     let normalized = key.trim_start_matches('/');
     if normalized.trim().is_empty() || normalized.trim_matches('/').is_empty() {
-        return Err(CliError::ValidationError(
-            "ve-tos mkdir requires a non-empty folder key".to_string(),
-        ));
+        return Err(CliError::ValidationError(public_tos_template(
+            "ve-tos mkdir requires a non-empty folder key",
+        )));
     }
     if normalized.ends_with('/') {
         Ok(normalized.to_string())
@@ -10236,6 +10254,7 @@ fn resolve_target_path(
     key: Option<&str>,
     command: &str,
 ) -> Result<String, CliError> {
+    let command = public_tos_template(command);
     if let Some(path) = path {
         return Ok(path.to_string());
     }
@@ -14565,10 +14584,7 @@ async fn restore_one_object(
     tier: Option<&str>,
     version_id: Option<&str>,
 ) -> Result<Envelope<core::RawResponseData>, CliError> {
-    let mut query = BTreeMap::from([("restore".to_string(), String::new())]);
-    if let Some(version_id) = version_id {
-        query.insert("queryVersionID".to_string(), version_id.to_string());
-    }
+    let query = restore_version_query(version_id);
     let body = restore_request_body(days, tier)?;
     core::execute_object_request(
         client,
@@ -14581,6 +14597,15 @@ async fn restore_one_object(
         Some(body),
     )
     .await
+}
+
+// [Review Fix #RestoreVersion] Use the public wire query name so restoration targets the requested version.
+fn restore_version_query(version_id: Option<&str>) -> BTreeMap<String, String> {
+    let mut query = BTreeMap::from([("restore".to_string(), String::new())]);
+    if let Some(version_id) = version_id {
+        query.insert("versionId".to_string(), version_id.to_string());
+    }
+    query
 }
 
 fn restore_request_body(days: Option<u32>, tier: Option<&str>) -> Result<Vec<u8>, CliError> {
@@ -15045,9 +15070,9 @@ fn parse_common_prefix_entry(value: &Value) -> Option<String> {
 
 fn validate_high_level_ls_max_keys(max_keys: u32) -> Result<(), CliError> {
     if max_keys == 0 {
-        return Err(CliError::ValidationError(
-            "ve-tos ls --max-keys must be greater than 0".to_string(),
-        ));
+        return Err(CliError::ValidationError(public_tos_template(
+            "ve-tos ls --max-keys must be greater than 0",
+        )));
     }
     Ok(())
 }
@@ -17945,6 +17970,18 @@ mod tests {
                 .expect("bucket root destination")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn test_restore_version_query_uses_wire_version_id() {
+        let query = restore_version_query(Some("version+%/example"));
+        assert_eq!(
+            query.get("versionId").map(String::as_str),
+            Some("version+%/example")
+        );
+        assert!(!query.contains_key("queryVersionID"));
+        assert!(query.contains_key("restore"));
+        assert_eq!(restore_version_query(None).len(), 1);
     }
 
     #[test]

@@ -1,0 +1,5 @@
+/target/
+/output/
+# [Review Fix #107] Keep documented local Python validation environments and bytecode out of version control.
+.venv/
+__pycache__/

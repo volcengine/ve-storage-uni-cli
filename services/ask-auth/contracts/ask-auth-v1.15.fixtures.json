@@ -1,0 +1,124 @@
+{
+  "design_version": "v1.15",
+  "trace_request_id": "22222222-2222-7222-8222-222222222222",
+  "claim_headers": {
+    "Idempotency-Key": "44444444-4444-7444-8444-444444444444"
+  },
+  "refresh_headers": {
+    "Idempotency-Key": "55555555-5555-7555-8555-555555555555"
+  },
+  "creation": {
+    "auth_id": "11111111-1111-7111-8111-111111111111",
+    "login_ticket": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "claim_challenge": "1q1niKYZ3vJWq43y0hVHoXScqahmbOEZsW32q52SbCo",
+    "device_name": "example-laptop",
+    "cli_version": "1.0.3"
+  },
+  "claim": {
+    "auth_id": "11111111-1111-7111-8111-111111111111",
+    "claim_verifier": "VlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlY"
+  },
+  "initial_token_bundle": {
+    "auth_id": "11111111-1111-7111-8111-111111111111",
+    "provider": "doubao",
+    "app_id": "cli_example",
+    "environment": "test",
+    "identity": {
+      "user_id": "example-user",
+      "tenant_id": null
+    },
+    "scope": [
+      "offline_access"
+    ],
+    "token_type": "Bearer",
+    "access_token": "example-access-token",
+    "refresh_token": "example-refresh-token",
+    "expires_at": "2026-11-11T02:00:00Z",
+    "refresh_expires_at": null,
+    "broker_token": "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M",
+    "broker_expires_at": "2026-12-11T01:00:00Z",
+    "credential_generation": 1
+  },
+  "refresh": {
+    "auth_id": "11111111-1111-7111-8111-111111111111",
+    "refresh_token": "example-refresh-token",
+    "credential_generation": 1
+  },
+  "status": {
+    "query": {
+      "auth_id": "11111111-1111-7111-8111-111111111111"
+    },
+    "broker_token": "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M"
+  },
+  "logout": {
+    "auth_id": "11111111-1111-7111-8111-111111111111"
+  },
+  "runtime_state_cases": [
+    {
+      "case": "ready broker rejected",
+      "status": "ready",
+      "http_status": 401,
+      "error_code": "authentication_required"
+    },
+    {
+      "case": "cleared login proof but active session retained",
+      "status": "active",
+      "poll_status": 401,
+      "claim_status": 401,
+      "create_status": 409,
+      "create_error": "idempotency_conflict"
+    },
+    {
+      "case": "refreshing rejects claim replay",
+      "status": "refreshing",
+      "http_status": 409,
+      "error_code": "refresh_in_progress"
+    },
+    {
+      "case": "expired retained active or refreshing login cache",
+      "statuses": [
+        "active",
+        "refreshing"
+      ],
+      "poll_status": 200,
+      "poll_state": "expired",
+      "reason_code": "claim_recovery_expired",
+      "claim_status": 409,
+      "claim_error": "claim_recovery_expired",
+      "authorization_status_unchanged": true
+    },
+    {
+      "case": "expired first claim with retained proof",
+      "status": "ready",
+      "claim_status": 410,
+      "claim_error": "login_expired"
+    },
+    {
+      "case": "valid active generation-1 replay",
+      "status": "active",
+      "credential_generation": 1,
+      "http_status": 200
+    },
+    {
+      "case": "status/logout wrong auth_id or foreign broker",
+      "http_status": 401,
+      "error_code": "authentication_required",
+      "no_identity_or_session_existence_disclosure": true
+    },
+    {
+      "case": "missing session proof",
+      "poll_status": 401,
+      "claim_status": 401
+    }
+  ],
+  "boundary": "Fixtures specify intended HTTP lifecycle behavior. The binary validates request shapes and safe errors only; the independent stage-2 Store/crypto library is tested against isolated MySQL and is not wired into HTTP.",
+  "ask_result": {
+    "schema_version": 1,
+    "request_id": "66666666-6666-7666-8666-666666666666",
+    "result_type": "out_of_scope",
+    "summary": "Example outside the storage CLI scope.",
+    "steps": [],
+    "missing_fields": [],
+    "questions": []
+  }
+}

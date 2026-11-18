@@ -360,9 +360,7 @@ fn suggested_action(category: AgentErrorCategory) -> &'static str {
         AgentErrorCategory::InvalidParam => {
             "validate command arguments and JSON body; run the command with --describe or --help"
         }
-        AgentErrorCategory::Unknown => {
-            "inspect status_code, ec, and request_id; run ve-tos doctor if needed"
-        }
+        AgentErrorCategory::Unknown => super::command_display::UNKNOWN_ERROR_ACTION,
     }
 }
 

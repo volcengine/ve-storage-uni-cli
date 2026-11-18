@@ -416,7 +416,8 @@ fn test_object_describe_covers_remaining_leaf_commands() {
                 "https://example.com/demo.txt",
                 "--describe",
             ],
-            "source_url(body)",
+            // [Review Fix #FetchBody] Describe exposes the actual protocol field.
+            "URL",
         ),
     ];
 

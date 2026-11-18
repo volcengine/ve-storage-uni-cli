@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [Review Fix #ProtocolRelease] Align 1.0.4 release metadata and local dependency identities.
 [package]
 name = "ve-tos-cli"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 license = "Apache-2.0"
 description = "Dedicated TOS command-line installer for the Volcengine storage unified CLI"
@@ -28,7 +29,7 @@ include = [
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-ve-storage-uni-cli = { version = "1.0.3", path = "../../.." }
+ve-storage-uni-cli = { version = "1.0.4", path = "../../.." }
 
 [dev-dependencies]
 serde_json = "1"

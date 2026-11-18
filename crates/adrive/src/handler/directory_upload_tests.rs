@@ -32,6 +32,65 @@ struct RemoveCommand {
 
 struct TestDirectory(PathBuf);
 
+#[test]
+fn usermeta_checkpoint_identity_and_legacy_resume() {
+    let source = TestDirectory::new();
+    let mut args = source.arguments(&["--checkpoint", "--meta", "A=1#b=2"]);
+    let first = checkpoint_path_for_cp(&args).unwrap();
+    args.meta = Some(crate::domain::metadata::parse_user_metadata("b=2#a=1").unwrap());
+    assert_eq!(first, checkpoint_path_for_cp(&args).unwrap());
+    args.meta = None;
+    assert_ne!(first, checkpoint_path_for_cp(&args).unwrap());
+
+    let destination = parse_adrive_uri("adrive://inst/space/a.txt", false).unwrap();
+    let mut checkpoint = UploadCheckpoint {
+        instance: "inst".into(),
+        space: "space".into(),
+        file_path: "a.txt".into(),
+        source_path: "/local/a.txt".into(),
+        file_size: 1,
+        part_size: ADRIVE_MULTIPART_PART_SIZE,
+        upload_id: Some("existing".into()),
+        completed_parts: vec![],
+        meta: None,
+    };
+    assert!(validate_upload_checkpoint(
+        &checkpoint,
+        &destination,
+        Path::new("/local/a.txt"),
+        "a.txt",
+        1,
+        None
+    )
+    .is_ok());
+    let meta = crate::domain::metadata::parse_user_metadata("a=1").unwrap();
+    assert!(matches!(
+        validate_upload_checkpoint(
+            &checkpoint,
+            &destination,
+            Path::new("/local/a.txt"),
+            "a.txt",
+            1,
+            Some(&meta)
+        ),
+        Err(CliError::Conflict(_))
+    ));
+    checkpoint.meta = Some(meta.clone());
+    assert!(validate_upload_checkpoint(
+        &checkpoint,
+        &destination,
+        Path::new("/local/a.txt"),
+        "a.txt",
+        1,
+        Some(&meta)
+    )
+    .is_ok());
+    let mut legacy = serde_json::to_value(checkpoint).unwrap();
+    legacy.as_object_mut().unwrap().remove("meta");
+    let legacy: UploadCheckpoint = serde_json::from_value(legacy).unwrap();
+    assert!(legacy.meta.is_none());
+}
+
 impl TestDirectory {
     fn new() -> Self {
         let path =
@@ -1597,6 +1656,7 @@ async fn failed_multipart_report(
         None,
         None,
         runtime,
+        None,
     ))
     .await;
     let mut report = BatchReport::new("ve-adrive cp");

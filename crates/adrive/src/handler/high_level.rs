@@ -32,6 +32,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tos_core::agent::command_display::{invocation_prefix, render_template};
 use tos_core::agent::describe::{
     CommandDescription, CommandLayer, CommandParameter, ParameterLocation, RelatedCommands,
     RiskLevel,
@@ -441,6 +442,8 @@ struct UploadCheckpoint {
     part_size: u64,
     upload_id: Option<String>,
     completed_parts: Vec<UploadPartCheckpoint>,
+    #[serde(default)]
+    meta: Option<HashMap<String, String>>,
 }
 
 struct ADriveUploadCheckpointRef {
@@ -525,6 +528,8 @@ fn enforce_critical_confirmation(
         return Ok(());
     }
 
+    // [Review Fix #ADriveDisplay9] Contextualize the internal command ID before inserting confirmation targets.
+    let command = public_adrive_command(command);
     if !force {
         return Err(CliError::ValidationError(format!(
             "critical delete command '{}' targeting '{}' requires --force and --confirm {} in non-interactive execution",
@@ -554,6 +559,7 @@ fn enforce_critical_confirmation(
 fn prevalidate_command(command: &ADriveCommand) -> Result<(), CliError> {
     match command {
         ADriveCommand::Cp(args) => {
+            validate_cp_metadata(args)?;
             validate_directory_upload_option(
                 &args.source,
                 &args.destination,
@@ -593,8 +599,11 @@ fn prevalidate_command(command: &ADriveCommand) -> Result<(), CliError> {
             )?;
             if matches!(target, ADriveTarget::Instances) {
                 return Err(CliError::ValidationError(
-                    "ve-adrive stat requires an instance, space, file, or folder target"
-                        .to_string(),
+                    // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+                    render_template(
+                        "ve-adrive stat requires an instance, space, file, or folder target",
+                        "ve-adrive",
+                    ),
                 ));
             }
             Ok(())
@@ -641,8 +650,8 @@ fn prevalidate_command(command: &ADriveCommand) -> Result<(), CliError> {
             }
             if args.instance.is_none() || args.space.is_none() || args.folder.is_none() {
                 return Err(CliError::ValidationError(
-                    "ve-adrive mkdir requires adrive://instance/space/folder or --instance --space --folder"
-                        .to_string(),
+                    // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+                    render_template("ve-adrive mkdir requires adrive://instance/space/folder or --instance --space --folder", "ve-adrive"),
                 ));
             }
             Ok(())
@@ -659,6 +668,8 @@ fn validate_transfer_endpoints(
     let source_is_remote = source.starts_with("adrive://");
     let dest_is_remote = destination.starts_with("adrive://");
     if !source_is_remote && !dest_is_remote {
+        // [Review Fix #ADriveDisplay9] Internal validation receives canonical command IDs, not executable names.
+        let command = public_adrive_command(command);
         return Err(CliError::ValidationError(format!(
             "{command} requires at least one endpoint to be adrive://instance/space[/path]"
         )));
@@ -668,6 +679,17 @@ fn validate_transfer_endpoints(
     }
     if dest_is_remote {
         parse_adrive_uri(destination, false)?;
+    }
+    Ok(())
+}
+
+fn validate_cp_metadata(args: &CpArgs) -> Result<(), CliError> {
+    if args.meta.is_some()
+        && (args.source.starts_with("adrive://") || !args.destination.starts_with("adrive://"))
+    {
+        return Err(CliError::ValidationError(
+            "--meta on cp requires a local source and an ADrive destination".into(),
+        ));
     }
     Ok(())
 }
@@ -1092,7 +1114,11 @@ async fn execute_cp(
             (true, false) => download_file(global, client, args, runtime).await,
             (true, true) => copy_remote_file(global, client, args, runtime).await,
             (false, false) => Err(CliError::ValidationError(
-                "ve-adrive cp requires one side to be adrive://instance/space/path".to_string(),
+                // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+                render_template(
+                    "ve-adrive cp requires one side to be adrive://instance/space/path",
+                    "ve-adrive",
+                ),
             )),
         }
     })
@@ -1198,8 +1224,11 @@ async fn recursive_cp_report(
         }
         (false, false) => {
             return Err(CliError::ValidationError(
-                "ve-adrive cp --recursive requires one side to be adrive://instance/space/path"
-                    .to_string(),
+                // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+                render_template(
+                    "ve-adrive cp --recursive requires one side to be adrive://instance/space/path",
+                    "ve-adrive",
+                ),
             ));
         }
     }
@@ -1301,8 +1330,8 @@ async fn recursive_cp_streaming_no_manifest_report(
             (true, false) => stream_adrive_download_no_manifest(&mut context).await,
             (true, true) => stream_adrive_remote_copy_no_manifest(&mut context).await,
             (false, false) => Err(CliError::ValidationError(
-                "ve-adrive cp --recursive requires one side to be adrive://instance/space/path"
-                    .to_string(),
+                // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+                render_template("ve-adrive cp --recursive requires one side to be adrive://instance/space/path", "ve-adrive"),
             )),
         }
             })
@@ -1469,6 +1498,7 @@ async fn queue_adrive_upload_file(
     let checkpoint_enabled = context.args.checkpoint;
     let checkpoint_dir = context.args.checkpoint_dir.clone();
     let bandwidth_limit = context.args.bandwidth_limit.clone();
+    let meta = context.args.meta.clone();
     let runtime = context.runtime;
     let client = context.client;
     context
@@ -1483,6 +1513,7 @@ async fn queue_adrive_upload_file(
                 checkpoint_dir.as_deref(),
                 bandwidth_limit.as_deref(),
                 runtime,
+                meta.as_ref(),
             ))
             .await;
             (
@@ -1648,8 +1679,8 @@ async fn stream_adrive_remote_copy_no_manifest(
     let destination = parse_adrive_uri(&context.args.destination, false)?;
     if source.instance != destination.instance {
         return Err(CliError::ValidationError(
-            "ve-adrive recursive remote copy requires source and destination in the same instance"
-                .to_string(),
+            // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+            render_template("ve-adrive recursive remote copy requires source and destination in the same instance", "ve-adrive"),
         ));
     }
     let source_prefix = trim_folder_prefix(&source.path);
@@ -1941,6 +1972,7 @@ async fn upload_directory_recursive(
         let checkpoint_enabled = args.checkpoint;
         let checkpoint_dir = args.checkpoint_dir.clone();
         let bandwidth_limit = args.bandwidth_limit.clone();
+        let meta = args.meta.clone();
         in_flight.push(async move {
             let result = capture_service_request_id(upload_adrive_file_for_batch(
                 client,
@@ -1952,6 +1984,7 @@ async fn upload_directory_recursive(
                 checkpoint_dir.as_deref(),
                 bandwidth_limit.as_deref(),
                 runtime,
+                meta.as_ref(),
             ))
             .await;
             (source, destination_label, item_key, progress_units, result)
@@ -2150,8 +2183,8 @@ async fn copy_remote_recursive(
     let destination = parse_adrive_uri(&args.destination, false)?;
     if source.instance != destination.instance {
         return Err(CliError::ValidationError(
-            "ve-adrive recursive remote copy requires source and destination in the same instance"
-                .to_string(),
+            // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+            render_template("ve-adrive recursive remote copy requires source and destination in the same instance", "ve-adrive"),
         ));
     }
     let mut scan_progress =
@@ -2375,6 +2408,7 @@ async fn upload_file(
         IdsBody::from_file(source_path.clone()),
     )
     .with_content_length(size);
+    input.meta = args.meta.clone();
     if let Some(rate_limiter) = rate_limiter_from_limit(args.bandwidth_limit.as_deref())? {
         input = input.with_rate_limiter(rate_limiter);
     }
@@ -2444,8 +2478,16 @@ async fn upload_file_multipart(
             part_size: ADRIVE_MULTIPART_PART_SIZE,
             upload_id: None,
             completed_parts: Vec::new(),
+            meta: args.meta.clone(),
         });
-    validate_upload_checkpoint(&checkpoint, &dest, &source_path, &file_path, file_size)?;
+    validate_upload_checkpoint(
+        &checkpoint,
+        &dest,
+        &source_path,
+        &file_path,
+        file_size,
+        args.meta.as_ref(),
+    )?;
 
     if checkpoint.upload_id.is_none() {
         let initiated = client
@@ -2454,7 +2496,7 @@ async fn upload_file_multipart(
                 space_id: dest.space.clone(),
                 file_path: file_path.clone(),
                 content_type: None,
-                meta: None,
+                meta: args.meta.clone(),
             })
             .await
             .map_err(map_ids_error)?;
@@ -2688,15 +2730,17 @@ async fn upload_adrive_file_simple(
     space: &str,
     remote_path: &str,
     local_path: &Path,
+    meta: Option<&HashMap<String, String>>,
 ) -> Result<(), CliError> {
     let size = tokio::fs::metadata(local_path).await?.len();
-    let input = PutFileInput::new(
+    let mut input = PutFileInput::new(
         instance.to_string(),
         space.to_string(),
         remote_path.to_string(),
         IdsBody::from_file(local_path.to_path_buf()),
     )
     .with_content_length(size);
+    input.meta = meta.cloned();
     let out = client.put_file(input).await.map_err(map_ids_error)?;
     let local_crc64 = local_file_crc64(local_path).await?;
     if out.hash_crc64_ecma != 0 && out.hash_crc64_ecma != local_crc64 {
@@ -2720,6 +2764,7 @@ async fn upload_adrive_file_for_batch(
     checkpoint_dir: Option<&str>,
     bandwidth_limit: Option<&str>,
     runtime: TransferRuntimeConfig,
+    meta: Option<&HashMap<String, String>>,
 ) -> Result<(), CliError> {
     let file_size = tokio::fs::metadata(local_path).await?.len();
     if should_use_multipart(file_size, checkpoint_enabled, runtime.checkpoint_threshold) {
@@ -2734,10 +2779,11 @@ async fn upload_adrive_file_for_batch(
             checkpoint_dir,
             bandwidth_limit,
             runtime,
+            meta,
         )
         .await;
     }
-    upload_adrive_file_simple(client, instance, space, remote_path, local_path).await
+    upload_adrive_file_simple(client, instance, space, remote_path, local_path, meta).await
 }
 
 async fn upload_adrive_file_multipart_for_batch(
@@ -2751,6 +2797,7 @@ async fn upload_adrive_file_multipart_for_batch(
     checkpoint_dir: Option<&str>,
     bandwidth_limit: Option<&str>,
     runtime: TransferRuntimeConfig,
+    meta: Option<&HashMap<String, String>>,
 ) -> Result<(), CliError> {
     let destination = ParsedADriveUri {
         instance: instance.to_string(),
@@ -2762,6 +2809,7 @@ async fn upload_adrive_file_multipart_for_batch(
         checkpoint_dir,
         local_path,
         &destination,
+        meta,
     )?;
     let mut checkpoint = load_upload_checkpoint(checkpoint_path.as_deref())
         .await?
@@ -2774,6 +2822,7 @@ async fn upload_adrive_file_multipart_for_batch(
             part_size: ADRIVE_MULTIPART_PART_SIZE,
             upload_id: None,
             completed_parts: Vec::new(),
+            meta: meta.cloned(),
         });
     validate_upload_checkpoint(
         &checkpoint,
@@ -2781,6 +2830,7 @@ async fn upload_adrive_file_multipart_for_batch(
         local_path,
         remote_path,
         file_size,
+        meta,
     )?;
 
     if checkpoint.upload_id.is_none() {
@@ -2790,7 +2840,7 @@ async fn upload_adrive_file_multipart_for_batch(
                 space_id: space.to_string(),
                 file_path: remote_path.to_string(),
                 content_type: None,
-                meta: None,
+                meta: meta.cloned(),
             })
             .await
             .map_err(map_ids_error)?;
@@ -3264,8 +3314,11 @@ async fn copy_remote_file(
     let dest = parse_adrive_uri(&args.destination, false)?;
     if source.instance != dest.instance {
         return Err(CliError::ValidationError(
-            "ve-adrive remote copy requires source and destination in the same instance"
-                .to_string(),
+            // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+            render_template(
+                "ve-adrive remote copy requires source and destination in the same instance",
+                "ve-adrive",
+            ),
         ));
     }
     let destination_path = remote_file_path_for_destination(&dest, &source)?;
@@ -3451,8 +3504,8 @@ async fn copy_single_for_move(
             let dest = parse_adrive_uri(&args.destination, false)?;
             if source.instance != dest.instance {
                 return Err(CliError::ValidationError(
-                    "ve-adrive remote move requires source and destination in the same instance"
-                        .to_string(),
+                    // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+                    render_template("ve-adrive remote move requires source and destination in the same instance", "ve-adrive"),
                 ));
             }
             let destination_path = remote_file_path_for_destination(&dest, &source)?;
@@ -3494,7 +3547,11 @@ async fn copy_single_for_move(
             }))
         }
         (false, false) => Err(CliError::ValidationError(
-            "ve-adrive mv requires one side to be adrive://instance/space/path".to_string(),
+            // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+            render_template(
+                "ve-adrive mv requires one side to be adrive://instance/space/path",
+                "ve-adrive",
+            ),
         )),
     }
 }
@@ -3505,9 +3562,10 @@ fn ensure_adrive_mv_folder_requires_recursive(
     recursive: bool,
 ) -> Result<(), CliError> {
     if is_folder_source && !recursive {
+        // [Review Fix #ADriveDisplay6] Interpolate the actual path after resolving the command prefix.
         return Err(CliError::ValidationError(format!(
-            "ve-adrive mv directory source requires --recursive: {}",
-            source
+            "{command} mv directory source requires --recursive: {source}",
+            command = invocation_prefix("ve-adrive")
         )));
     }
     Ok(())
@@ -3517,8 +3575,11 @@ fn adrive_recursive_mv_source_folder_path(source: &ParsedADriveUri) -> Result<St
     let folder_path = source.path.trim_end_matches('/').to_string();
     if folder_path.is_empty() {
         return Err(CliError::ValidationError(
-            "ve-adrive mv --recursive requires a source directory path, not a space root"
-                .to_string(),
+            // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+            render_template(
+                "ve-adrive mv --recursive requires a source directory path, not a space root",
+                "ve-adrive",
+            ),
         ));
     }
     Ok(folder_path)
@@ -3669,6 +3730,7 @@ async fn execute_mv(
             .await;
         }
         let cp_args = CpArgs {
+            meta: None,
             source: args.source.clone(),
             destination: args.destination.clone(),
             by_name: false,
@@ -3842,6 +3904,7 @@ fn effective_mv_runtime_config(
     args: &MvArgs,
 ) -> Result<TransferRuntimeConfig, CliError> {
     let cp_args = CpArgs {
+        meta: None,
         source: args.source.clone(),
         destination: args.destination.clone(),
         by_name: false,
@@ -3907,8 +3970,8 @@ async fn execute_recursive_mv_streaming_no_manifest(
             (true, false) => stream_adrive_download_move_no_manifest(&mut context).await,
             (true, true) => stream_adrive_remote_move_no_manifest(&mut context).await,
             (false, false) => Err(CliError::ValidationError(
-                "ve-adrive mv --recursive requires one side to be adrive://instance/space/path"
-                    .to_string(),
+                // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+                render_template("ve-adrive mv --recursive requires one side to be adrive://instance/space/path", "ve-adrive"),
             )),
         }
             })
@@ -4099,6 +4162,7 @@ async fn queue_adrive_upload_move_file(
                 checkpoint_dir.as_deref(),
                 None,
                 runtime,
+                None,
             ))
             .await;
             let delete_result = if copy_result.0.is_ok() {
@@ -4267,8 +4331,8 @@ async fn stream_adrive_remote_move_no_manifest(
     let destination = parse_adrive_uri(&context.args.destination, false)?;
     if source.instance != destination.instance {
         return Err(CliError::ValidationError(
-            "ve-adrive recursive remote move requires source and destination in the same instance"
-                .to_string(),
+            // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+            render_template("ve-adrive recursive remote move requires source and destination in the same instance", "ve-adrive"),
         ));
     }
     let source_prefix = trim_folder_prefix(&source.path);
@@ -4435,6 +4499,7 @@ async fn execute_sync(
     let resolved_args = resolve_sync_args_by_name(client, args).await?;
     let args = &resolved_args;
     let cp_args = CpArgs {
+        meta: None,
         source: args.source.clone(),
         destination: args.destination.clone(),
         by_name: false,
@@ -4469,7 +4534,11 @@ async fn execute_sync(
     let list_echo_enabled = effective_list_echo_enabled(global, args.list_echo, args.no_list_echo);
     if !args.source.starts_with("adrive://") && !args.destination.starts_with("adrive://") {
         return Err(CliError::ValidationError(
-            "ve-adrive sync requires one side to be adrive://instance/space/path".to_string(),
+            // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+            render_template(
+                "ve-adrive sync requires one side to be adrive://instance/space/path",
+                "ve-adrive",
+            ),
         ));
     }
     let (mut report, copy_stream_result, copy_drain_result) = if args.no_manifest {
@@ -4838,8 +4907,8 @@ fn resolve_create_space_owner_id(
 fn oauth_user_id_required_error() -> CliError {
     // [Review Fix #2] Keep the stable error code while making remediation executable.
     CliError::ValidationError(
-        "[oauth_user_id_required] OAuth Space creation requires --owner-id or ve-adrive auth login --instance <instance_id> to load the selected user's ID"
-            .to_string(),
+        // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+        render_template("[oauth_user_id_required] OAuth Space creation requires --owner-id or ve-adrive auth login --instance <instance_id> to load the selected user's ID", "ve-adrive"),
     )
 }
 
@@ -4943,7 +5012,11 @@ async fn execute_delete(
         }
         ADriveTarget::Instances | ADriveTarget::Path(_) => {
             return Err(CliError::ValidationError(
-                "ve-adrive del only removes instances or spaces".to_string(),
+                // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+                render_template(
+                    "ve-adrive del only removes instances or spaces",
+                    "ve-adrive",
+                ),
             ));
         }
     };
@@ -5428,8 +5501,11 @@ async fn list_adrive_delete_entries(
 fn reject_direct_adrive_rm_filters(args: &RmArgs) -> Result<(), CliError> {
     if args.include.is_some() || args.exclude.is_some() {
         return Err(CliError::ValidationError(
-            "ve-adrive rm --recursive-delete-mode direct does not support --include/--exclude"
-                .to_string(),
+            // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+            render_template(
+                "ve-adrive rm --recursive-delete-mode direct does not support --include/--exclude",
+                "ve-adrive",
+            ),
         ));
     }
     Ok(())
@@ -5678,10 +5754,24 @@ enum RootInstanceListing {
 
 struct BoundedSpaces {
     spaces: Vec<SpaceInfo>,
+    root_id: Option<String>,
     root_space: Option<SpaceInfo>,
     next_marker: Option<String>,
     is_truncated: bool,
     request_id: String,
+}
+
+impl From<super::group_spaces::GroupSpaces> for BoundedSpaces {
+    fn from(listed: super::group_spaces::GroupSpaces) -> Self {
+        Self {
+            spaces: listed.spaces,
+            root_id: listed.root_id,
+            root_space: listed.root_space,
+            is_truncated: listed.next_marker.is_some(),
+            next_marker: listed.next_marker,
+            request_id: listed.request_id,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5801,6 +5891,12 @@ async fn list_spaces_bounded(
     initial_marker: Option<&str>,
     listing_kind: SpaceListingKind,
 ) -> Result<BoundedSpaces, CliError> {
+    if listing_kind == SpaceListingKind::Group {
+        return super::group_spaces::list(client, instance, max_keys, initial_marker)
+            .await
+            .map(BoundedSpaces::from);
+    }
+    super::group_spaces::reject_scoped_cursor(initial_marker)?;
     let mut spaces = Vec::new();
     let mut root_space = None;
     let mut marker = initial_marker.map(ToString::to_string);
@@ -5834,6 +5930,7 @@ async fn list_spaces_bounded(
 
     Ok(BoundedSpaces {
         spaces,
+        root_id: None,
         root_space,
         is_truncated: next_marker.is_some(),
         next_marker,
@@ -6211,6 +6308,7 @@ async fn execute_ls(
                     crc64: None,
                 });
                 spaces.push(json!({
+                    "is_root": listed.root_id.as_ref() == Some(&space.space_id),
                     "space_id": space.space_id,
                     "name": space.name,
                     "display_name": space.display_name,
@@ -6280,6 +6378,7 @@ fn prevalidate_ls_space_listing_kind(
             "--owner-type is valid only when listing Spaces under one Instance".to_string(),
         ));
     }
+    super::group_spaces::reject_scoped_cursor(args.marker.as_deref())?;
     Ok(None)
 }
 
@@ -6301,7 +6400,11 @@ async fn execute_stat(
     let payload = match target {
         ADriveTarget::Instances => {
             return Err(CliError::ValidationError(
-                "ve-adrive stat requires an instance, space, file, or folder target".to_string(),
+                // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+                render_template(
+                    "ve-adrive stat requires an instance, space, file, or folder target",
+                    "ve-adrive",
+                ),
             ));
         }
         ADriveTarget::Instance { instance } => {
@@ -7175,6 +7278,7 @@ async fn put_adrive_single_stdin_file(
     )
     .with_content_length(size);
     input.content_type = args.content_type.clone();
+    input.meta = args.meta.clone();
 
     let out = client.put_file(input).await.map_err(map_ids_error)?;
     verify_adrive_crc64_response(out.hash_crc64_ecma, local_crc64, "stdin upload")?;
@@ -7212,7 +7316,7 @@ async fn put_adrive_multipart_stdin_file(
             space_id: target.space.clone(),
             file_path: target.path.clone(),
             content_type: args.content_type.clone(),
-            meta: None,
+            meta: args.meta.clone(),
         })
         .await
         .map_err(map_ids_error)?;
@@ -7561,7 +7665,11 @@ async fn execute_mkdir(
     let folder_path = target.path.trim_matches('/');
     if folder_path.is_empty() {
         return Err(CliError::ValidationError(
-            "ve-adrive mkdir requires a non-empty folder path".to_string(),
+            // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+            render_template(
+                "ve-adrive mkdir requires a non-empty folder path",
+                "ve-adrive",
+            ),
         ));
     }
     let folder_paths = folder_paths_for_mkdir(folder_path, args.parents);
@@ -8035,7 +8143,11 @@ fn adrive_marker_pagination(next_marker: &str, total_returned: u64) -> Paginatio
 fn validate_adrive_ls_max_keys(max_keys: i32) -> Result<(), CliError> {
     if max_keys <= 0 {
         return Err(CliError::ValidationError(
-            "ve-adrive ls --max-keys must be greater than 0".to_string(),
+            // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+            render_template(
+                "ve-adrive ls --max-keys must be greater than 0",
+                "ve-adrive",
+            ),
         ));
     }
     Ok(())
@@ -9436,6 +9548,10 @@ fn checkpoint_path_for_cp(args: &CpArgs) -> Result<Option<PathBuf>, CliError> {
     args.include.hash(&mut hasher);
     args.exclude.hash(&mut hasher);
     args.recursive.hash(&mut hasher);
+    if let Some(meta) = &args.meta {
+        let ordered: BTreeMap<_, _> = meta.iter().collect();
+        ordered.hash(&mut hasher);
+    }
     // [Review Fix #DirectoryCheckpoint] Directory policy and root mapping are
     // part of the logical task, so changed policies cannot reuse old skips.
     args.include_parent.hash(&mut hasher);
@@ -9449,6 +9565,7 @@ fn checkpoint_path_for_adrive_batch_file(
     checkpoint_dir: Option<&str>,
     source_path: &Path,
     destination: &ParsedADriveUri,
+    meta: Option<&HashMap<String, String>>,
 ) -> Result<Option<PathBuf>, CliError> {
     if !checkpoint_enabled {
         return Ok(None);
@@ -9461,6 +9578,10 @@ fn checkpoint_path_for_adrive_batch_file(
     destination.instance.hash(&mut hasher);
     destination.space.hash(&mut hasher);
     destination.path.hash(&mut hasher);
+    if let Some(meta) = meta {
+        let ordered: BTreeMap<_, _> = meta.iter().collect();
+        ordered.hash(&mut hasher);
+    }
     let fingerprint = hasher.finish();
     Ok(Some(dir.join(format!("cp-file-{fingerprint:016x}.json"))))
 }
@@ -9508,6 +9629,7 @@ fn validate_upload_checkpoint(
     source_path: &Path,
     file_path: &str,
     file_size: u64,
+    meta: Option<&HashMap<String, String>>,
 ) -> Result<(), CliError> {
     if checkpoint.instance != destination.instance
         || checkpoint.space != destination.space
@@ -9515,6 +9637,7 @@ fn validate_upload_checkpoint(
         || checkpoint.source_path != source_path.display().to_string()
         || checkpoint.file_size != file_size
         || checkpoint.part_size != ADRIVE_MULTIPART_PART_SIZE
+        || checkpoint.meta.as_ref() != meta
     {
         return Err(CliError::Conflict(
             "checkpoint metadata does not match this ADrive upload task; remove the checkpoint to restart".to_string(),
@@ -10128,9 +10251,11 @@ async fn build_adrive_sync_delete_plan(
     list_concurrency: usize,
 ) -> Result<Vec<BatchManifestItem>, CliError> {
     if !args.force {
+        // [Review Fix #ADriveDisplay6] A destination can contain command-like text and must remain unchanged.
         return Err(CliError::ValidationError(format!(
-            "ve-adrive sync --delete requires --force and --confirm {} to delete extraneous destination files/folders",
-            args.destination
+            "{command} sync --delete requires --force and --confirm {} to delete extraneous destination files/folders",
+            args.destination,
+            command = invocation_prefix("ve-adrive")
         )));
     }
     let mut plan = match (
@@ -10147,7 +10272,11 @@ async fn build_adrive_sync_delete_plan(
             build_adrive_delete_plan_for_adrive_source(client, args, list_concurrency).await
         }
         (false, false) => Err(CliError::ValidationError(
-            "ve-adrive sync requires one side to be adrive://instance/space/path".to_string(),
+            // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+            render_template(
+                "ve-adrive sync requires one side to be adrive://instance/space/path",
+                "ve-adrive",
+            ),
         )),
     }?;
     // [Review Fix #3] Keep sync delete-extra ordered child-first for hierarchical paths.
@@ -10281,7 +10410,8 @@ async fn build_adrive_delete_plan_for_adrive_source(
     let destination = parse_adrive_uri(&args.destination, false)?;
     if source.instance != destination.instance {
         return Err(CliError::ValidationError(
-            "ve-adrive sync --delete for remote sync requires source and destination in the same instance".to_string(),
+            // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+            render_template("ve-adrive sync --delete for remote sync requires source and destination in the same instance", "ve-adrive"),
         ));
     }
     let source_prefix = trim_folder_prefix(&source.path);
@@ -10747,8 +10877,8 @@ fn resolve_create_target(args: &CreateArgs) -> Result<ADriveCreateTarget, CliErr
             }
         } else {
             return Err(CliError::ValidationError(
-                "ve-adrive crt only creates instances or spaces; use ve-adrive mkdir for folders"
-                    .to_string(),
+                // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+                render_template("ve-adrive crt only creates instances or spaces; use ve-adrive mkdir for folders", "ve-adrive"),
             ));
         }
     } else {
@@ -10767,7 +10897,8 @@ fn resolve_create_target(args: &CreateArgs) -> Result<ADriveCreateTarget, CliErr
             }
             (None, None) => {
                 return Err(CliError::ValidationError(
-                    "ve-adrive crt requires adrive://instance-name, adrive://instance-id/space-name, or --instance".to_string(),
+                    // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+                    render_template("ve-adrive crt requires adrive://instance-name, adrive://instance-id/space-name, or --instance", "ve-adrive"),
                 ));
             }
         }
@@ -10777,7 +10908,11 @@ fn resolve_create_target(args: &CreateArgs) -> Result<ADriveCreateTarget, CliErr
         ADriveCreateTarget::Instance { name } => {
             if name.trim().is_empty() {
                 return Err(CliError::ValidationError(
-                    "ve-adrive crt requires a non-empty instance name".to_string(),
+                    // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+                    render_template(
+                        "ve-adrive crt requires a non-empty instance name",
+                        "ve-adrive",
+                    ),
                 ));
             }
             if args.index_enabled {
@@ -10789,7 +10924,11 @@ fn resolve_create_target(args: &CreateArgs) -> Result<ADriveCreateTarget, CliErr
         ADriveCreateTarget::Space { instance, name } => {
             if instance.trim().is_empty() || name.trim().is_empty() {
                 return Err(CliError::ValidationError(
-                    "ve-adrive crt requires non-empty instance and space names".to_string(),
+                    // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+                    render_template(
+                        "ve-adrive crt requires non-empty instance and space names",
+                        "ve-adrive",
+                    ),
                 ));
             }
         }
@@ -10809,11 +10948,12 @@ fn resolve_delete_target(args: &DeleteArgs) -> Result<ADriveTarget, CliError> {
     match target {
         ADriveTarget::Instance { .. } | ADriveTarget::Space { .. } => Ok(target),
         ADriveTarget::Instances => Err(CliError::ValidationError(
-            "ve-adrive del requires an instance or space target".to_string(),
+            // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+            render_template("ve-adrive del requires an instance or space target", "ve-adrive"),
         )),
         ADriveTarget::Path(_) => Err(CliError::ValidationError(
-            "ve-adrive del only removes instances or spaces; use ve-adrive rm for files or folders"
-                .to_string(),
+            // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+            render_template("ve-adrive del only removes instances or spaces; use ve-adrive rm for files or folders", "ve-adrive"),
         )),
     }
 }
@@ -10832,12 +10972,14 @@ fn resolve_rm_target(args: &RmArgs) -> Result<ParsedADriveUri, CliError> {
         ADriveTarget::Space { instance, space } => {
             if !args.recursive {
                 return Err(CliError::ValidationError(
-                    "ve-adrive rm requires a file or folder target; add --recursive to clear a space or use ve-adrive del to delete the space".to_string(),
+                    // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+                    render_template("ve-adrive rm requires a file or folder target; add --recursive to clear a space or use ve-adrive del to delete the space", "ve-adrive"),
                 ));
             }
             if args.recursive_delete_mode == RecursiveDeleteMode::Direct {
                 return Err(CliError::ValidationError(
-                    "ve-adrive rm --recursive-delete-mode direct cannot target a space root; use bottom-up to clear space contents or ve-adrive del to delete the space".to_string(),
+                    // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+                    render_template("ve-adrive rm --recursive-delete-mode direct cannot target a space root; use bottom-up to clear space contents or ve-adrive del to delete the space", "ve-adrive"),
                 ));
             }
             Ok(ParsedADriveUri {
@@ -10847,8 +10989,11 @@ fn resolve_rm_target(args: &RmArgs) -> Result<ParsedADriveUri, CliError> {
             })
         }
         ADriveTarget::Instances | ADriveTarget::Instance { .. } => Err(CliError::ValidationError(
-            "ve-adrive rm requires a file or folder target; use ve-adrive del for instances"
-                .to_string(),
+            // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+            render_template(
+                "ve-adrive rm requires a file or folder target; use ve-adrive del for instances",
+                "ve-adrive",
+            ),
         )),
     }
 }
@@ -11095,7 +11240,7 @@ fn high_level_scenario_routing(command: &str) -> HashMap<String, String> {
     );
     routing.insert(
         "low_level_boundary".to_string(),
-        "ADrive Low-Level CLI is not implemented; High-Level commands wrap IDS API actions directly"
+        "Low-Level commands expose document Chunk APIs; raw API execution remains unimplemented"
             .to_string(),
     );
     // [Review Fix #RebaseADriveDescribe] Rebase dropped ADrive/TOS describe
@@ -11376,6 +11521,9 @@ async fn build_plan(
     auth: &ADriveAuthArgs,
     command: &ADriveCommand,
 ) -> Result<serde_json::Value, CliError> {
+    if let ADriveCommand::Cp(args) = command {
+        validate_cp_metadata(args)?;
+    }
     match command {
         ADriveCommand::Cp(args) => validate_directory_upload_option(
             &args.source,
@@ -11803,6 +11951,11 @@ async fn build_plan(
             "force_required_for_destructive": destructive,
         },
     });
+    match command {
+        ADriveCommand::Cp(args) => plan["meta"] = json!(args.meta),
+        ADriveCommand::Put(args) => plan["meta"] = json!(args.meta),
+        _ => {}
+    }
 
     if let Some(ref imp) = impact {
         plan["impact"] = serde_json::to_value(imp).unwrap_or_else(|_| serde_json::Value::Null);
@@ -12915,6 +13068,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn recursive_upload_checkpoint_identity_includes_ordered_metadata() {
+        let source = Path::new("/local/source.bin");
+        let destination = parse_adrive_uri("adrive://inst/space/file.bin", false).unwrap();
+        let path = |meta| {
+            checkpoint_path_for_adrive_batch_file(
+                true,
+                Some("/checkpoints"),
+                source,
+                &destination,
+                meta,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let first = HashMap::from([
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ]);
+        let reordered = HashMap::from([
+            ("b".to_string(), "2".to_string()),
+            ("a".to_string(), "1".to_string()),
+        ]);
+        let changed = HashMap::from([
+            ("a".to_string(), "new".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ]);
+        assert_eq!(path(Some(&first)), path(Some(&reordered)));
+        assert_ne!(path(Some(&first)), path(Some(&changed)));
+        assert_ne!(path(None), path(Some(&first)));
+
+        // 无 metadata 的旧断点路径保持不变。
+        let mut legacy = std::collections::hash_map::DefaultHasher::new();
+        "ve-adrive cp batch file".hash(&mut legacy);
+        source.display().to_string().hash(&mut legacy);
+        destination.instance.hash(&mut legacy);
+        destination.space.hash(&mut legacy);
+        destination.path.hash(&mut legacy);
+        assert_eq!(
+            path(None),
+            Path::new("/checkpoints").join(format!("cp-file-{:016x}.json", legacy.finish()))
+        );
+        assert!(checkpoint_path_for_adrive_batch_file(
+            false,
+            None,
+            source,
+            &destination,
+            Some(&first)
+        )
+        .unwrap()
+        .is_none());
+    }
+
     fn upload_checkpoint(file_path: &str, upload_id: Option<&str>) -> UploadCheckpoint {
         UploadCheckpoint {
             instance: "inst".to_string(),
@@ -12925,6 +13131,7 @@ mod tests {
             part_size: ADRIVE_MULTIPART_PART_SIZE,
             upload_id: upload_id.map(ToString::to_string),
             completed_parts: Vec::new(),
+            meta: None,
         }
     }
 

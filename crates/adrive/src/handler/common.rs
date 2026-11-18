@@ -19,6 +19,7 @@ use serde::Serialize;
 use serde_json::Value;
 #[cfg(test)]
 use std::sync::Arc;
+use tos_core::agent::command_display::{diagnostic_action, invocation_prefix, render_template};
 use tos_core::agent::envelope::Envelope;
 use tos_core::agent::error::{AgentErrorCategory, CliError};
 use tos_core::agent::global_args::GlobalArgs;
@@ -869,8 +870,11 @@ fn build_oauth_auth_provider(global: &GlobalArgs) -> Result<OAuthAuthProvider, C
     // profile selection but before the independent Resource Server endpoint.
     if !inspect_oauth_credentials(global)?.ready {
         return Err(CliError::ConfigMissing(
-            "[login_required] usable OAuth credentials are required; run ve-adrive auth login"
-                .to_string(),
+            // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+            render_template(
+                "[login_required] usable OAuth credentials are required; run ve-adrive auth login",
+                "ve-adrive",
+            ),
         ));
     }
     let token_manager = OAuthTokenManager::new(
@@ -1072,7 +1076,12 @@ pub fn adrive_error_guidance(
 ) -> AdriveErrorGuidance {
     let semantics = error.agent_semantics();
     if semantics.code == "share_result_unknown" {
-        return guidance("Do not automatically retry this share mutation; reconcile its outcome with share get or share list",Some("ve-adrive share get <share-id> --instance <instance-id>"),None);
+        // [Review Fix #ADriveDisplay10] Reconciliation commands need the executable, including aggregate failures.
+        return guidance(
+            &render_template("Do not automatically retry this share mutation; reconcile its outcome with ve-adrive share get or ve-adrive share list", "ve-adrive"),
+            Some("ve-adrive share get <share-id> --instance <instance-id>"),
+            None,
+        );
     }
     let mode = error_auth_mode(global, requested_mode);
     if mode == Some(AuthMode::Oauth)
@@ -1159,9 +1168,11 @@ fn auth_error_guidance(
         ));
     }
     if mode == Some(AuthMode::Oauth) && code == "oauth_user_id_required" {
-        // [Review Fix #2] `auth login` requires the target Instance on this CLI surface.
+        // [Review Fix #5] Recommend an explicit target here so the new login
+        // refreshes identity metadata for the Instance being operated on.
+        // [Review Fix #ADriveDisplay4] Render only this static suggested action; generic semantics can contain upstream text.
         return Some(guidance(
-            "Run ve-adrive auth login --instance <instance_id> to refresh the selected user identity, or pass --owner-id explicitly",
+            &render_template("Run ve-adrive auth login --instance <instance_id> to refresh the selected user identity, or pass --owner-id explicitly", "ve-adrive"),
             Some("ve-adrive auth login --instance <instance_id>"),
             Some("ve-adrive doctor --check auth"),
         ));
@@ -1270,11 +1281,11 @@ fn normalize_adrive_error_code(code: &str) -> String {
 
 fn oauth_error_guidance(code: &str) -> Option<AdriveErrorGuidance> {
     let descriptor = oauth_error_descriptor(code)?;
-    Some(AdriveErrorGuidance {
-        suggested_action: descriptor.suggested_action.to_string(),
-        fix_command: None,
-        doctor_hint: Some(descriptor.doctor_hint.to_string()),
-    })
+    Some(guidance(
+        descriptor.suggested_action,
+        None,
+        Some(descriptor.doctor_hint),
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -1361,10 +1372,21 @@ fn guidance(
     fix_command: Option<&str>,
     doctor_hint: Option<&str>,
 ) -> AdriveErrorGuidance {
+    let prefix = std::env::var("VE_STORAGE_UNI_ADRIVE_EXAMPLE_PREFIX")
+        .unwrap_or_else(|_| "ve-adrive".to_string());
+    // [Review Fix #DoctorEntry1] Aggregate failures bypass the root error
+    // renderer, so remediation must resolve its executable at the source.
+    let command_for_entrypoint = |command: &str| {
+        command
+            .strip_prefix("ve-adrive ")
+            .map(|suffix| format!("{prefix} {suffix}"))
+            .unwrap_or_else(|| command.to_string())
+    };
     AdriveErrorGuidance {
-        suggested_action: suggested_action.to_string(),
-        fix_command: fix_command.map(ToString::to_string),
-        doctor_hint: doctor_hint.map(ToString::to_string),
+        // [Review Fix #ADriveDisplay8] Specialize only the shared fallback; other guidance stays opaque.
+        suggested_action: diagnostic_action(suggested_action, "ve-adrive"),
+        fix_command: fix_command.map(command_for_entrypoint),
+        doctor_hint: doctor_hint.map(command_for_entrypoint),
     }
 }
 
@@ -1412,8 +1434,38 @@ pub(crate) fn output_result_with_columns<T: Serialize>(
     let raw = serde_json::to_value(data)?;
     let mut enveloped = ensure_envelope(global, raw);
     publicize_adrive_output_value(&mut enveloped);
-    let value = apply_query(global, enveloped)?;
+    // [Review Fix #ADriveDisplay7] Describe owns its prose; ordinary payloads can contain opaque upstream values.
+    if global.describe {
+        super::meta::render_adrive_documentation(&mut enveloped);
+    }
+    let mut value = apply_query(global, enveloped)?;
+    apply_space_owner_display(global, &mut value);
     render_value(global, &value, columns)
+}
+
+fn apply_space_owner_display(global: &GlobalArgs, value: &mut Value) {
+    let is_tabular = matches!(
+        global.output.unwrap_or_else(OutputFormat::auto_detect),
+        OutputFormat::Table | OutputFormat::Csv | OutputFormat::Markdown
+    );
+    if !is_tabular
+        || global
+            .query
+            .as_ref()
+            .is_some_and(|query| !query.trim().is_empty())
+        || value["command"] != "ve-adrive ls"
+        || value["data"]["scope"] != "spaces"
+    {
+        return;
+    }
+    // [Review Fix #GroupSpaces3] Project root's display label without changing machine ownership or query results.
+    if let Some(spaces) = value["data"]["spaces"].as_array_mut() {
+        for space in spaces {
+            if space["is_root"] == true {
+                space["owner_type"] = Value::String("root".into());
+            }
+        }
+    }
 }
 
 /// [Review Fix #3] Kept for backward compatibility — routes through the unified pipeline.
@@ -3195,10 +3247,12 @@ pub(crate) fn ensure_force_for_destructive(
         return Ok(());
     }
 
+    // [Review Fix #ADriveDisplay9] Only the registered command ID is contextualized; targets remain literal.
+    let display_command = executable_adrive_command(command);
     if can_prompt {
         eprint!(
             "⚠ destructive command '{}' targeting '{}'\n  Type 'yes' to proceed: ",
-            command, target
+            display_command, target
         );
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).map_err(|e| {
@@ -3217,13 +3271,13 @@ pub(crate) fn ensure_force_for_destructive(
     if requires_delete_confirm(command) {
         return Err(CliError::ValidationError(format!(
             "critical delete command '{}' for '{}' requires --force and --confirm {} in non-interactive execution",
-            command, target, target
+            display_command, target, target
         )));
     }
 
     Err(CliError::ValidationError(format!(
         "destructive command '{}' for '{}' requires --force (or --yes in interactive shell)",
-        command, target
+        display_command, target
     )))
 }
 
@@ -3243,6 +3297,8 @@ fn ensure_exact_confirm(
 ) -> Result<(), CliError> {
     // [Review Fix #6] ADrive delete-class commands are critical in
     // non-interactive execution and must echo the public adrive:// target.
+    // [Review Fix #ADriveDisplay9] Keep confirmation input opaque while showing an executable command ID.
+    let command = executable_adrive_command(command);
     match global.confirm.as_deref() {
         Some(provided) if provided == expected => Ok(()),
         Some(provided) => Err(CliError::ValidationError(format!(
@@ -3254,4 +3310,12 @@ fn ensure_exact_confirm(
             command, expected
         ))),
     }
+}
+
+fn executable_adrive_command(command: &str) -> String {
+    // [Review Fix #ADriveDisplay9] This helper accepts internal command IDs, never user messages or paths.
+    command
+        .strip_prefix("ve-adrive ")
+        .map(|suffix| format!("{} {suffix}", invocation_prefix("ve-adrive")))
+        .unwrap_or_else(|| command.to_string())
 }

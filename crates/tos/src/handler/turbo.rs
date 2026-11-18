@@ -46,8 +46,7 @@ pub async fn handle_turbo_command(
 
     let Some(action) = action else {
         return Err(CliError::ValidationError(
-            "`ve-tos turbo` requires a subcommand; use `ve-tos turbo --help` or `ve-tos turbo --describe`"
-                .to_string(),
+            crate::handler::common::public_tos_template("`ve-tos turbo` requires a subcommand; use `ve-tos turbo --help` or `ve-tos turbo --describe`"),
         ));
     };
 

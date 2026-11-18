@@ -1765,6 +1765,8 @@ fn selected_matches(selected: Option<&str>, name: &str) -> bool {
         .unwrap_or(true)
 }
 
+// [Review Fix #CommandDisplay10] Diagnostic product names apply to both
+// standalone and unified entrypoints without advertising another executable.
 fn config_check(global: &GlobalArgs) -> Result<DoctorCheck, CliError> {
     let path = global.config_path();
     let profile = effective_tos_profile(global)?;
@@ -1788,7 +1790,7 @@ fn config_check(global: &GlobalArgs) -> Result<DoctorCheck, CliError> {
         } else {
             "warning"
         },
-        message: "tos-cli configuration is read from the tos profile namespace and BYTE_TOS_* environment variables".to_string(),
+        message: "ByteCloud TOS configuration is read from the tos profile namespace and BYTE_TOS_* environment variables".to_string(),
         details: json!({
             "profile": global.profile,
             "config_path": path.display().to_string(),
@@ -1825,9 +1827,10 @@ fn auth_check(global: &GlobalArgs) -> Result<DoctorCheck, CliError> {
             "warning"
         },
         message: if has_access_key && has_secret_key {
-            "tos-cli credentials are configured".to_string()
+            "ByteCloud TOS credentials are configured".to_string()
         } else {
-            "tos-cli credentials are incomplete (check BYTE_TOS_* or [profile.tos])".to_string()
+            "ByteCloud TOS credentials are incomplete (check BYTE_TOS_* or [profile.tos])"
+                .to_string()
         },
         details: json!({
             "mode": "aksk",
@@ -1874,7 +1877,8 @@ fn registry_check() -> DoctorCheck {
     DoctorCheck {
         name: "registry",
         status: "passed",
-        message: "tos-cli registry exposes high-level commands and utilities only".to_string(),
+        message: "ByteCloud TOS registry exposes high-level commands and utilities only"
+            .to_string(),
         details: json!({
             "capabilities": capabilities().len(),
             "layers": ["high_level", "utilities"],
@@ -1890,13 +1894,13 @@ async fn network_check(global: &GlobalArgs, args: &DoctorArgs) -> Result<DoctorC
         let (status, message, hint) = if has_psm {
             (
                 "passed",
-                "tos-cli will use PSM service discovery; live endpoint probe is skipped without --endpoint",
+                "ByteCloud TOS will use PSM service discovery; live endpoint probe is skipped without --endpoint",
                 "run a bucket command with --psm or configure [profile.tos].psm to validate service discovery",
             )
         } else {
             (
                 "warning",
-                "tos-cli requires either an endpoint or PSM service discovery for network access",
+                "ByteCloud TOS requires either an endpoint or PSM service discovery for network access",
                 "configure endpoint via --endpoint/BYTE_TOS_ENDPOINT/[profile.tos].endpoint or PSM via --psm/BYTE_TOS_PSM/[profile.tos].psm",
             )
         };
@@ -1932,9 +1936,10 @@ async fn network_check(global: &GlobalArgs, args: &DoctorArgs) -> Result<DoctorC
         name: "network",
         status: "passed",
         message: if has_psm {
-            "tos-cli endpoint is configured; endpoint mode takes precedence over PSM".to_string()
+            "ByteCloud TOS endpoint is configured; endpoint mode takes precedence over PSM"
+                .to_string()
         } else {
-            "tos-cli endpoint is configured".to_string()
+            "ByteCloud TOS endpoint is configured".to_string()
         },
         details: json!({
             "endpoint_cli_override": global.endpoint,

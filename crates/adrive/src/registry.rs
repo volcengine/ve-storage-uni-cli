@@ -45,6 +45,12 @@ const BY_NAME_PARAMETER: RegistryParameter = RegistryParameter {
     description: "Treat ADrive instance/space target segments as names and resolve them to IDs",
 };
 
+const META_PARAMETER: RegistryParameter = RegistryParameter {
+    name: "meta",
+    required: false,
+    description: crate::cli::high_level::USERMETA_HELP,
+};
+
 const AUTH_PARAMS: &[RegistryParameter] = &[
     RegistryParameter {
         name: "auth-mode",
@@ -59,7 +65,7 @@ const AUTH_PARAMS: &[RegistryParameter] = &[
     RegistryParameter {
         name: "instance",
         required: false,
-        description: "OAuth login Instance; required unless the selected profile or ADRIVE_DEFAULT_INSTANCE supplies it",
+        description: "Optional OAuth login Instance; overrides the selected profile and ADRIVE_DEFAULT_INSTANCE, otherwise the authorization server selects it",
     },
     RegistryParameter {
         name: "auth-endpoint",
@@ -180,6 +186,7 @@ const DU_PARAMS: &[RegistryParameter] = &[
 ];
 
 const PUT_PARAMS: &[RegistryParameter] = &[
+    META_PARAMETER,
     BY_NAME_PARAMETER,
     RegistryParameter {
         name: "path",
@@ -241,6 +248,7 @@ const MKDIR_PARAMS: &[RegistryParameter] = &[
 // [Review Fix #ADrive-Discovery] Capabilities must expose every implemented
 // high-level transfer flag so agents do not have to infer behavior from help.
 const CP_PARAMS: &[RegistryParameter] = &[
+    META_PARAMETER,
     BY_NAME_PARAMETER,
     RegistryParameter {
         name: "source",
@@ -846,7 +854,8 @@ const LS_PARAMS: &[RegistryParameter] = &[
     RegistryParameter {
         name: "owner-type",
         required: false,
-        description: "OAuth Space collection: user (default) or group",
+        // [Review Fix #GroupSpaceDocs1] Help, Describe, Skill and MCP share the same group-listing contract.
+        description: crate::cli::high_level::GROUP_SPACE_LISTING_HELP,
     },
     RegistryParameter {
         name: "human-readable",
@@ -1377,6 +1386,8 @@ pub fn capabilities() -> &'static [CapabilityRow] {
         CAPABILITIES
             .iter()
             .chain(crate::share_registry::SHARE_CAPABILITIES)
+            .chain(crate::file_metadata::CAPABILITIES)
+            .chain(crate::chunk_metadata::CAPABILITIES)
             .cloned()
             .collect()
     })
@@ -1395,9 +1406,10 @@ pub fn command_domains() -> Vec<&'static str> {
 
 /// Map a command to its business skill domain, mirroring the TOS taxonomy.
 ///
-/// ADrive currently exposes only High-Level commands plus utilities, so there
-/// are three domains:
+/// ADrive exposes high-level workflows, low-level Chunk APIs and utilities:
 ///   - `adrive-transfer` high-level data movement (cp/mv/sync/ls/...)
+///   - `adrive-file`     low-level core file APIs (set-meta)
+///   - `adrive-chunk`    low-level document chunk search and read APIs
 ///   - `adrive-shared`   cross-cutting tooling (config/api/serve/skill/...)
 ///   - `adrive-admin`    operational helpers (doctor/capabilities)
 ///
@@ -1406,6 +1418,13 @@ pub fn command_domains() -> Vec<&'static str> {
 pub fn business_domain(command: &str) -> &'static str {
     let row = find_capability(command);
     let layer = row.map(|row| row.layer).unwrap_or("");
+    // [Review Fix #HelpLayers] Keep low-level resource skills out of utility exports.
+    if layer == "low-level" && row.is_some_and(|row| row.domain == "chunk") {
+        return "adrive-chunk";
+    }
+    if layer == "low-level" && row.is_some_and(|row| row.domain == "file") {
+        return "adrive-file";
+    }
     if layer == "high-level" {
         return "adrive-transfer";
     }

@@ -108,7 +108,7 @@ fn validate_tos_cli_storage_class(command: &TosCliCommand) -> Result<(), CliErro
     if storage_class.is_some() {
         return Err(CliError::ValidationError(format!(
             "{} does not support --storage-class",
-            crate::cli::command_path(command)
+            crate::registry::public_tos_command(&crate::cli::command_path(command))
         )));
     }
     Ok(())

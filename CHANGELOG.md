@@ -1,5 +1,18 @@
 # ChangeLog of Volcengine Storage Unified CLI
 
+## 版本号：v1.0.4（未发布）
+
+- 修复 ve-tos Low-Level 对象协议：元数据改用编码后的请求头并显式控制更新策略；保留未指定的 Content-Type；时间、过期时间、Fetch、标签、版本选择及 status 路由按真实协议构造请求。
+- 修复数据处理任务类型和任务 ID、ObjectSet 名称选择器及数据集解绑请求体，补齐请求格式、状态回读与显式启用的真实服务回读测试。
+- 修复 ByteTOS 中文递归列举帮助仍展示 auto/flat 的问题，统一为仅支持 hierarchical；修正缺少 config 测试的 region 前置条件，并将分享操作发现测试对齐到 share 子命令帮助。
+- 三个独立 CLI、统一入口及共享 CLI crates 统一为 1.0.4。tos-cli 本次发版包含近期已合入 master 的公共 Help、Usage、错误 message、修复命令及 Doctor 指引修复；本 MR 不新增 ByteTOS 存储协议修改。
+
+- 修复 OAuth group Space 列举：RootSpace 合入 `data.spaces`，按 SpaceID 去重置顶并计入 `--max-keys`；CLI 续页游标记录 root 已返回状态及部分页位置，避免 `--max-keys 1` 漏项。结构化输出保留真实 owner_type 并增加 is_root，无 `--query` 的 table/CSV/Markdown 将 root 行标为小写 root；清单和统计使用合并后的实际行数，保留 root_space 与旧服务 marker 兼容。
+- 全局统一 CLI 自写操作指引的实际入口：覆盖错误正文、修复建议、Doctor 检查项、跨服务配置建议、预演确认、中英文 help、Describe、Skill/MCP 描述和导出。保留机器命令标识、Schema 字面值、真实用户参数、服务端文本及多入口补全注册，新增六入口回归和命令根词表一致性校验。
+- 补齐批量失败摘要和分享下载 OAuth 失败的 doctor_hint／修复命令入口转换，覆盖三个独立 CLI 及统一入口。
+- 修复独立 CLI 参数错误的 Usage 泄露统一入口名称：错误用法和修复／诊断命令按实际入口显示，覆盖 ve-adrive-cli、ve-tos-cli、tos-cli 及统一入口，保留结构化命令标识、服务端错误内容和分享链接脱敏。
+- 统一 ADrive 命令层级：根 help 将 share 入口归入 High-Level Commands、chunk 入口归入 Low-Level Commands，子命令通过各组 help 展开；同步中英文帮助、根与叶 Describe、能力分组和筛选、Chunk Skill 业务域、MCP 发现及 Doctor 原则检查。
+
 ## 版本号：v1.0.3（未发布）
 
 - 业务 HTTP 客户端升级至 reqwest 0.13.5，启用平台证书验证及系统 CA，并显式保留 query/form/json/stream 能力；凭据 SDK 暂用的 reqwest 0.12 同时启用系统根证书加载（与其内置 CA 合并）。同步三个独立 CLI 的锁文件及证书说明，保持证书链与主机名校验，沿用原有代理、超时和重试行为。

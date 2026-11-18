@@ -606,6 +606,12 @@ fn test_help_output() {
         .expect("Failed to execute");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("ve-storage-uni-cli"));
+    for dedicated in ["tos-cli", "ve-tos-cli", "ve-adrive-cli"] {
+        assert!(
+            !stdout.contains(dedicated),
+            "root help leaked {dedicated}: {stdout}"
+        );
+    }
     assert!(stdout.contains("tos"));
     assert!(stdout.contains("ve-tos"));
     // [Help-Cleanup #1] tosvector / tostable are intentionally hidden from the
@@ -637,6 +643,25 @@ fn test_help_output() {
         !stdout.contains("APIs"),
         "top-level --help must not include API-count strings"
     );
+}
+
+#[test]
+fn test_unified_tool_help_uses_only_unified_invocations() {
+    for args in [
+        vec!["tos", "--help"],
+        vec!["ve-tos", "--help"],
+        vec!["ve-tos", "--help", "--language", "zh"],
+        vec!["ve-adrive", "--help", "--language", "zh"],
+        vec!["tos", "completion", "bash", "--help"],
+    ] {
+        let stdout = successful_cli_stdout(&args);
+        for dedicated in ["tos-cli", "ve-tos-cli", "ve-adrive-cli"] {
+            assert!(
+                !stdout.contains(dedicated),
+                "args={args:?}, leaked {dedicated}: {stdout}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -2305,7 +2330,7 @@ fn test_chinese_auth_help_localizes_new_authentication_contract() {
     let login_help =
         successful_cli_stdout(&["ve-adrive", "auth", "login", "--help", "--language", "zh"]);
     for expected in [
-        "要授权的 ADrive Instance ID",
+        "要授权的 ADrive Instance ID。覆盖 profile default_instance 和 ADRIVE_DEFAULT_INSTANCE；未设置时由授权服务器选择 Instance",
         "OAuth 授权服务器基础 URL",
         "授权期间显示的人类可读设备名称",
     ] {
@@ -3080,8 +3105,9 @@ fn test_chinese_adrive_root_config_and_raw_api_describe_are_localized() {
     assert_adrive_metadata_localized(
         &root,
         &[
-            "ADrive CLI 高层文件操作与 Agent 工具",
-            "adrive:// URI 和 flags",
+            "ADrive CLI 文件工作流、分享链接、文档 Chunk API 与 Agent 工具",
+            "支持 URI 和显式选择器的文件管理及分享工作流",
+            "文档片段 API 操作",
         ],
         &["high-level file operations", "File management operations"],
         "ve-adrive root",
@@ -3837,6 +3863,8 @@ fn test_adrive_help() {
         .output()
         .expect("Failed to execute");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ve-storage-uni-cli ve-adrive <command> [options]"));
+    assert!(!stdout.contains("  ve-adrive-cli <command> [options]"));
     assert!(stdout.contains("cp"));
     assert!(stdout.contains("crt"));
     assert!(stdout.contains("del"));
@@ -4881,20 +4909,29 @@ fn test_adrive_capabilities_schema_matches_agent_contract() {
             "critical capability examples must include --confirm: {capability:?}"
         );
     }
-    assert!(!data["groups"]
+    assert!(data["groups"]
         .as_array()
         .expect("groups")
         .iter()
-        .any(|group| group["name"] == "Low-Level API" || group["layer"] == "low_level"));
-    assert!(!data["capabilities"]
-        .as_array()
-        .expect("capabilities")
+        .any(|group| group["layer"] == "low_level" && group["command_count"] == 3));
+    // [Review Fix #HelpLayers] File and Chunk APIs are implemented; raw instance passthrough remains unavailable.
+    let low_level: Vec<_> = capabilities
         .iter()
-        .any(|cap| cap["layer"] == "low-level"
-            || cap["command"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("ve-adrive api instance")));
+        .filter(|cap| cap["layer"] == "low-level")
+        .map(|cap| cap["command"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        low_level,
+        [
+            "ve-adrive file set-meta",
+            "ve-adrive chunk search",
+            "ve-adrive chunk read"
+        ]
+    );
+    assert!(!capabilities.iter().any(|cap| cap["command"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("ve-adrive api instance")));
 }
 
 #[test]
@@ -4978,7 +5015,16 @@ fn test_adrive_parse_error_uses_failed_envelope() {
     assert_eq!(parsed["command"], "ve-adrive cp");
     assert_eq!(parsed["error"]["kind"], "validation_error");
     assert_eq!(parsed["error"]["exit_code"], 6);
-    assert_eq!(parsed["error"]["fix_command"], "ve-adrive <command> --help");
+    // [Review Fix #ErrorEntry3] Human repair commands follow the entrypoint;
+    // the machine command above remains the canonical identifier.
+    assert_eq!(
+        parsed["error"]["fix_command"],
+        "ve-storage-uni-cli ve-adrive <command> --help"
+    );
+    assert!(parsed["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Usage: ve-storage-uni-cli ve-adrive cp "));
 }
 
 #[test]
@@ -6028,6 +6074,9 @@ fn test_tos_data_process_command_parse() {
             "ve-tos",
             "data-process",
             "list-jobs",
+            // [Review Fix #JobType] A job query requires its task type.
+            "--job-type",
+            "Transcode",
             "--bucket",
             "b",
         ],

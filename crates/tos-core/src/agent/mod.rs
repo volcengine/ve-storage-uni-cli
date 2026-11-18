@@ -15,6 +15,7 @@
  */
 
 pub mod capabilities;
+pub mod command_display;
 pub mod describe;
 pub mod dryrun;
 pub mod envelope;

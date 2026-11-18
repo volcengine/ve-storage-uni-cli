@@ -606,9 +606,11 @@ impl TosClient {
             let data_endpoint = self.service_endpoint();
             derive_tos_control_endpoint(Some(&data_endpoint)).ok_or_else(|| {
                 CliError::ConfigMissing(
-                    "control_endpoint is required when it cannot be derived from endpoint; \
-                     run `ve-tos-cli config set control_endpoint <value>` or pass --control-endpoint"
-                        .to_string(),
+                    crate::agent::command_display::render_template(
+                        "control_endpoint is required when it cannot be derived from endpoint; \
+                         run `ve-tos-cli config set control_endpoint <value>` or pass --control-endpoint",
+                        "ve-tos",
+                    ),
                 )
             })?
         };
