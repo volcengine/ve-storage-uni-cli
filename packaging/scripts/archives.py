@@ -57,6 +57,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Release platform metadata JSON",
     )
+    parser.add_argument(
+        "--command",
+        action="append",
+        choices=COMMANDS,
+        help="Include only this CLI in the archive; can be repeated",
+    )
     return parser.parse_args()
 
 
@@ -150,6 +156,8 @@ def update_checksums(out_dir: Path) -> None:
 def main() -> None:
     args = parse_args()
     archive_name, commands = release_plan(args.metadata, args.target)
+    if args.command:
+        commands = tuple(dict.fromkeys(args.command))
     out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -167,7 +175,9 @@ def main() -> None:
             is_windows=args.target.endswith("windows-msvc"),
         )
         make_archive(stage_dir, out_dir / archive_name)
-        copy_shell_installer(out_dir)
+        # [Review Fix #1] The generic installer expects every CLI in the archive.
+        if set(commands) == set(COMMANDS):
+            copy_shell_installer(out_dir)
         update_checksums(out_dir)
     finally:
         # [Review Fix #3] Always remove staging files, including when archive

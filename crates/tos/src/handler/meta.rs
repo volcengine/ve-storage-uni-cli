@@ -27,6 +27,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
+use tos_core::agent::command_display::{
+    invocation_prefix, render_template, render_template_with_prefix,
+};
 use tos_core::agent::describe::RiskLevel;
 use tos_core::agent::envelope::Envelope;
 use tos_core::agent::error::CliError;
@@ -155,6 +158,19 @@ const VE_TOS_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Content-MD5 request header for JSON body", "JSON 正文的 Content-MD5 请求头"),
     ("Content-Type for TOS uploads/copies", "TOS 上传/复制使用的 Content-Type"),
     ("Content-Type for the uploaded object", "上传对象使用的 Content-Type"),
+    // [Review Fix #ProtocolHelp] Localize corrected request semantics and units.
+    ("Explicit Content-Type update (REPLACE_NEW preserves omitted values)", "显式更新 Content-Type（REPLACE_NEW 保留未指定的值）"),
+    ("Metadata replacement mode (REPLACE_NEW merges supplied values; REPLACE replaces all)", "元数据更新策略（REPLACE_NEW 合并指定值；REPLACE 全量替换）"),
+    ("Unique tag (x-tos-unique-tag)", "唯一 tag（x-tos-unique-tag）"),
+    ("Custom metadata, encoded once", "自定义元数据，编码一次"),
+    ("Nonnegative TTL days; 0 clears expiration", "非负整数 TTL 天数；0 清除过期设置"),
+    ("Object TTL in nonnegative integer days (0 clears expiration)", "对象 TTL，单位为非负整数天数（0 清除过期设置）"),
+    // [Review Fix #ProtocolQueryConstants] Describe resolved query names in both languages.
+    ("Recursive delete flag (recursive query)", "递归删除参数（recursive）"),
+    ("Skip trash flag (skipTrash query)", "跳过回收站参数（skipTrash）"),
+    ("Compatibility seconds value; must agree with --time (x-tos-modify-timestamp)", "兼容的秒数参数，必须与 --time 一致（x-tos-modify-timestamp）"),
+    ("Fractional nanoseconds in 0..999999999 (x-tos-modify-timestamp-ns)", "秒内纳秒数，范围 0..999999999（x-tos-modify-timestamp-ns）"),
+    ("Get object file status (alias of stat)", "获取对象文件状态（stat 的别名）"),
     ("Content-Type header", "Content-Type 请求头"),
     ("Continuation token", "续传 token"),
     ("Continuation token for listing tasks", "列出任务时使用的续传 token"),
@@ -1478,7 +1494,8 @@ pub async fn handle_capabilities_command(
     global: &GlobalArgs,
     args: &CapabilitiesArgs,
 ) -> Result<i32, CliError> {
-    let view = capabilities_view(args)?;
+    let mut view = serde_json::to_value(capabilities_view(args)?)?;
+    render_ve_tos_documentation(&mut view);
     output_result_with_columns(
         global,
         &Envelope::success("ve-tos capabilities", view),
@@ -1606,8 +1623,12 @@ fn capabilities_view(args: &CapabilitiesArgs) -> Result<CapabilitiesView<'_>, Cl
     if let Some(group) = args.group.as_deref() {
         if !is_known_group_or_category(group) {
             return Err(CliError::ValidationError(format!(
-                "unknown capabilities group '{}': use `ve-tos capabilities --view groups` to list valid groups",
-                group
+                "unknown capabilities group '{}': {}",
+                group,
+                render_template(
+                    "use `ve-tos capabilities --view groups` to list valid groups",
+                    "ve-tos"
+                )
             )));
         }
     }
@@ -1897,12 +1918,20 @@ fn build_text_lines(caps: &[CapabilityRow], commands: &[CommandTreeEntry]) -> Ve
     let mut lines: Vec<String> = Vec::new();
     for cap in caps {
         if seen.insert(cap.command.clone()) {
-            lines.push(format!("{}\t{}", cap.command, cap.description));
+            lines.push(format!(
+                "{}\t{}",
+                cap.command,
+                render_template(&cap.description, "ve-tos")
+            ));
         }
     }
     for entry in commands {
         if seen.insert(entry.command.clone()) {
-            lines.push(format!("{}\t{}", entry.command, entry.description));
+            lines.push(format!(
+                "{}\t{}",
+                entry.command,
+                render_template(&entry.description, "ve-tos")
+            ));
         }
     }
     lines
@@ -2770,6 +2799,7 @@ fn skill_index_markdown(
                 DocumentationLanguage::En => skill.description.clone(),
                 DocumentationLanguage::Zh => localized_skill_description_zh(skill),
             };
+            let description = render_template(&description, "ve-tos");
             body.push_str(&format!(
                 "- [{}](./{}/{}/SKILL.md): `{}` - {}\n",
                 skill.name,
@@ -2806,6 +2836,7 @@ fn skill_markdown(
     } else {
         skill.description.clone()
     };
+    let description = render_template(&description, "ve-tos");
     // [Review Fix #Skill2] Resolve every displayed command at export time;
     // canonical registry IDs and MCP names remain stable across entrypoints.
     let public_command = public_tos_example(&skill.command);
@@ -2950,10 +2981,12 @@ fn build_mcp_server(global: &GlobalArgs) -> Result<tos_core::mcp::TosMcpServer, 
         .into_iter()
         .map(|skill| {
             let destructive = matches!(skill.risk_level.as_str(), "high" | "critical");
+            let mut input_schema = skill.input_schema;
+            render_ve_tos_documentation(&mut input_schema);
             ToolEntry::from_parts(
-                skill.name.clone(),
-                skill.description.clone(),
-                skill.input_schema.clone(),
+                skill.name,
+                render_template(&skill.description, "ve-tos"),
+                input_schema,
                 destructive,
             )
         })
@@ -3715,7 +3748,8 @@ fn config_check(global: &GlobalArgs) -> Result<DoctorCheck, CliError> {
     Ok(DoctorCheck {
         name: "config",
         status: if is_ready { "passed" } else { "warning" },
-        message: "effective TOS profile loaded with redacted fields".to_string(),
+        // [Review Fix #CommandDisplay5] Product wording remains valid for either executable entrypoint.
+        message: "effective Volcengine TOS profile loaded with redacted fields".to_string(),
         details: json!({
             // [Review Fix #DoctorShape] Expose the same common config keys as
             // tos-cli and ve-adrive while retaining the historical ve-tos keys.
@@ -4166,12 +4200,14 @@ fn skill_definitions() -> Vec<SkillDefinition> {
 
 fn skill_definitions_for_language(language: DocumentationLanguage) -> Vec<SkillDefinition> {
     let mut definitions = skill_definitions();
-    if matches!(language, DocumentationLanguage::Zh) {
-        for definition in &mut definitions {
+    for definition in &mut definitions {
+        if matches!(language, DocumentationLanguage::Zh) {
             definition.description = localized_skill_description_zh(definition);
             definition.input_schema = localized_input_schema(&definition.input_schema, language);
             definition.usage = localized_skill_usage_zh(&definition.usage);
         }
+        definition.description = render_template(&definition.description, "ve-tos");
+        render_ve_tos_documentation(&mut definition.input_schema);
     }
     definitions
 }
@@ -4200,10 +4236,12 @@ fn translated_ve_tos_metadata(source: &'static str) -> &'static str {
 }
 
 fn localized_input_schema(schema: &Value, language: DocumentationLanguage) -> Value {
-    match language {
+    let mut localized = match language {
         DocumentationLanguage::En => schema.clone(),
         DocumentationLanguage::Zh => localize_schema_descriptions_zh(schema),
-    }
+    };
+    render_ve_tos_documentation(&mut localized);
+    localized
 }
 
 fn localize_schema_descriptions_zh(value: &Value) -> Value {
@@ -4250,6 +4288,72 @@ fn localize_schema_descriptions_zh(value: &Value) -> Value {
 /// machine fields such as commands, examples, API names, and enum values stay exact.
 pub fn localize_ve_tos_auth_documentation_zh(value: &mut Value) {
     localize_ve_tos_metadata_value_zh(value, "", false);
+}
+
+/// Render trusted VeTOS documentation after localization for the active entrypoint.
+/// Only known prose fields are rewritten; command IDs and schema literals remain exact.
+/// The caller must supply CLI-owned metadata, never upstream or user-owned content.
+pub fn render_ve_tos_documentation(value: &mut Value) {
+    let is_schema = value.get("properties").is_some();
+    render_ve_tos_metadata(value, "", false, is_schema, &invocation_prefix("ve-tos"));
+}
+
+fn render_ve_tos_metadata(
+    value: &mut Value,
+    parent: &str,
+    is_human: bool,
+    is_schema: bool,
+    prefix: &str,
+) {
+    // [Review Fix #CommandDisplay2] Render only metadata prose after catalog
+    // lookup; machine IDs, schema defaults and completion registrations are contracts.
+    match value {
+        Value::String(text) if is_human => {
+            *text = render_template_with_prefix(text, "ve-tos", prefix);
+        }
+        Value::Array(items) => {
+            for item in items {
+                render_ve_tos_metadata(item, parent, is_human, is_schema, prefix);
+            }
+        }
+        Value::Object(fields) => {
+            for (key, child) in fields {
+                if is_documentation_contract_field(key) || is_schema && key == "examples" {
+                    continue;
+                }
+                let child_is_schema =
+                    is_schema || matches!(key.as_str(), "schema" | "input_schema" | "inputSchema");
+                let child_is_human = is_human || is_ve_tos_human_metadata_field(parent, key);
+                render_ve_tos_metadata(child, key, child_is_human, child_is_schema, prefix);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_documentation_contract_field(key: &str) -> bool {
+    is_ve_tos_machine_metadata_field(key)
+        || matches!(
+            key,
+            "output_filter_examples"
+                | "related_commands"
+                | "actions"
+                | "default"
+                | "const"
+                | "registered_command_names"
+                | "mode_resolution"
+                | "script"
+                | "request"
+                | "request_plan"
+                | "headers"
+                | "query"
+                | "body"
+                | "payload"
+                | "config"
+                | "value"
+                | "values"
+                | "argv"
+        )
 }
 
 fn localize_ve_tos_metadata_value_zh(value: &mut Value, parent: &str, is_human: bool) {
@@ -5572,5 +5676,51 @@ mod tests {
             zti_token_provider: None,
             documentation_language: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod command_display_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn renders_prose_after_localization_and_preserves_machine_and_user_values() {
+        let prefix = "ve-storage-uni-cli ve-tos";
+        let mut document = json!({
+            "command": "ve-tos rb",
+            "description": "先运行 ve-tos rm；then run ve-tos doctor",
+            "related_commands": ["ve-tos rm"],
+            "scenario_routing": {"cleanup": "use ve-tos rm", "registered_command_names": "ve-tos doctor"},
+            "input_schema": {"type": "object", "properties": {"target": {
+                "description": "use ve-tos doctor", "default": "ve-tos doctor",
+                "enum": ["ve-tos doctor"], "examples": ["ve-tos doctor"]
+            }}},
+            "request": {"body": {"description": "ve-tos doctor"}},
+            "examples": ["ve-tos ls | ve-tos cat"],
+            "script": "ve-tos doctor"
+        });
+        render_ve_tos_metadata(&mut document, "", false, false, prefix);
+        assert_eq!(document["command"], "ve-tos rb");
+        assert_eq!(
+            document["description"],
+            format!("先运行 {prefix} rm；then run {prefix} doctor")
+        );
+        assert_eq!(document["related_commands"][0], "ve-tos rm");
+        assert_eq!(
+            document["scenario_routing"]["cleanup"],
+            format!("use {prefix} rm")
+        );
+        assert_eq!(
+            document["scenario_routing"]["registered_command_names"],
+            "ve-tos doctor"
+        );
+        let target = &document["input_schema"]["properties"]["target"];
+        assert_eq!(target["description"], format!("use {prefix} doctor"));
+        assert_eq!(target["default"], "ve-tos doctor");
+        assert_eq!(target["enum"][0], "ve-tos doctor");
+        assert_eq!(target["examples"][0], "ve-tos doctor");
+        assert_eq!(document["request"]["body"]["description"], "ve-tos doctor");
+        assert_eq!(document["examples"][0], "ve-tos ls | ve-tos cat");
+        assert_eq!(document["script"], "ve-tos doctor");
     }
 }

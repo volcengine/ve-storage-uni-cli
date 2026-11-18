@@ -1,6 +1,6 @@
 ---
 name: ve-adrive-cli
-description: Use when managing Volcengine A-Drive resources with ve-adrive-cli, including AK/SK, OAuth, or Unified authentication, login and status, owner-aware Space creation and listing, and file/folder operations or whole-Space share links.
+description: Use when managing Volcengine A-Drive resources with ve-adrive-cli, including authentication, Space and file operations, share links, and searching or reading document chunks in an IDS Space for citation-grounded RAG answers.
 ---
 
 # ve-adrive-cli
@@ -83,6 +83,7 @@ Read [Safety](references/safety.md) before making changes or sharing URLs.
 | User intent                 | Start here                                  | Completion evidence                                             |
 |-----------------------------|---------------------------------------------|-----------------------------------------------------------------|
 | Inspect or locate resources | `ls`, `stat`, then `find`/`du` if supported | Exact target, metadata, and listing completeness                |
+| Answer from Space documents | `chunk search`, then `chunk read` if needed | Matching text and exact `FilePath#ChunkOrdinal` citations |
 | Upload, download, or copy   | `cp --help`, then a concrete dry-run        | Destination metadata or local file verification                 |
 | Reconcile a directory       | `sync --help` and a dry-run                 | Planned versus completed transfers; deletion count if requested |
 | Remove or move resources    | Exact source/target and command contract    | Remaining source/target state, including failed items           |
@@ -106,6 +107,12 @@ documentation; it does not run storage operations or configure an Agent to load 
 that session's domain-qualified entry point when requesting an export.
 
 ## Discovery
+
+Root help groups `share` under High-Level Commands and `chunk` under Low-Level
+Commands. Use `share --help` or `chunk --help` to discover their actions.
+`capabilities --layer high_level` includes sharing workflows; `--layer low_level`
+selects the implemented Chunk APIs. Exported Chunk skills use the `adrive-chunk`
+domain and retain their existing `ve_adrive_chunk_search` / `ve_adrive_chunk_read` names.
 
 Start read-only. Resolve and verify the executable first, then inspect the selected Profile. Keep full capability
 discovery conditional because its compact JSON output is large; use it only when command support is uncertain:
@@ -174,7 +181,7 @@ ve-adrive-cli ls adrive://<instance-id> --output json
 ## OAuth login
 
 Default to OAuth for a user's cloud drive. When the user asks to set up or log in, configure the selected Profile once
-so later Resource commands stay short. For normal public ADrive, require only the Instance ID and use:
+so later Resource commands stay short. For normal public ADrive, use:
 
 - Auth base URL: defaults to the configured Resource endpoint; set `auth_endpoint` only when a separate Auth service is required.
 - Resource base URL: `https://idsapi.volces.com`
@@ -194,9 +201,13 @@ requests a non-persistent invocation, pass the same values as command or environ
 ve-adrive-cli config set auth_mode oauth
 ve-adrive-cli config set endpoint https://idsapi.volces.com
 ve-adrive-cli config set region cn-beijing
-ve-adrive-cli config set default_instance <instance-id>
 ve-adrive-cli config show --output json
 ```
+
+Set `default_instance` only when the user wants to choose a specific Instance; `--instance` overrides it for one login.
+If neither is set and `ADRIVE_DEFAULT_INSTANCE` is absent, the Auth service selects the Instance. The CLI requires a
+nonempty Instance ID in the Token response and saves that ID with the OAuth credentials, independently of
+`default_instance` in the Profile.
 
 Pass only the base URL to `--auth-endpoint`; the CLI appends paths such as
 `/v1/oauth/device_authorization` and `/v1/oauth/token`. Keep the foreground process running while the user completes
@@ -222,7 +233,7 @@ plus Doctor validate local credential readiness; finish a real end-to-end check 
 rather than business API success.
 
 Treat an OAuth status as reusable only when `ready` is true and its
-`instance_id` matches the requested Instance. Otherwise start a new explicit login for the requested Instance.
+`instance_id` matches the requested Instance. Otherwise start a new login for the requested Instance with `--instance`.
 
 OAuth login stores returned identity metadata such as `user_id` with the selected profile. It does not decode identity
 from a Token.
@@ -262,8 +273,34 @@ ve-adrive-cli ls adrive://<instance-id> --owner-type user \
   --max-keys 1000 --marker '<previous-next-marker>' --output json
 ```
 
-Run the same loop for `--owner-type group`. Count any separately returned
-`data.root_space` once across all pages. Report user-owned and group-owned counts separately before the total.
+Run the same loop for `--owner-type group`. For OAuth group listings, the returned
+`RootSpace` is merged into `data.spaces`, deduplicated by `SpaceID`, and placed first.
+Every `data.spaces` row has an `is_root` boolean. Root counts toward `--max-keys`
+and, once identified by RootSpace, appears only once along the CLI's `data.next_marker` chain, including
+when `--max-keys 1`. If no RootSpace exists, listing succeeds with the other Spaces.
+
+Count the returned `data.spaces` rows across pages. `data.root_space` remains for
+compatibility; do not add it again to counts or manifests. An explicit
+`--manifest-path` lists the merged, deduplicated rows, including root; its total
+uses the actual rows written. Report user-owned and group-owned counts separately
+before the total.
+
+JSON/YAML/XML preserve each Space's actual `owner_type`; use `is_root` to identify
+root. Without `--query`, table/CSV/Markdown display root's `owner_type` as lowercase
+`root` and leave other owner types unchanged. This display label does not change
+the Space's actual ownership.
+
+Group continuation markers are opaque CLI cursors that retain whether root was
+already returned, the service continuation marker, and a partially consumed page's
+replay position. Pass them back unchanged for the same Instance and owner
+collection; never parse, concatenate, edit, or reuse them for another collection.
+They contain no credentials. Legacy raw service markers remain accepted, but
+continue new results using the exact `data.next_marker` returned by the CLI.
+If RootSpace first appears after the same ID was returned on an earlier logical
+page as an ordinary Space, that earlier result cannot be retroactively reclassified.
+Listing is not a snapshot: concurrent service changes can affect later pages.
+Other authentication modes, user Space collections, and AK/SK pagination keep
+their existing behavior.
 
 After discovering Spaces, list each Space root with the same pagination loop:
 
@@ -318,6 +355,63 @@ ve-adrive-cli mkdir \
 Local-directory uploads with `cp --recursive` and `sync` preserve selected directories, including empty directories, by default. `--disable-dir-object` skips explicit directory uploads; it is valid only for local-directory uploads. Files can still create required parents in HNS/ADrive. ADrive preserves directories with its folder API. Both manifest and `--no-manifest` execution preserve the same directory policy. An empty source creates the effective destination folder when a non-root path exists; `--include-parent` retains the source basename. Directory tasks count as items with zero bytes. The switch does not authorize deleting source-present directories during `sync --delete`.
 
 Use `ve-adrive-cli <command> --help` when non-connection flags are uncertain.
+
+## File User Metadata
+
+`cp` local uploads and `put` accept `--meta 'owner=xsh#env=test'` or a JSON
+object of strings, also named `--usermeta` or `--metadata`. Pass literal values, not pre-encoded
+text. JSON supports Chinese, `#`, newlines and literal percent signs. `&` is not a separator.
+Keys are case-insensitive ASCII letters, digits, hyphens or underscores;
+`ids-*` is reserved. Do not assume a separate client-side capacity budget.
+
+For an existing file, run:
+
+```bash
+ve-adrive-cli file set-meta adrive://<instance-id>/<space-id>/docs/a.txt --meta '{"env":"prod","empty":""}' --dry-run
+ve-adrive-cli file set-meta adrive://<instance-id>/<space-id>/docs/a.txt --meta '{"env":"prod","empty":""}'
+ve-adrive-cli stat adrive://<instance-id>/<space-id>/docs/a.txt --output json --query 'data.meta'
+```
+
+`file set-meta` is the low-level file resource command, aligned with
+`ve-tos object set-meta`. The update is incremental: omitted keys remain, empty values are not deletions,
+and file content is not re-uploaded. This is not TOS object tagging. Check errors
+and read back metadata before reporting success. Capacity/permission failures
+must not be reported as applied. Recursive `cp --meta` affects uploaded files,
+not directory markers or skipped files; remote-source copy directions reject it.
+Both single and multipart uploads preserve the same metadata. Checkpoint resumes
+must not silently reuse a multipart upload initialized with different metadata.
+
+## Document chunks (Space)
+
+Use the selected OAuth profile with `file:read` and permission for the target files.
+The instance must already have Doc `fileAndChunk` indexing configured. Do not change
+configuration, upload a file, trigger a scan, or add media types to make a query work.
+Do not substitute AK/SK, Unified, or an administrator identity for the selected user.
+
+```bash
+ve-adrive-cli chunk search --help
+ve-adrive-cli chunk search adrive://instance-id/space-id/handbook/ --text '出差住宿标准是多少' --limit 5 --output json
+ve-adrive-cli chunk read --instance instance-id --space space-id --file handbook/travel.txt --etag 'etag-from-current-search' --ordinals 0,1 --output json
+```
+
+- Search is recursive by default; `--no-recursive` limits it to direct children.
+  Use `--text` for the query, not global `--query` (JMESPath output filtering).
+  Text is nonempty after trimming and at most 100 UTF-8 bytes; limit is 1–100.
+- Keep Instance, Space, `FilePath`, `ETag` and ordinals together from the same hit.
+  Explicit selectors accept literal file paths; percent-encode reserved characters
+  in `adrive://` URIs. Do not silently broaden the search to another directory.
+- `chunk read` takes either unique `--ordinals 0,1` or inclusive `--range 0-1`, at
+  most 20 chunks. A stale version may return 404; search again and re-evaluate the
+  answer rather than replacing the ETag in an existing citation.
+- Empty `data.Items` is a successful no-match response, not readiness evidence.
+  Preserve 403/409/503 distinctions; no automatic polling or environment repair.
+- `ChunkTruncated=true` means source content was not fully indexed. Reading
+  neighbouring indexed chunks cannot recover the omitted source content.
+- Quote only returned text, cite `FilePath#ChunkOrdinal`, and state when the
+  evidence cannot answer the question. Avoid exposing tokens or ETags in answers.
+- `--describe` and `--dry-run` are offline; a plan is not a successful search.
+  If the installed version lacks `chunk`, report that version mismatch rather
+  than introducing another CLI or guessing a command.
 
 ## Share links (V1)
 

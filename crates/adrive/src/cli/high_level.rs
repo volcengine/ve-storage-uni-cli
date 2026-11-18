@@ -15,6 +15,9 @@
  */
 
 use clap::{Args, ValueEnum};
+use std::collections::HashMap;
+
+pub const USERMETA_HELP: &str = "User metadata as key=value#key2=value2 or a JSON object of strings. Keys are case-insensitive ASCII letters, digits, hyphens and underscores; ids-* is reserved. Empty values are stored, not deleted. Capacity is enforced by the service. On cp, applies only to uploaded files, not directory markers; remote sources are not supported with --meta.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ProgressGranularity {
@@ -108,6 +111,9 @@ pub struct CpArgs {
     /// Checkpoint directory override
     #[arg(long)]
     pub checkpoint_dir: Option<String>,
+    /// User metadata for local uploads: key=value#key2=value2 or JSON; directory markers are unchanged
+    #[arg(long, aliases = ["usermeta", "metadata"], value_parser = crate::domain::metadata::parse_user_metadata)]
+    pub meta: Option<HashMap<String, String>>,
     /// File size threshold for checkpoint multipart/range transfer (e.g., 20MB)
     #[arg(long)]
     pub checkpoint_threshold: Option<String>,
@@ -464,6 +470,9 @@ pub enum RecursiveDeleteMode {
     Direct,
 }
 
+/// Shared group Space listing contract for help and discovery metadata.
+pub const GROUP_SPACE_LISTING_HELP: &str = "OAuth Space collection: user (default) or group. OAuth group listing merges RootSpace into data.spaces, deduplicates by SpaceID and places root first. Each row includes is_root; root counts toward --max-keys; once identified by RootSpace, it appears once when following CLI continuation cursors, including --max-keys 1. If RootSpace first appears after the same ID was returned on an earlier logical page as an ordinary Space, that earlier row cannot be retroactively reclassified. Missing RootSpace does not suppress other Spaces. JSON/YAML/XML preserve the real owner_type; table/CSV/Markdown without --query display the root row owner_type as lowercase root and leave other rows unchanged. data.root_space remains for compatibility; counts and manifests use only merged data.spaces, without counting root again. CLI group cursors retain the emitted root, service marker and partial-page replay position; they contain no credentials and must be passed unchanged within the same Instance and owner collection. Do not parse, construct, modify or reuse cursors across collections. Legacy raw service markers remain accepted; use the CLI-returned data.next_marker for new pagination. Listing is not a snapshot; other authentication modes, the user collection and AK/SK pagination retain their existing behavior.";
+
 #[derive(Debug, Clone, Args)]
 #[command(
     after_help = "Examples:\n  ve-adrive-cli ls\n  ve-adrive-cli ls --instance myinst\n  ve-adrive-cli ls adrive://myinst --owner-type group\n  ve-adrive-cli ls --instance myinst --space myspace\n  ve-adrive-cli ls adrive://myinst/myspace/prefix/ --max-keys 100"
@@ -491,7 +500,7 @@ pub struct LsArgs {
     #[arg(long)]
     pub marker: Option<String>,
     /// OAuth Space owner collection to list
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, long_help = GROUP_SPACE_LISTING_HELP)]
     pub owner_type: Option<OwnerType>,
     /// Human-readable sizes
     #[arg(long, short = 'H')]
@@ -687,6 +696,9 @@ pub struct PutArgs {
     /// Content-Type for the uploaded file
     #[arg(long)]
     pub content_type: Option<String>,
+    /// User metadata: key=value#key2=value2 or a JSON object of strings
+    #[arg(long, aliases = ["usermeta", "metadata"], value_parser = crate::domain::metadata::parse_user_metadata)]
+    pub meta: Option<HashMap<String, String>>,
     /// Stdin size threshold for switching to multipart upload (e.g., 20MB)
     #[arg(long)]
     pub multipart_threshold: Option<String>,
@@ -728,9 +740,72 @@ pub struct MkdirArgs {
 
 #[cfg(test)]
 mod tests {
-    use clap::ValueEnum;
+    use clap::{Args, Command, ValueEnum};
 
-    use super::{OwnerType, ServiceType};
+    use super::{CpArgs, OwnerType, PutArgs, ServiceType};
+    use crate::cli::file::SetMetaArgs;
+
+    #[test]
+    fn usermeta_help_groups_upload_options() {
+        for (mut command, before, after) in [
+            (
+                CpArgs::augment_args(Command::new("cp")),
+                "--checkpoint-dir",
+                "--checkpoint-threshold",
+            ),
+            (
+                PutArgs::augment_args(Command::new("put")),
+                "--content-type",
+                "--multipart-threshold",
+            ),
+        ] {
+            let help = command.render_long_help().to_string();
+            let meta = help.find("--meta <META>").unwrap();
+            assert!(help.find(before).unwrap() < meta, "{help}");
+            assert!(meta < help.find(after).unwrap(), "{help}");
+        }
+    }
+
+    #[test]
+    fn usermeta_option_order_preserves_upload_positionals() {
+        let target = "adrive://inst/space/file.txt";
+        for (option, before_path) in ["--meta", "--usermeta", "--metadata"]
+            .into_iter()
+            .flat_map(|option| [true, false].map(|before| (option, before)))
+        {
+            for (command, positionals) in [
+                (
+                    CpArgs::augment_args(Command::new("cp")),
+                    vec!["local.txt", target],
+                ),
+                (PutArgs::augment_args(Command::new("put")), vec![target]),
+                (
+                    SetMetaArgs::augment_args(Command::new("set-meta")),
+                    vec![target],
+                ),
+            ] {
+                let mut argv = vec![command.get_name()];
+                if before_path {
+                    argv.extend([option, "owner=xsh"]);
+                }
+                argv.extend(positionals.iter().copied());
+                if !before_path {
+                    argv.extend([option, "owner=xsh"]);
+                }
+                let matches = command.clone().try_get_matches_from(argv).unwrap();
+                let meta = matches
+                    .get_one::<std::collections::HashMap<String, String>>("meta")
+                    .unwrap();
+                assert_eq!(meta["owner"], "xsh");
+                if command.get_name() == "cp" {
+                    assert_eq!(matches.get_one::<String>("source").unwrap(), "local.txt");
+                    assert_eq!(matches.get_one::<String>("destination").unwrap(), target);
+                } else {
+                    assert_eq!(matches.get_one::<String>("path").unwrap(), target);
+                }
+            }
+        }
+    }
 
     #[test]
     fn owner_type_accepts_only_lowercase_public_values() {

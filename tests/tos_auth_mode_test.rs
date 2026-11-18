@@ -584,22 +584,26 @@ fn tos_recursive_list_help_only_offers_hierarchical() {
         assert!(!list_mode.contains("- auto:"), "{command}: {list_mode}");
         assert!(!list_mode.contains("- flat:"), "{command}: {list_mode}");
     }
-    let chinese = invoke(
-        home.path(),
-        &["tos", "cp", "--help", "--language", "zh"],
-        None,
-    );
-    assert!(chinese.status.success());
-    let help = String::from_utf8(chinese.stdout).unwrap();
-    assert!(help.contains("递归列举模式：仅支持 hierarchical"), "{help}");
-    for args in [
-        vec!["tos", "cp", "-h"],
-        vec!["tos", "cp", "-h", "--language", "zh"],
-    ] {
-        let output = invoke(home.path(), &args, None);
-        assert!(output.status.success());
-        let help = String::from_utf8(output.stdout).unwrap();
-        assert!(!help.contains("auto, flat, hierarchical"), "{help}");
+    // [Review Fix #Baseline3] Cover both languages and help formats because
+    // Chinese localization precedes the ByteTOS-only listing filter.
+    for command in ["cp", "mv", "sync", "rm"] {
+        for flag in ["--help", "-h"] {
+            for (language, expected) in [
+                ("en", "Recursive listing mode: hierarchical only"),
+                ("zh", "递归列举模式：仅支持 hierarchical"),
+            ] {
+                let output = invoke(
+                    home.path(),
+                    &["tos", command, flag, "--language", language],
+                    None,
+                );
+                assert!(output.status.success());
+                let help = String::from_utf8(output.stdout).unwrap();
+                assert!(help.contains(expected), "{help}");
+                assert!(!help.contains("auto、flat"), "{help}");
+                assert!(!help.contains("auto, flat, hierarchical"), "{help}");
+            }
+        }
     }
 }
 

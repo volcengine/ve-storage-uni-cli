@@ -48,7 +48,7 @@ pub async fn handle_multipart_command(
 
     let Some(action) = action else {
         return Err(CliError::ValidationError(
-            "`ve-tos multipart` requires a subcommand; use `ve-tos multipart --help` or `ve-tos multipart --describe`".to_string(),
+            crate::handler::common::public_tos_template("`ve-tos multipart` requires a subcommand; use `ve-tos multipart --help` or `ve-tos multipart --describe`"),
         ));
     };
 

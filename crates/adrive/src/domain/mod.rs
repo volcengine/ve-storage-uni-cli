@@ -15,7 +15,9 @@
  */
 
 pub mod auth;
+pub mod chunk;
 pub mod client;
+pub mod metadata;
 pub mod oauth;
 pub mod rate_limiter;
 pub mod share_access;

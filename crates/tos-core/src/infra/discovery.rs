@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-//! ByteTOS PSM service discovery.
+//! Shared Consul lookup and ByteTOS PSM service discovery.
 //!
 //! This module intentionally implements the small subset of `byted-sd` needed
 //! by `tos-cli`: local Consul lookup, BNS bucket routing, and weighted endpoint
@@ -39,6 +39,8 @@ const DEFAULT_CONSUL_HOST: &str = "127.0.0.1";
 const DEFAULT_CONSUL_PORT: u16 = 2280;
 const DEFAULT_CONSUL_TIMEOUT_MS: u64 = 500;
 const DEFAULT_ENDPOINT_WEIGHT: u32 = 10;
+const MAX_CONSUL_BODY_BYTES: usize = 1024 * 1024;
+const MAX_CONSUL_ENDPOINTS: usize = 1024;
 const DEFAULT_LOCAL_PSM_WEIGHT: f32 = 100.0;
 const DEFAULT_CLUSTER: &str = "default";
 const HEADER_REMOTE_PSM: &str = "x-tos-remote-psm";
@@ -506,46 +508,94 @@ impl BnsTask {
     }
 }
 
+/// Direct PSM lookup parameters; no bucket, BNS routing, or TOS test override is used.
 #[derive(Debug, Clone)]
-struct ConsulLookupRequest {
-    psm: String,
-    idc: Option<String>,
-    cluster: Option<String>,
-    addr_family: Option<AddrFamily>,
+pub struct ConsulLookupRequest {
+    /// Service PSM; an IDC suffix is added unless `.service.` is already present.
+    pub psm: String,
+    /// Optional IDC suffix used to qualify the PSM.
+    pub idc: Option<String>,
+    /// Optional Consul cluster filter, encoded as a query parameter.
+    pub cluster: Option<String>,
+    /// Address family override; absent values use existing environment inference.
+    pub addr_family: Option<AddrFamily>,
 }
 
+/// Local Consul lookup transport shared by direct PSM and bucket-aware callers.
 #[derive(Debug)]
-struct ConsulLookupClient {
+pub struct ConsulLookupClient {
     http: Client,
     base_url: String,
 }
 
 impl ConsulLookupClient {
-    fn from_env() -> Result<Self, CliError> {
-        let timeout = Duration::from_millis(consul_timeout_ms());
+    /// Build a lookup client using existing Consul address and timeout environment variables.
+    ///
+    /// Returns an HTTP client construction error. Address precedence remains
+    /// `CONSUL_HTTP_ADDR`, `CONSUL_HTTP_HOST`, then the existing TCE host variables.
+    pub fn from_env() -> Result<Self, CliError> {
+        Self::build(Duration::from_millis(consul_timeout_ms()))
+    }
+
+    /// Build a direct lookup client with an explicit total HTTP timeout.
+    ///
+    /// `timeout` must be nonzero. Consul address environment variables retain
+    /// their usual precedence; `CONSUL_HTTP_TIMEOUT` is ignored. Returns a
+    /// validation error for zero timeout or an HTTP client construction error.
+    pub fn from_env_with_timeout(timeout: Duration) -> Result<Self, CliError> {
+        if timeout.is_zero() {
+            return Err(CliError::ValidationError(
+                "Consul timeout must be nonzero".into(),
+            ));
+        }
+        Self::build(timeout)
+    }
+
+    fn build(timeout: Duration) -> Result<Self, CliError> {
         Ok(Self {
+            // [Review Fix #89] Local discovery must not follow redirects or use ambient proxies.
             http: Client::builder()
                 .timeout(timeout)
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
                 .build()
                 .map_err(CliError::Http)?,
             base_url: format!("http://{}/v1/lookup/name", consul_addr_from_env()),
         })
     }
 
-    async fn lookup(
+    /// Resolve `request` directly through Consul, without bucket or BNS lookup.
+    ///
+    /// Returns nonempty weighted numeric IP endpoints. Returns an error for
+    /// empty PSM, non-success HTTP status (including redirects), timeout,
+    /// malformed JSON, bodies over 1 MiB, more than 1024 endpoints, or unusable
+    /// addresses (zero port, unspecified, multicast, or IPv4 broadcast).
+    pub async fn lookup(
         &self,
         request: ConsulLookupRequest,
     ) -> Result<Vec<WeightedEndpoint>, CliError> {
+        if request.psm.trim().is_empty() {
+            return Err(CliError::ValidationError(
+                "Consul PSM must be nonempty".into(),
+            ));
+        }
         let url = self.lookup_url(&request)?;
-        let resp = self.http.get(url).send().await?;
-        if !resp.status().is_success() {
+        let response = self.http.get(url).send().await?;
+        if !response.status().is_success() {
             return Err(CliError::TransferFailed(format!(
                 "Consul lookup returned status {}",
-                resp.status()
+                response.status()
             )));
         }
-        resp.json::<Vec<ConsulEndpointData>>()
-            .await?
+        let content = bounded_consul_body(response).await?;
+        let endpoints: Vec<ConsulEndpointData> = serde_json::from_slice(&content)?;
+        // [Review Fix #90] Bound discovery fan-out and reject unusable empty success responses.
+        if endpoints.is_empty() || endpoints.len() > MAX_CONSUL_ENDPOINTS {
+            return Err(CliError::TransferFailed(
+                "Invalid Consul endpoint count".into(),
+            ));
+        }
+        endpoints
             .into_iter()
             .map(ConsulEndpointData::into_weighted_endpoint)
             .collect()
@@ -572,6 +622,28 @@ impl ConsulLookupClient {
     }
 }
 
+async fn bounded_consul_body(mut response: reqwest::Response) -> Result<Vec<u8>, CliError> {
+    // [Review Fix #91] Enforce the byte limit before JSON allocation, including chunked bodies.
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_CONSUL_BODY_BYTES as u64)
+    {
+        return Err(CliError::TransferFailed(
+            "Consul response exceeds 1 MiB".into(),
+        ));
+    }
+    let mut content = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > MAX_CONSUL_BODY_BYTES - content.len() {
+            return Err(CliError::TransferFailed(
+                "Consul response exceeds 1 MiB".into(),
+            ));
+        }
+        content.extend_from_slice(&chunk);
+    }
+    Ok(content)
+}
+
 #[derive(Debug, Deserialize)]
 struct ConsulEndpointData {
     #[serde(rename = "Host")]
@@ -587,6 +659,16 @@ impl ConsulEndpointData {
         let ip = IpAddr::from_str(&self.host).map_err(|err| {
             CliError::TransferFailed(format!("Consul endpoint host is not an IP address: {err}"))
         })?;
+        // [Review Fix #92] A numeric IP alone does not make a usable service endpoint.
+        if self.port == 0
+            || ip.is_unspecified()
+            || ip.is_multicast()
+            || matches!(ip, IpAddr::V4(address) if address.is_broadcast())
+        {
+            return Err(CliError::TransferFailed(
+                "Unusable Consul endpoint address".into(),
+            ));
+        }
         let weight = self
             .tags
             .get("weight")
@@ -615,7 +697,11 @@ impl AddrFamilyOptions {
     }
 }
 
-fn choose_weighted_addr(endpoints: &[WeightedEndpoint]) -> Option<SocketAddr> {
+/// Select a socket address according to the supplied endpoint weights.
+///
+/// Returns `None` for an empty slice. Zero weights retain the existing TOS
+/// behavior and participate with weight one. This function performs no IO.
+pub fn choose_weighted_addr(endpoints: &[WeightedEndpoint]) -> Option<SocketAddr> {
     choose_weighted_index(endpoints.iter().map(|endpoint| endpoint.weight))
         .and_then(|index| endpoints.get(index))
         .map(|endpoint| endpoint.addr)
@@ -851,7 +937,7 @@ mod tests {
     use crate::infra::config::Profile;
     use std::sync::Mutex;
 
-    static DISCOVERY_ENV_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) static DISCOVERY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_discovery_env(run: impl FnOnce()) {
         let _guard = DISCOVERY_ENV_LOCK.lock().expect("discovery env lock");
@@ -1024,3 +1110,7 @@ mod tests {
         restore_env("MY_HOST_IPV6", old.5);
     }
 }
+
+#[cfg(test)]
+#[path = "discovery/consul_tests.rs"]
+mod consul_tests;

@@ -772,7 +772,10 @@ fn share_info_value(
         value["ShareUrl"] = json!(url);
     } else if origin.is_none() {
         // [Review Fix #ServerShareURL2/#ServerShareURL4] URL absence cannot undo create; list metadata may also lack an ID, so retain metadata without claiming validity.
-        value["ShareUrlWarning"] = json!("Service response omitted a usable ShareURL. Keep the returned ShareID and configure --share-endpoint or use share get; do not repeat a successful create.");
+        value["ShareUrlWarning"] = json!(tos_core::agent::command_display::render_template(
+            "Service response omitted a usable ShareURL. Keep the returned ShareID and configure --share-endpoint or use ve-adrive share get; do not repeat a successful create.",
+            "ve-adrive",
+        ));
     }
     Ok(value)
 }

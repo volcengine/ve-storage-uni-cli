@@ -20,6 +20,7 @@ members = [
     "crates/tosvector",
     "crates/tostable",
     "crates/adrive",
+    "services/ask-auth",
 ]
 
 [workspace.dependencies]
@@ -54,9 +55,10 @@ futures = "0.3"
 crc64fast = "1"
 volcengine-rust-sdk-auth = "=0.1.1"
 
+# [Review Fix #ProtocolRelease] Align 1.0.4 release metadata and local dependency identities.
 [package]
 name = "ve-storage-uni-cli"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 license = "Apache-2.0"
 description = "Unified command-line interface for Volcengine storage services"
@@ -72,10 +74,10 @@ include = [
 ]
 
 [dependencies]
-tos-core = { version = "1.0.3", path = "crates/tos-core" }
-ve-tos-cli = { package = "ve-tos-cli-core", version = "1.0.3", path = "crates/tos" }
-tos-cli = { package = "tos-cli-core", version = "1.0.3", path = "crates/toscli" }
-ve-adrive-cli = { package = "ve-adrive-cli-core", version = "1.0.3", path = "crates/adrive" }
+tos-core = { version = "1.0.4", path = "crates/tos-core" }
+ve-tos-cli = { package = "ve-tos-cli-core", version = "1.0.4", path = "crates/tos" }
+tos-cli = { package = "tos-cli-core", version = "1.0.4", path = "crates/toscli" }
+ve-adrive-cli = { package = "ve-adrive-cli-core", version = "1.0.4", path = "crates/adrive" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

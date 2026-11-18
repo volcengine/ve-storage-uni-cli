@@ -30,6 +30,7 @@ use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use tos_core::agent::command_display::{invocation_prefix, render_template};
 use tos_core::agent::error::CliError;
 use tos_core::agent::request_id::{sanitize_request_id, ServiceRequestTrace};
 use tos_core::infra::client::storage_user_agent;
@@ -46,6 +47,7 @@ use super::rate_limiter::RateLimiter;
 use super::token_manager::OAuthTokenManager;
 use super::types::*;
 
+mod chunk;
 mod share;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -78,8 +80,8 @@ impl Error {
 fn oauth_user_id_required_error() -> Error {
     // [Review Fix #2] Keep the stable error code while making remediation executable.
     Error::Cli(CliError::ValidationError(
-        "[oauth_user_id_required] OAuth Space creation requires --owner-id or ve-adrive auth login --instance <instance_id> to load the selected user's ID"
-            .to_string(),
+        // [Review Fix #ADriveDisplay1] Resolve CLI-authored instructions without touching user values.
+        render_template("[oauth_user_id_required] OAuth Space creation requires --owner-id or ve-adrive auth login --instance <instance_id> to load the selected user's ID", "ve-adrive"),
     ))
 }
 
@@ -174,6 +176,7 @@ pub struct ClientOptions {
 #[derive(Clone)]
 struct ClientInner {
     auth: RequestAuth,
+    oauth_instance_scope: Option<String>,
     endpoint: String,
     region: String,
     http: reqwest::Client,
@@ -438,6 +441,7 @@ impl Client {
         Ok(Self {
             inner: Arc::new(ClientInner {
                 auth,
+                oauth_instance_scope: None,
                 endpoint,
                 region,
                 http,
@@ -799,7 +803,7 @@ impl Client {
             header_i64(&headers, "x-ids-file-updated-at"),
             header_str(&headers, "x-ids-file-type"),
             header_str(&headers, "x-ids-file-storage-class"),
-            metadata_headers(&headers),
+            metadata_headers(&headers)?,
             header_str(&headers, "x-ids-file-is-folder") == "true",
             Box::pin(stream),
         ))
@@ -838,10 +842,26 @@ impl Client {
             updated_at: header_i64(&headers, "x-ids-file-updated-at"),
             file_type: header_str(&headers, "x-ids-file-type"),
             storage_class: header_str(&headers, "x-ids-file-storage-class"),
-            meta: metadata_headers(&headers),
+            meta: metadata_headers(&headers)?,
             is_folder: header_str(&headers, "x-ids-is-folder") == "true"
                 || header_str(&headers, "x-ids-file-is-folder") == "true",
         })
+    }
+
+    pub async fn update_file_meta(
+        &self,
+        input: &UpdateFileMetaInput,
+    ) -> Result<UpdateFileMetaOutput> {
+        self.do_json(
+            Method::PUT,
+            &format!(
+                "/v1/instances/{}/spaces/{}/files/{}:meta",
+                input.instance_id, input.space_id, input.file_path
+            ),
+            None,
+            Some(input),
+        )
+        .await
     }
 
     pub async fn delete_file(&self, input: &DeleteFileInput) -> Result<DeleteFileOutput> {
@@ -1716,10 +1736,19 @@ impl Client {
                 Ok((None, AppliedRedactionContext::from_values(exact_values)))
             }
             RequestAuth::OAuth(manager) => {
-                if let Some(instance_id) = request_instance_id(path, query) {
+                let instance_id = self
+                    .inner
+                    .oauth_instance_scope
+                    .as_deref()
+                    .or_else(|| request_instance_id(path, query));
+                if let Some(instance_id) = instance_id {
                     manager.validate_instance(instance_id)?;
                 }
                 let access_token = manager.access_token().await?;
+                // access_token 可能主动续期，发送前重新核对续期后的实例绑定。
+                if let Some(instance_id) = instance_id {
+                    manager.validate_instance(instance_id)?;
+                }
                 let mut authorization = HeaderValue::from_str(&format!("Bearer {access_token}"))
                     .map_err(|_| Error::client("invalid OAuth Authorization header"))?;
                 authorization.set_sensitive(true);
@@ -1884,8 +1913,10 @@ impl Client {
                 )
             })
             .unwrap_or_default();
+        // [Review Fix #ADriveDisplay3] Request metadata must remain verbatim while the instruction tracks the entrypoint.
         Error::Cli(CliError::AuthFailed(format!(
-            "HTTP 401 [login_required] Access Token remained unauthorized after one refresh{request_id}; run ve-adrive auth login"
+            "HTTP 401 [login_required] Access Token remained unauthorized after one refresh{request_id}; run {command} auth login",
+            command = invocation_prefix("ve-adrive")
         )))
     }
 }
@@ -1963,6 +1994,7 @@ macro_rules! impl_has_response_info {
 }
 
 impl_has_response_info!(
+    UpdateFileMetaOutput,
     CreateInstanceOutput,
     GetInstanceOutput,
     ListInstancesOutput,
@@ -2070,16 +2102,16 @@ async fn throttle_body(rate_limiter: Option<&RateLimiter>, bytes: usize) {
 }
 
 fn insert_meta_header(headers: &mut HeaderMap, key: &str, value: &str) -> Result<()> {
-    let name = if key.to_ascii_lowercase().starts_with("x-ids-meta-") {
-        key.to_string()
-    } else {
-        format!("x-ids-meta-{key}")
-    };
+    let name = format!("x-ids-meta-{key}");
     headers.insert(
         HeaderName::from_bytes(name.as_bytes())
             .map_err(|err| Error::client(format!("invalid metadata header name: {err}")))?,
-        HeaderValue::from_str(value)
-            .map_err(|err| Error::client(format!("invalid metadata header value: {err}")))?,
+        HeaderValue::from_str(
+            &url::form_urlencoded::byte_serialize(value.as_bytes())
+                .collect::<String>()
+                .replace('+', "%20"),
+        )
+        .map_err(|err| Error::client(format!("invalid metadata header value: {err}")))?,
     );
     Ok(())
 }
@@ -2209,20 +2241,25 @@ fn header_u64(headers: &HeaderMap, name: &str) -> u64 {
     header_str(headers, name).parse::<u64>().unwrap_or(0)
 }
 
-fn metadata_headers(headers: &HeaderMap) -> HashMap<String, String> {
+fn metadata_headers(headers: &HeaderMap) -> Result<HashMap<String, String>> {
     headers
         .iter()
         .filter_map(|(key, value)| {
-            let key = key.as_str();
-            if !key.starts_with("x-ids-meta-") {
-                return None;
-            }
-            value.to_str().ok().map(|value| {
-                (
-                    key.trim_start_matches("x-ids-meta-").to_string(),
-                    value.to_string(),
-                )
-            })
+            key.as_str()
+                .strip_prefix("x-ids-meta-")
+                .map(|key| (key, value))
+        })
+        .map(|(key, value)| {
+            let key = super::share_url::decode_component(key, false).map_err(|_| {
+                Error::InvalidResponse("invalid percent-encoded metadata key".into())
+            })?;
+            let value = value
+                .to_str()
+                .map_err(|_| Error::InvalidResponse("invalid metadata header".into()))?;
+            let value = super::share_url::decode_component(value, false).map_err(|_| {
+                Error::InvalidResponse("invalid percent-encoded metadata header".into())
+            })?;
+            Ok((key, value))
         })
         .collect()
 }
@@ -2502,6 +2539,28 @@ mod tests {
         );
         assert!(auth.starts_with("HMAC-SHA256 Credential=ak/20230601/cn-beijing/tos/request"));
         assert!(auth.contains("SignedHeaders=host;x-date"));
+    }
+
+    #[test]
+    fn usermeta_headers_round_trip_literal_values_and_prefixed_keys() {
+        let mut headers = HeaderMap::new();
+        let value = "中文 + %20 # =\nnext";
+        insert_meta_header(&mut headers, "note", value).unwrap();
+        insert_meta_header(&mut headers, "empty", "").unwrap();
+        insert_meta_header(&mut headers, "x-ids-meta-user", "literal").unwrap();
+        let decoded = metadata_headers(&headers).unwrap();
+        assert_eq!(decoded["note"], value);
+        assert_eq!(decoded["empty"], "");
+        assert_eq!(decoded["x-ids-meta-user"], "literal");
+        headers.insert("x-ids-meta-note", HeaderValue::from_static("a+b%2520"));
+        assert_eq!(metadata_headers(&headers).unwrap()["note"], "a+b%20");
+        for invalid in ["%", "%ZZ", "%FF"] {
+            headers.insert("x-ids-meta-note", HeaderValue::from_str(invalid).unwrap());
+            assert!(matches!(
+                metadata_headers(&headers),
+                Err(Error::InvalidResponse(_))
+            ));
+        }
     }
 
     #[test]

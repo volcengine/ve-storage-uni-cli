@@ -6,8 +6,9 @@ use serde_json::{json, Value};
 /// Returns None for paths outside the registered share command surface.
 pub fn describe_share_command(command: &str) -> Option<Value> {
     if command == "ve-adrive share" {
+        // [Review Fix #ShareGroupLayer] Namespace Describe must agree with its high-level leaves.
         return Some(
-            json!({"command":command,"kind":"command_group","description":"Manage and receive share links","supports_describe":true,"supports_help":true,"subcommands":crate::registry::capabilities().iter().filter(|row|row.group=="share").map(|row|json!({"name":row.command.rsplit(' ').next(),"description":row.description,"risk_level":row.risk_level})).collect::<Vec<_>>() }),
+            json!({"command":command,"kind":"command_group","layer":"high-level","description":"Manage and receive share links","supports_describe":true,"supports_help":true,"subcommands":crate::registry::capabilities().iter().filter(|row|row.group=="share").map(|row|json!({"name":row.command.rsplit(' ').next(),"description":row.description,"risk_level":row.risk_level})).collect::<Vec<_>>() }),
         );
     }
     if !command.starts_with("ve-adrive share ") {

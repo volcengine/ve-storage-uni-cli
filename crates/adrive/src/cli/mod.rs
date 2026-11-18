@@ -15,6 +15,8 @@
  */
 
 pub mod auth;
+pub mod chunk;
+pub mod file;
 pub mod high_level;
 pub mod meta;
 pub mod share;
@@ -58,6 +60,12 @@ pub enum ADriveCommand {
     /// Manage and receive share links
     Share(share::ShareCommand),
 
+    // ─── Low-Level Commands ────────────────────────────────
+    /// File core APIs
+    File(file::FileCommand),
+    /// Search and read document chunks
+    Chunk(chunk::ChunkCommand),
+
     // ─── Meta / Utilities ───────────────────────────────────
     /// Discover CLI capabilities
     Capabilities(meta::CapabilitiesArgs),
@@ -85,6 +93,20 @@ pub enum ADriveCommand {
 /// Stable, debug-syntax-free command path used by error envelopes.
 pub fn command_path(command: &ADriveCommand) -> String {
     let suffix: &str = match command {
+        ADriveCommand::File(group) => {
+            return group
+                .action
+                .as_ref()
+                .map(|action| format!("ve-adrive file {}", action.name()))
+                .unwrap_or_else(|| "ve-adrive file".into());
+        }
+        ADriveCommand::Chunk(group) => {
+            return group
+                .action
+                .as_ref()
+                .map(|action| format!("ve-adrive chunk {}", action.name()))
+                .unwrap_or_else(|| "ve-adrive chunk".into());
+        }
         // High-level
         ADriveCommand::Cp(_) => "cp",
         ADriveCommand::Mv(_) => "mv",
@@ -160,7 +182,6 @@ fn grouped_help_text() -> String {
 
 Usage:
   ve-adrive-cli <command> [options]
-  ve-storage-uni-cli ve-adrive <command> [options]
 
 High-Level Commands:
   cp            Copy local files, ADrive files, or folders
@@ -176,17 +197,11 @@ High-Level Commands:
   find          Find files by name, size, or mtime
   cat           Stream file content
   put           Upload stdin to a file
+  share         Manage and receive share links
 
-Share Links:
-  share create  Create a share link
-  share get     Get a share link
-  share list    List share links
-  share update  Update share settings
-  share cancel  Cancel a share link
-  share inspect Inspect share info
-  share files   List shared files
-  share view    Preview one shared file
-  share download Download shared files
+Low-Level Commands:
+  file          File core APIs
+  chunk         Search and read document chunks
 
 Capabilities / Utilities:
   capabilities  Discover CLI capabilities
@@ -248,6 +263,7 @@ Examples:
   ve-adrive-cli cp ./a.txt adrive://inst-1/space-1/docs/a.txt
   ve-adrive-cli cat --instance inst-1 --space space-1 --folder docs --file a.txt
   ve-adrive-cli cat adrive://inst-1/space-1/docs/a.txt | gzip | ve-adrive-cli put adrive://inst-1/space-1/docs/a.txt.gz
+  ve-adrive-cli file set-meta adrive://inst-1/space-1/docs/a.txt --meta 'owner=xsh#env=test'
   ve-adrive-cli rm adrive://inst-1/space-1/docs/a.txt --force --confirm adrive://inst-1/space-1/docs/a.txt
   ve-adrive-cli del adrive://inst-1/space-1 --force --confirm adrive://inst-1/space-1
   ve-adrive-cli --auth-mode oauth auth login --instance inst-1 --auth-endpoint https://idsauth.volces.com
@@ -269,17 +285,8 @@ Run 've-adrive-cli doctor' for environment diagnostics.
 fn contextualized_grouped_help(help: &str) -> String {
     let prefix =
         std::env::var(ADRIVE_EXAMPLE_PREFIX_ENV).unwrap_or_else(|_| "ve-adrive-cli".to_string());
-    if prefix == "ve-adrive-cli" {
-        return help.to_string();
-    }
-
-    help.replace(
-        "  ve-adrive-cli <command> [options]\n  ve-storage-uni-cli ve-adrive <command> [options]",
-        "  __ADRIVE_PRIMARY__ <command> [options]\n  __ADRIVE_SECONDARY__ <command> [options]",
-    )
-    .replace("ve-adrive-cli ", &format!("{prefix} "))
-    .replace("__ADRIVE_PRIMARY__", &prefix)
-    .replace("__ADRIVE_SECONDARY__", "ve-adrive-cli")
+    // [Review Fix #1] Rewrite the single canonical invocation for the unified entry.
+    help.replace("ve-adrive-cli ", &format!("{prefix} "))
 }
 
 #[cfg(test)]
@@ -310,5 +317,19 @@ mod tests {
         ] {
             assert!(help.contains(expected), "grouped help missing {expected}");
         }
+    }
+
+    #[test]
+    fn grouped_help_keeps_share_and_chunk_in_their_command_layers() {
+        let help = grouped_help_text();
+        let (high_level, remaining) = help.split_once("Low-Level Commands:").unwrap();
+        assert!(high_level.contains("  share         Manage and receive share links"));
+        assert!(!high_level.contains("chunk search"));
+        assert!(!high_level.contains("share create"));
+        let low_level = remaining.split("Capabilities / Utilities:").next().unwrap();
+        assert!(low_level.contains("  file          File core APIs"));
+        assert!(low_level.contains("  chunk         Search and read document chunks"));
+        assert!(!help.contains("Document Chunks:"));
+        assert!(!help.contains("Share Links:"));
     }
 }

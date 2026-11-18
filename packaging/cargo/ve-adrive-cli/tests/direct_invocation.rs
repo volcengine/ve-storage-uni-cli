@@ -76,6 +76,7 @@ fn dedicated_adrive_cli_direct_invocation() {
     let stdout = String::from_utf8_lossy(&help.stdout);
     assert!(stdout.contains("ADrive CLI"));
     assert!(stdout.contains("ve-adrive-cli <command>"));
+    assert!(!stdout.contains("ve-storage-uni-cli ve-adrive <command>"));
     // [Review Fix #1] Direct-entry control-plane help coverage lives in the
     // packaging crate after removing root-package dedicated binaries.
     assert!(!stdout.contains("--control-endpoint"));
@@ -100,13 +101,36 @@ fn dedicated_adrive_cli_direct_invocation() {
 }
 
 #[test]
+fn dedicated_adrive_leaf_help_uses_only_dedicated_invocation() {
+    for args in [
+        vec!["ls", "--help"],
+        vec!["config", "set", "--help"],
+        vec!["doctor", "--help", "--language", "zh"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ve-adrive-cli"))
+            .args(&args)
+            .output()
+            .expect("run ve-adrive-cli help");
+        assert!(output.status.success(), "args={args:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("ve-storage-uni-cli"),
+            "args={args:?}: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn dedicated_adrive_cli_version_output() {
     let output = Command::new(env!("CARGO_BIN_EXE_ve-adrive-cli"))
         .arg("--version")
         .output()
         .expect("Failed to execute ve-adrive-cli --version");
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("ve-adrive-cli"));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        format!("ve-adrive-cli {}", env!("CARGO_PKG_VERSION"))
+    );
 }
 
 #[test]

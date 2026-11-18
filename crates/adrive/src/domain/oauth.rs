@@ -41,7 +41,9 @@ const TOKEN_PATH: &str = "v1/oauth/token";
 pub struct DeviceAuthorizationRequest {
     /// Public Native Client identifier.
     pub client_id: String,
-    /// IDS Instance receiving the authorization.
+    /// IDS Instance; an empty value omits the form field for server selection.
+    // [Review Fix #1] Preserve the public request field type for library callers.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub instance_id: String,
     /// Human-readable device name displayed during consent.
     pub device_name: String,
@@ -736,6 +738,28 @@ mod tests {
         assert!(request.contains("device_name=test-device"));
         assert!(request.contains("scope=all"));
         assert!(!request.contains("client_secret"));
+    }
+
+    #[tokio::test]
+    async fn device_authorization_omits_unselected_instance() {
+        let (endpoint, captured) = serve_once(
+            200,
+            r#"{"device_code":"device-code","user_code":"USER-CODE","verification_uri":"https://idsauth.volces.com/oauth/device","verification_uri_complete":"https://idsauth.volces.com/oauth/device#user_code=USER-CODE","expires_in":600,"interval":5}"#,
+        );
+        let client = OAuthClient::new(endpoint, ClientOptions::default()).unwrap();
+
+        client
+            .create_device_authorization(&DeviceAuthorizationRequest {
+                client_id: OAUTH_CLIENT_ID.to_string(),
+                instance_id: String::new(),
+                device_name: "test-device".to_string(),
+                scope: "all".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let request = captured.recv().unwrap();
+        assert!(!request.contains("instance_id="));
     }
 
     #[tokio::test]

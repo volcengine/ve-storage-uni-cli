@@ -331,6 +331,8 @@ fn test_advanced_dry_run_uses_documented_endpoint_kinds() {
 
 #[test]
 fn test_advanced_body_commands_require_config_for_execution_paths() {
+    // [Review Fix #Baseline1] Satisfy the independent region requirement so
+    // this test checks missing JSON config without depending on host settings.
     let output = cli(&[
         "--output",
         "json",
@@ -339,6 +341,8 @@ fn test_advanced_body_commands_require_config_for_execution_paths() {
         "create",
         "--name",
         "acc-1",
+        "--region",
+        "cn-beijing",
         "--dry-run",
     ]);
     assert!(!output.status.success());

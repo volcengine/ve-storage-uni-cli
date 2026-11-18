@@ -49,7 +49,7 @@ pub async fn handle_bucket_command(
 
     let Some(action) = action else {
         return Err(CliError::ValidationError(
-            "`ve-tos bucket` requires a subcommand; use `ve-tos bucket --help` or `ve-tos bucket --describe`".to_string(),
+            crate::handler::common::public_tos_template("`ve-tos bucket` requires a subcommand; use `ve-tos bucket --help` or `ve-tos bucket --describe`"),
         ));
     };
 
@@ -127,7 +127,7 @@ fn bucket_action_name(action: &BucketAction) -> &'static str {
 
 /// --dry-run 处理：不需要真实凭证，本地预览操作
 fn handle_dry_run(global: &GlobalArgs, action: &BucketAction) -> Result<i32, CliError> {
-    let (command, dry_run) = match action {
+    let (command, mut dry_run) = match action {
         BucketAction::Create(args) => {
             validate_bucket_create_args(args)?;
             let bucket_name = parse_bucket_arg(args.uri.as_deref(), args.bucket_name.as_deref())?;
@@ -337,6 +337,11 @@ fn handle_dry_run(global: &GlobalArgs, action: &BucketAction) -> Result<i32, Cli
         }
     };
 
+    // [Review Fix #CommandDisplay7] Confirm commands are instructions; their
+    // resource arguments remain unchanged after the executable prefix.
+    if let Some(confirm) = &mut dry_run.confirm_command {
+        *confirm = crate::registry::public_tos_command(confirm);
+    }
     let envelope = Envelope::success(command, dry_run);
     output_result(global, &envelope)?;
     Ok(0)
@@ -769,7 +774,7 @@ fn validate_allowed_value(name: &str, value: &str, allowed: &[&str]) -> Result<(
 
 fn build_bucket_create_confirm_command(args: &BucketCreateArgs, bucket_name: &str) -> String {
     let mut parts = vec![
-        "tos".to_string(),
+        "ve-tos".to_string(),
         "bucket".to_string(),
         "create".to_string(),
         format!("tos://{}", bucket_name),

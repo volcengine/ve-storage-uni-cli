@@ -34,12 +34,16 @@ behavior expected by ByteCloud users and scripts.
 ### `ve-adrive-cli`
 
 Use `ve-adrive-cli` for Volcengine ADrive file workflows, including listing,
-upload, download, sync, folder creation, diagnostics, capability discovery, and
-MCP serving.
+upload, download, sync, document chunk search/read, folder creation, diagnostics,
+capability discovery, and MCP serving.
 
 The internal `ve-storage-uni-cli` dispatcher is kept for local development and
 cross-surface testing. Public package managers and curl installation expose the
 three dedicated commands above.
+
+ADrive root help lists `share` under High-Level Commands and `chunk` under
+Low-Level Commands. Expand their actions with `ve-adrive-cli share --help` and
+`ve-adrive-cli chunk --help`; capability discovery and Describe use the same layers.
 
 ## Security and privacy
 
@@ -201,9 +205,12 @@ without rewriting `credentials.toml` or creating local encryption key material.
 
 `auth login` runs the Device Authorization flow in the foreground: it prints
 the verification URL and then polls until the user finishes or the grant
-expires. It requests the fixed `all` scope and saves
+expires. The Instance comes from `--instance`, the selected Profile's
+`default_instance`, or `ADRIVE_DEFAULT_INSTANCE`; if none is set, the
+Authorization Server selects the Instance and returns its ID with the Token.
+Login rejects a missing or mismatched returned ID. It requests the fixed `all` scope and saves
 the returned Access/Refresh Token pair under the current Profile in encrypted
-`credentials.toml`, along with any returned `user_id` identity metadata. OAuth
+`credentials.toml`, along with the returned Instance ID and any `user_id` identity metadata. OAuth
 user-owned Space creation uses that metadata when `--owner-id` is omitted;
 OAuth group-owned Spaces always require an explicit `--owner-id`. The Auth
 endpoint priority is `--auth-endpoint` > `[profile.adrive].auth_endpoint` >
@@ -264,7 +271,7 @@ tos-cli config set endpoint https://your-bytetos-endpoint.example.com
 tos-cli config show --output json
 
 ve-adrive-cli config set region cn-beijing
-ve-adrive-cli config set endpoint https://ids-cn-beijing.volces.com
+ve-adrive-cli config set endpoint https://idsapi.volces.com
 ve-adrive-cli config show --output json
 ```
 
@@ -286,6 +293,31 @@ tos-cli ls tos://my-bucket/prefix/ --output table
 tos-cli cp ./local.txt tos://my-bucket/local.txt --dry-run
 tos-cli sync ./dir tos://my-bucket/backup/ --recursive --dry-run
 ```
+
+### Document chunks (Space)
+
+Use the selected OAuth profile and an instance with Doc `fileAndChunk` indexing enabled.
+The user needs `file:read` and permission to read the target files. These commands do
+not upload files, change indexing configuration, trigger scans, or switch identity.
+
+```bash
+ve-adrive-cli config set region cn-beijing
+ve-adrive-cli config set endpoint https://idsapi.volces.com
+ve-adrive-cli config set auth_mode oauth
+ve-adrive-cli auth login --instance instance-id
+ve-adrive-cli chunk search adrive://instance-id/space-id/handbook/ --text '出差住宿标准是多少' --limit 5 --output json
+ve-adrive-cli chunk read adrive://instance-id/space-id/handbook/travel.txt --etag 'etag-from-current-search' --ordinals 0,1 --output json
+```
+
+Pass back the exact `FilePath`, `ETag` and ordinals from one search hit. `--range 0-1`
+is an inclusive alternative to `--ordinals`; read at most 20 chunks at a time.
+`--text` is the search text; global `--query` remains a JMESPath output filter.
+An empty `data.Items` means no matches, not proof that indexing is ready. A stale
+version may return 404; search again rather than silently choosing a different version.
+`ChunkTruncated` means some source content was not indexed and cannot be recovered
+by reading neighbouring chunks. See [Chunk usage and contracts](docs/adrive-chunk-search.md).
+
+### Share links
 
 ADrive V1 share links expose nine commands: `share create`, `get`, `list`,
 `update`, `cancel`, `inspect`, `files`, `view`, and `download`. The current Go SDK contract
@@ -685,6 +717,33 @@ ve-adrive-cli cp ./local.txt adrive://instance/space/local.txt --dry-run
 ve-adrive-cli mkdir adrive://instance/space/new-folder
 ve-adrive-cli sync ./dir adrive://instance/space/backup/ --recursive --dry-run
 ```
+
+ADrive user metadata:
+
+```bash
+ve-adrive-cli cp ./local.txt adrive://instance/space/local.txt --meta 'owner=xsh#env=test'
+printf 'content' | ve-adrive-cli put adrive://instance/space/stdin.txt --meta '{"note":"中文 + % #"}'
+ve-adrive-cli file set-meta adrive://instance/space/local.txt --meta 'env=prod#empty='
+ve-adrive-cli stat adrive://instance/space/local.txt --output json --query 'data.meta'
+```
+
+`--meta` (aliases `--usermeta`, `--metadata`) accepts `key=value#key2=value2` or a JSON object
+with string values. Keys use ASCII letters, digits, hyphens and underscores;
+they are normalized to lowercase, and `ids-*` is reserved. Values are passed
+literally; do not URL-encode them yourself. JSON supports values containing
+`#`, newlines and other special characters. `&` remains part of a value, not a separator.
+Capacity is enforced by IDS/TOS,
+including storage encoding and IDS-owned fields, not a separate CLI limit.
+
+`cp --meta` applies only to local-to-ADrive uploads, including recursive file
+uploads and multipart initialization; directory markers are unchanged. Other
+copy directions reject the option. Skipped uploads remain skipped.
+`put --meta` works with both single and multipart stdin uploads.
+`file set-meta` (the low-level file resource command, aligned with
+`ve-tos object set-meta`) patches the existing file without re-uploading content: omitted keys
+are preserved, and empty values are stored rather than deleted. It does not
+provide full replacement, key deletion, or TOS object tags. Use `--by-name`
+to resolve Instance and Space names. Dry-run is offline and never updates files.
 
 Inspect command contracts before executing:
 

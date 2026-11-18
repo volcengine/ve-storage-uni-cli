@@ -28,6 +28,10 @@ fi
 
 ## 2. 文档与能力发现
 
+根 `--help` 的 High-Level Commands / 高阶命令只展示一次 `share` 入口，
+不再单列 Share Links 或展开全部分享操作。`share --help` 仍列举九个子命令；
+capabilities 与 Describe 的分享叶命令仍归属 `high-level`。
+
 ```bash
 "$SHARE_CLI" share --help --language zh
 "$SHARE_CLI" share create --help --language zh
@@ -75,7 +79,7 @@ share_manage ls "adrive://$SHARE_INSTANCE/$SHARE_SPACE/"
 
 ```bash
 SHARE_LOCAL="$(mktemp -d)"
-SHARE_FOLDER="share-manual-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
+SHARE_FOLDER="share-manual-$(python3 -c 'import secrets; print(secrets.token_hex(6))')"
 SHARE_REMOTE="adrive://$SHARE_INSTANCE/$SHARE_SPACE/$SHARE_FOLDER/"
 printf 'share test\n' > "$SHARE_LOCAL/report.txt"
 share_manage mkdir "${SHARE_REMOTE}empty/" --parents

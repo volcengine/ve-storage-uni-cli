@@ -2841,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "tos-cli"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "serde_json",
  "tokio",
@@ -2850,7 +2850,7 @@ dependencies = [
 
 [[package]]
 name = "tos-cli-core"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "clap",
  "reqwest 0.13.5",
@@ -2863,7 +2863,7 @@ dependencies = [
 
 [[package]]
 name = "tos-core"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "aes-gcm",
  "axum 0.8.9",
@@ -3150,7 +3150,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "ve-adrive-cli-core"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -3179,7 +3179,7 @@ dependencies = [
 
 [[package]]
 name = "ve-storage-uni-cli"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "clap",
  "serde_json",
@@ -3193,7 +3193,7 @@ dependencies = [
 
 [[package]]
 name = "ve-tos-cli-core"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "base64 0.22.1",
  "chrono",

@@ -247,7 +247,9 @@ def check_partial_listing(fixture, action, failure_mode):
             raise AssertionError((arguments, result.returncode, result.stdout, result.stderr)) from error
         assert result.returncode != 0 and not envelope["success"], (arguments, envelope)
         assert envelope["status_code"] == 403, (arguments, envelope)
-        assert envelope["error"]["doctor_hint"] == fixture.surface + " doctor", envelope
+        prefix = (f"{fixture.binary.name} {fixture.surface}"
+                  if fixture.binary.name == "ve-storage-uni-cli" else fixture.binary.name)
+        assert envelope["error"]["doctor_hint"] == prefix + " doctor", envelope
         assert envelope["data"]["report_path"], (arguments, envelope)
         rows = report_rows(envelope)
         expected = fixture.server.response_ids[("GET", "failed-list" + ("-no-id" if failure_mode == "no-id" else ""))]

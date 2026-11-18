@@ -46,6 +46,7 @@ fn dedicated_tos_cli_direct_invocation() {
     let stdout = String::from_utf8_lossy(&help.stdout);
     assert!(stdout.contains("TOS Object Storage CLI"));
     assert!(stdout.contains("ve-tos-cli <command>"));
+    assert!(!stdout.contains("ve-storage-uni-cli"));
     // [Review Fix #1] Direct-entry control-plane help coverage lives in the
     // packaging crate after removing root-package dedicated binaries.
     assert!(stdout.contains("--control-endpoint"));
@@ -59,6 +60,26 @@ fn dedicated_tos_cli_direct_invocation() {
     let stdout = String::from_utf8_lossy(&describe.stdout);
     assert!(stdout.contains("\"status\": \"success\""));
     assert!(stdout.contains("\"command\": \"ve-tos cp\""));
+}
+
+#[test]
+fn dedicated_tos_leaf_help_uses_only_dedicated_invocation() {
+    for args in [
+        vec!["ls", "--help"],
+        vec!["config", "set", "--help"],
+        vec!["doctor", "--help", "--language", "zh"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ve-tos-cli"))
+            .args(&args)
+            .output()
+            .expect("run ve-tos-cli help");
+        assert!(output.status.success(), "args={args:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("ve-storage-uni-cli"),
+            "args={args:?}: {stdout}"
+        );
+    }
 }
 
 #[test]

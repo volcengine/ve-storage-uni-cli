@@ -526,6 +526,20 @@ pub(crate) fn active_tos_config_binary() -> Binary {
         .unwrap_or(Binary::Tos)
 }
 
+/// Render CLI-authored shared TOS instructions for the active storage surface.
+/// User values and upstream messages must be interpolated after this operation.
+pub(crate) fn public_tos_template(template: &str) -> String {
+    use tos_core::agent::command_display::{invocation_prefix, render_template_with_prefix};
+    let surface = if active_tos_config_binary() == Binary::Tos {
+        "tos"
+    } else {
+        "ve-tos"
+    };
+    // [Review Fix #CommandDisplay2] Shared handlers carry ve-tos source text
+    // even when dispatched by the independent ByteTOS executable.
+    render_template_with_prefix(template, "ve-tos", &invocation_prefix(surface))
+}
+
 /// Parse a bucket name from either `bucket` or `tos://bucket/...`.
 pub(crate) fn parse_bucket_name(input: &str) -> String {
     if input.starts_with("tos://") {
@@ -704,6 +718,7 @@ pub(crate) fn ensure_force_for_destructive(
     let stderr_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
     let can_prompt = stdin_tty && stderr_tty && !global.quiet;
     let confirm_target = critical_confirm_target(command, target);
+    let display_command = public_tos_template(command);
 
     if force {
         if requires_delete_confirm(command) && !can_prompt {
@@ -719,7 +734,7 @@ pub(crate) fn ensure_force_for_destructive(
     if can_prompt {
         eprint!(
             "⚠ destructive command '{}' targeting '{}'\n  Type 'yes' to proceed: ",
-            command, target
+            display_command, target
         );
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).map_err(|e| {
@@ -738,13 +753,13 @@ pub(crate) fn ensure_force_for_destructive(
     if requires_delete_confirm(command) {
         return Err(CliError::ValidationError(format!(
             "critical delete command '{}' for '{}' requires --force and --confirm {} in non-interactive execution",
-            command, target, confirm_target
+            display_command, target, confirm_target
         )));
     }
 
     Err(CliError::ValidationError(format!(
         "destructive command '{}' for '{}' requires --force (or --yes in interactive shell)",
-        command, target
+        display_command, target
     )))
 }
 
@@ -773,6 +788,9 @@ fn ensure_exact_confirm(
     command: &str,
     expected: &str,
 ) -> Result<(), CliError> {
+    // [Review Fix #CommandDisplay6] Only the internal command is presentation
+    // text; confirmation URIs must remain byte-for-byte identical.
+    let command = public_tos_template(command);
     // [Review Fix #6] Delete-class commands are critical in non-interactive
     // execution: --force confirms intent, while --confirm must name the exact
     // resource path using the public URI form.
@@ -816,6 +834,9 @@ pub fn output_result_with_columns<T: Serialize>(
         // document at its shared output boundary so command-group and dynamic
         // API handlers keep their full machine-readable payload.
         crate::handler::meta::localize_ve_tos_auth_documentation_zh(&mut raw);
+    }
+    if global.describe && active_tos_config_binary() == Binary::VeTos {
+        crate::handler::meta::render_ve_tos_documentation(&mut raw);
     }
     let enveloped = ensure_envelope(global, raw);
     let value = apply_query(global, enveloped)?;
@@ -2807,6 +2828,9 @@ mod tests {
 
     #[test]
     fn force_for_destructive_error_message_mentions_target() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _restore = EnvironmentRestore::capture(&[TOS_CONFIG_BINARY_ENV]);
+        std::env::set_var(TOS_CONFIG_BINARY_ENV, "ve-tos");
         let g = global();
         let result =
             ensure_force_for_destructive(&g, false, "ve-tos multipart abort", "upload-id-123");
