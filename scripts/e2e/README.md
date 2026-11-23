@@ -159,6 +159,68 @@ pytest -v tos/test_envelope_schema.py
 pytest -v -m "not slow"
 ```
 
+## TOS protocol validation
+
+Run these focused checks from the repository root. Local HTTP fixtures validate
+request placement and state readback without accessing a real service:
+
+```bash
+cargo test -p ve-storage-uni-cli --test tos_protocol_http_test \
+  --locked --offline -- --test-threads=1
+```
+
+The protocol tests cover these contracts:
+
+| Command family | Required request contract |
+| --- | --- |
+| object set-meta | POST ?metadata; encoded x-tos-meta-* headers; no JSON body; explicit x-tos-metadata-directive REPLACE_NEW (default) or REPLACE; Content-Type only when requested |
+| object set-time | POST ?time; x-tos-modify-timestamp Unix seconds and x-tos-modify-timestamp-ns fractional nanoseconds; no JSON body |
+| object set-expires | POST ?objectExpires; JSON ObjectExpires integer TTL days; zero clears expiration |
+| object fetch | POST ?fetch; URL in JSON; metadata and storage class in headers |
+| object set-tagging | PUT ?tagging; JSON TagSet.Tags containing Key/Value entries |
+| Version-specific object APIs | versionId query, preserving isolation from the current version |
+| object batch-delete | resolved query keys recursive and skipTrash, not Go constant identifiers |
+| object status | GetFileStatus alias, GET ?stat |
+| data-process jobs | nonempty job_type query; get-job uses --job-id (legacy --id supported) |
+| object-set named operations | ObjectSetName=name, not name as a query key |
+| dataset binding | DELETE /datasetbinding with DatasetName/URI JSON; GET/list use datasetname and uri query selectors |
+
+A successful write response alone is insufficient. Readback must verify metadata
+merge/replacement, literal percent values, Content-Type preservation and explicit
+overrides, tags, TTL set/clear, and historical-version isolation. Public expiry
+readback uses `x-tos-expiration`; `x-tos-object-expires` is not the public HEAD
+readback contract. The local fixture tests live in
+[`tests/tos_protocol_http_test.rs`](../../tests/tos_protocol_http_test.rs).
+
+For real-service readback, configure the TOS credentials above, build the unified
+binary under test, and explicitly opt in. This command creates and cleans up
+disposable buckets; run it only against an approved test account:
+
+```bash
+TOS_E2E_PROTOCOL_BIN="$PWD/target/release/ve-storage-uni-cli" \
+TOS_E2E_PROTOCOL_LIVE=1 \
+  python3 -m pytest scripts/e2e/tos/test_object_protocol_readback.py -v
+```
+
+`TOS_E2E_PROTOCOL_BIN` selects the absolute path of the tested binary; adjust it
+if the build is elsewhere. Fetch additionally requires
+`TOS_E2E_PROTOCOL_FETCH_URL`, a small source accessible by TOS, and is skipped
+when that value is absent. SetObjectTime needs a service-enabled HNS test
+account. Bucket-creation preconditions can skip a fixture; unsupported API
+capabilities after bucket creation remain visible failures. Version isolation
+waits for versioning configuration and version visibility before mutating an old
+version, then cleans up all versions. These are acceptance requirements, not a
+claim that a particular environment has passed them.
+
+Protocol reference sources:
+
+- [Official TOS SDK request types](https://github.com/volcengine/ve-tos-golang-sdk/blob/main/tos/type.go)
+- [Official object request construction](https://github.com/volcengine/ve-tos-golang-sdk/blob/main/tos/object.go)
+- [Official Fetch requests](https://github.com/volcengine/ve-tos-golang-sdk/blob/main/tos/fetch.go)
+- [Official dataset binding requests](https://github.com/volcengine/ve-tos-js-sdk/blob/main/src/methods/datasetSearch/binding.ts)
+- [ObjectSet lifecycle selector](https://docs.volcengine.com/docs/torch-object-storage/delete-object-set-life-cycle?lang=zh)
+- [Job query parameters](https://docs.volcengine.com/docs/torch-object-storage/query-media-job?lang=zh)
+
 ## Resource Cleanup
 
 - Temporary buckets use a unique 16-hex suffix per test session to avoid collisions.

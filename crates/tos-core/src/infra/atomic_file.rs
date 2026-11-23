@@ -66,7 +66,7 @@ fn replace_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn sync_parent_directory(path: &Path) -> Result<(), CliError> {
+pub(crate) fn sync_parent_directory(path: &Path) -> Result<(), CliError> {
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::File::open(directory)
         .and_then(|file| file.sync_all())
@@ -74,7 +74,7 @@ fn sync_parent_directory(path: &Path) -> Result<(), CliError> {
 }
 
 #[cfg(not(unix))]
-fn sync_parent_directory(_path: &Path) -> Result<(), CliError> {
+pub(crate) fn sync_parent_directory(_path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 

@@ -15,8 +15,46 @@
  */
 
 use std::process::Command;
+#[path = "src/ask/application_values.rs"]
+mod application_values;
+
+const BUILD_ENV_NAMES: [&str; 2] = [
+    "STORAGE_CLI_BUILD_DOUBAO_APP_ID",
+    "STORAGE_CLI_BUILD_DOUBAO_APP_SECRET",
+];
+
+const BUNDLE_ERROR: &str = "invalid bundled Doubao application configuration; provide both STORAGE_CLI_BUILD_DOUBAO_APP_ID and STORAGE_CLI_BUILD_DOUBAO_APP_SECRET inputs with valid values, or leave both absent";
+
+fn application_value(name: &str) -> Result<Option<String>, ()> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+fn validate_application_bundle() -> Result<bool, ()> {
+    for name in BUILD_ENV_NAMES {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    println!("cargo:rerun-if-changed=src/ask/application_values.rs");
+    // [Review Fix #14] Never format VarError or field values: Unicode failures may own secrets.
+    let app_id = application_value(BUILD_ENV_NAMES[0])?;
+    let secret = application_value(BUILD_ENV_NAMES[1])?;
+    application_values::parse_bundle(app_id.as_deref(), secret.as_deref())
+        .map(|bundle| bundle.is_some())
+        .map_err(|_| ())
+}
 
 fn main() {
+    match validate_application_bundle() {
+        Ok(true) => println!("cargo:warning=Doubao ask application: bundled (build inputs received)"),
+        Ok(false) => println!("cargo:warning=Doubao ask application: not bundled (both build environment variables absent; export them before invoking Cargo)"),
+        Err(()) => {
+            eprintln!("{BUNDLE_ERROR}");
+            std::process::exit(1);
+        }
+    }
     // Capture the rustc version at build time and expose it to the crate via
     // `option_env!("RUSTC_VERSION")`. Used to build the HTTP User-Agent string.
     println!("cargo:rerun-if-changed=build.rs");

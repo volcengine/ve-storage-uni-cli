@@ -50,6 +50,20 @@ update every applicable user-facing discovery surface in the same change:
 If a surface is not applicable, record that conclusion in the implementation
 review instead of silently skipping it.
 
+Global option names do not imply support by every command. Keep the command-specific
+display rules in `tos_core::agent::help_scope` aligned with actual handler and MCP
+forwarding paths. Apply these rules to inherited help and common discovery properties;
+keep business parameters and existing argument acceptance separate. Group help shows
+the union needed by its children. Preserve conditional uses such as `cat`'s structured
+preview output and the VeTos MCP raw API tool's parent account ID.
+
+`--describe` must bypass writes and runtime checks. Doctor `--dry-run` also bypasses
+configuration, authentication and live probes. Run `cargo test -p ve-storage-uni-cli
+--test help_option_scope --locked --offline` for option visibility, discovery schemas,
+and preview side effects, plus `tests/command_presentation_regression.py` for shared
+help rendering. Keep unrelated storage arguments named `ask`, `config`, or `skill`
+from being mistaken for command paths.
+
 CLI-generated error Usage and repair/diagnostic commands must use the active
 entrypoint: `ve-adrive-cli`, `ve-tos-cli`, `tos-cli`, or the corresponding unified
 invocation. Keep structured command identifiers canonical and preserve quoted

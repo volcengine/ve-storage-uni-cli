@@ -334,33 +334,35 @@ impl OAuthTokenManager {
     ) -> Result<String, CliError> {
         let validated = validate_refresh_token(token, instance_id)?;
         let access_token = validated.access_token.clone();
-        let mut credentials = CredentialsFile::load_from(&self.credentials_path)?;
-        credentials.set_adrive_oauth(
-            &self.profile_name,
-            StoredOAuthCredentials {
-                access_token: Some(validated.access_token),
-                refresh_token: Some(validated.refresh_token),
-                expires_at: Some(expires_at(validated.expires_in)?),
-                token_type: Some("Bearer".to_string()),
-                scope: validated.scope,
-                legacy_client_id: None,
-                instance_id: Some(instance_id.to_string()),
-                user_id: validated.user_id.or(stored_user_id),
-                auth_endpoint: Some(client.endpoint().as_str().to_string()),
-            },
-        )?;
-        credentials.save_to_path(&self.credentials_path)?;
+        // [Review Fix #CredentialTransaction7] The per-profile refresh lock coordinates HTTP; the shared transaction lock only guards persistence.
+        CredentialsFile::update(&self.credentials_path, |credentials| {
+            credentials.set_adrive_oauth(
+                &self.profile_name,
+                StoredOAuthCredentials {
+                    access_token: Some(validated.access_token),
+                    refresh_token: Some(validated.refresh_token),
+                    expires_at: Some(expires_at(validated.expires_in)?),
+                    token_type: Some("Bearer".to_string()),
+                    scope: validated.scope,
+                    legacy_client_id: None,
+                    instance_id: Some(instance_id.to_string()),
+                    user_id: validated.user_id.or(stored_user_id),
+                    auth_endpoint: Some(client.endpoint().as_str().to_string()),
+                },
+            )
+        })?;
         Ok(access_token)
     }
 
     fn clear_invalid_grant(&self, rejected_refresh_token: &str) -> Result<(), CliError> {
-        let mut credentials = CredentialsFile::load_from(&self.credentials_path)?;
-        let current = credentials.adrive_oauth(&self.profile_name, &self.credentials_path)?;
-        if current.refresh_token.as_deref() == Some(rejected_refresh_token) {
-            credentials.clear_adrive_oauth(&self.profile_name);
-            credentials.save_to_path(&self.credentials_path)?;
-        }
-        Ok(())
+        // [Review Fix #CredentialTransaction8] A concurrent login must not be erased by an older invalid_grant response.
+        CredentialsFile::update(&self.credentials_path, |credentials| {
+            let current = credentials.adrive_oauth(&self.profile_name, &self.credentials_path)?;
+            if current.refresh_token.as_deref() == Some(rejected_refresh_token) {
+                credentials.clear_adrive_oauth(&self.profile_name);
+            }
+            Ok(())
+        })
     }
 }
 

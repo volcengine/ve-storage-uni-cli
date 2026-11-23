@@ -21,6 +21,7 @@ pub mod dryrun;
 pub mod envelope;
 pub mod error;
 pub mod global_args;
+pub mod help_scope;
 pub mod output;
 pub mod pagination;
 pub mod progress;

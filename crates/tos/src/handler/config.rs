@@ -944,9 +944,10 @@ fn handle_credential_set(
         .ok_or_else(|| CliError::ValidationError("missing credential field".to_string()))?;
     let section = credential_section_for_tos_path(segments)?;
     let credentials_path = global.credentials_path();
-    let mut credentials = CredentialsFile::load_from(&credentials_path)?;
-    credentials.set_aksk_field(profile_name, section, field, value)?;
-    credentials.save_to_path(&credentials_path)?;
+    // [Review Fix #CredentialTransaction4] Merge this field into the latest shared credential store while holding its transaction lock.
+    CredentialsFile::update(&credentials_path, |credentials| {
+        credentials.set_aksk_field(profile_name, section, field, value)
+    })?;
 
     let data = serde_json::json!({
         "section": credential_section_path(profile_name, section),

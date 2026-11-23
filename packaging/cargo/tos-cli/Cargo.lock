@@ -34,6 +34,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -48,6 +49,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -943,6 +945,7 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
+ "zeroize",
 ]
 
 [[package]]
@@ -1704,6 +1707,7 @@ dependencies = [
  "cpufeatures",
  "opaque-debug",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -2865,6 +2869,7 @@ dependencies = [
 name = "tos-core"
 version = "1.0.4"
 dependencies = [
+ "aes",
  "aes-gcm",
  "axum 0.8.9",
  "base64 0.22.1",
@@ -2872,6 +2877,8 @@ dependencies = [
  "clap",
  "comfy-table",
  "dirs-next",
+ "fs2",
+ "ghash",
  "hex",
  "hmac",
  "http",
@@ -2879,6 +2886,8 @@ dependencies = [
  "hyper-util",
  "indicatif",
  "jmespath",
+ "libc",
+ "polyval",
  "prost",
  "rand 0.8.6",
  "reqwest 0.12.28",
@@ -2899,7 +2908,9 @@ dependencies = [
  "tracing",
  "ulid",
  "url",
+ "uuid",
  "volcengine-rust-sdk-auth",
+ "zeroize",
 ]
 
 [[package]]
@@ -3182,13 +3193,16 @@ name = "ve-storage-uni-cli"
 version = "1.0.4"
 dependencies = [
  "clap",
+ "serde",
  "serde_json",
  "tokio",
  "tos-cli-core",
  "tos-core",
  "tracing-subscriber",
+ "uuid",
  "ve-adrive-cli-core",
  "ve-tos-cli-core",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -217,6 +217,73 @@ The archive step writes `dist/ve-storage-uni-cli-*`, `dist/SHA256SUMS`, and
 `dist/install.sh`. Archives contain `bin/ve-tos-cli`, `bin/tos-cli`, and
 `bin/ve-adrive-cli`.
 
+For an official build that includes the publisher's Doubao application, inject
+`STORAGE_CLI_BUILD_DOUBAO_APP_ID` and `STORAGE_CLI_BUILD_DOUBAO_APP_SECRET`
+through the protected local/SCM build environment,
+then add `--require-ask-credentials` to `archives` or `all`.
+
+| Build environment variable | Value source |
+| --- | --- |
+| `STORAGE_CLI_BUILD_DOUBAO_APP_ID` | The publisher's App ID. |
+| `STORAGE_CLI_BUILD_DOUBAO_APP_SECRET` | The same application's App Secret, supplied through a protected input. |
+
+Both variables must be present and valid. The CLI requests the fixed scopes
+`doubao:session:write`, `doubao:session.event:read`, and `offline_access` for
+session creation, reply streaming, and refresh credentials. Enable those user
+permissions for the publisher application before real authorization testing;
+see the [permission sources](../docs/ask-direct.md#21-准备应用).
+`STORAGE_CLI_BUILD_DOUBAO_SCOPES` is no longer read and can be removed from CI.
+
+For a local build, run the following in **Bash**, replacing the App ID placeholder
+with the actual value. Secret input is hidden and
+does not appear in shell command history. Use the target for your build runner;
+the example below is for macOS arm64.
+
+```bash
+set +x
+export STORAGE_CLI_BUILD_DOUBAO_APP_ID='<publisher App ID>'
+read -r -s -p 'App Secret: ' STORAGE_CLI_BUILD_DOUBAO_APP_SECRET
+printf '\n'
+export STORAGE_CLI_BUILD_DOUBAO_APP_SECRET
+
+python3 packaging/scripts/release.py archives \
+  --target aarch64-apple-darwin --require-ask-credentials
+
+unset STORAGE_CLI_BUILD_DOUBAO_APP_SECRET
+```
+
+For **SCM builds**, configure App ID as a build environment variable.
+Store App Secret in SCM's protected secret configuration and map it to the exact
+environment variable name `STORAGE_CLI_BUILD_DOUBAO_APP_SECRET` in the Cargo build
+step. The build script then runs the same `release.py archives` command above;
+no Secret value belongs in the script. Do not enable shell tracing (`set -x`) or
+print the build environment. Every target runner must receive the complete
+application configuration.
+
+Do not put secret values in source, command arguments, logs, or this runbook.
+The build emits a value-free `Doubao ask application: bundled` or `not bundled`
+notice. Cargo inherits exported environment variables; it does not automatically
+load `.env` files or unexported shell variables. Both inputs are tracked for
+rebuilds. Inspect the newly built binary's `ask --describe` output and require
+`application_bundled: true`; use the matching debug/release/custom target path.
+Later Cargo builds or tests without the inputs may replace the configured
+artifact with an unconfigured one.
+
+`--require-ask-credentials` requires a fresh build and cannot be combined with
+`--skip-build`. Native binaries are inspected with a read-only describe
+operation; cross-built binaries still require acceptance on their target
+platform. Keep using those same build outputs when making package wrappers.
+Rotating the application Secret requires rebuilding and distributing new
+binaries. Customers running the built binaries do not need these build
+environment variables. Binaries and compiler caches contain application
+credentials; compile-time injection does not prevent their extraction.
+
+The flag verifies embedded application configuration, not provider permissions,
+user login, or operating-system support. A customer-side `cargo install` compiles
+source without the publisher's private environment. See the
+[direct ask guide](../docs/ask-direct.md) for customer usage, internal overrides,
+credential rotation, and remaining platform acceptance work.
+
 ### 2. Build package wrappers
 
 Generate npm packages:
@@ -493,53 +560,88 @@ GitHub Release assets are available.
 python3 packaging/scripts/release.py all --version <version> --target <triple> --pip-target <triple> --publish --tap-dir . --github-release-clobber
 ```
 
-### Coordinated CLI release 1.0.4
+### Single-CLI npm and PyPI release (ADrive example)
 
-The current release includes `ve-tos-cli`, `tos-cli`, and `ve-adrive-cli`.
-The root dispatcher, shared `tos-core`, CLI implementation crates, and entry
-crates all use 1.0.4. Vector/Table scaffold versions are aligned with the workspace
-but are not new public install channels. The independently deployed ask-auth
-service keeps its own version.
+`ve-adrive-cli` can be released independently to npm and PyPI. Choose an
+unpublished version for the selected package; it does not need to match the
+versions of `ve-tos-cli` or `tos-cli`. npm publishing also requires an available
+matching GitHub tag. Use `--package ve-adrive-cli` throughout this procedure.
+The `all --publish` command and the unfiltered registry commands publish
+multiple packages and are outside this procedure.
 
-This supersedes the previous ADrive-only 1.0.4 preparation instructions. The
-current `tos-cli` release includes shared Help/Usage, error-message, remediation,
-and Doctor fixes already merged in master. See
-[`docs/release-v1.0.4.md`](../docs/release-v1.0.4.md) for release notes and known
-validation limits.
+Before building, update the version in `crates/adrive/Cargo.toml` and
+`packaging/cargo/ve-adrive-cli/Cargo.toml`, and refresh the affected lockfiles
+and dependency requirements as needed. The binary reports the ADrive core
+version. `--version` sets npm/PyPI wrapper metadata and the GitHub release
+reference; it does not change the Rust package versions or relabel a binary.
+Other CLI and shared crate versions only change when their own changes require
+a release. Build from the final reviewed commit after it has reached the
+public source repository, and verify the binary and wrapper versions agree.
 
-Prepare from the final reviewed commit after it has reached the public source
-repository. Before any upload, inspect the actual target registries and GitHub
-tag: an existing published package/version must not be overwritten, and an
-existing tag must not be retargeted. If a previous ADrive-only 1.0.4 is already
-published in a channel, new ADrive code requires a new version there; a new local
-1.0.4 binary does not establish registry availability.
-
-Preview Cargo publishing in dependency order (this only prints commands):
-
-```bash
-python3 packaging/scripts/release.py cargo --dry-run
-```
-
-Build complete archives on each supported CI runner, using a clean directory:
+Replace `<version>` with the selected version, and keep these shell variables
+in the release terminal for the commands below. Use a clean output directory
+for that version:
 
 ```bash
-python3 packaging/scripts/release.py archives --target <triple> --out-dir dist/1.0.4
-python3 packaging/scripts/release.py checksums --out-dir dist/1.0.4
+release_version='<version>'
+release_dir="dist/adrive-$release_version"
 ```
 
-Verify the archive contains all three dedicated binaries and each reports 1.0.4.
-Generate wrappers without uploading:
+The npm installer downloads `ve-storage-uni-cli-<target>` archives from the
+GitHub Release tagged `v<version>`. Build an ADrive-only archive for each npm
+target on its matching runner. Collect the archives into the same release
+directory, then regenerate checksums after collecting all targets:
 
 ```bash
-python3 packaging/scripts/release.py npm --version 1.0.4 --out-dir dist/1.0.4/npm
-python3 packaging/scripts/release.py pip --version 1.0.4 --target <triple> --out-dir dist/1.0.4/pip --build-wheel
+python3 packaging/scripts/release.py archives --package ve-adrive-cli --target <triple> --out-dir "$release_dir"
+python3 packaging/scripts/release.py checksums --out-dir "$release_dir"
 ```
 
-The npm publishing selector includes only `ve-tos-cli` and `ve-adrive-cli`; the
-`tos-cli` npm name belongs to another publisher. The existing PyPI, Cargo,
-Homebrew, WinGet and internal ByteCloud channels keep their documented scope.
-Publishing and release-asset updates are separate execution steps after these
-artifacts and the selected version have been verified.
+The npm targets are `x86_64-apple-darwin`, `aarch64-apple-darwin`,
+`x86_64-unknown-linux-gnu.2.17`, `aarch64-unknown-linux-gnu.2.17`, and
+`x86_64-pc-windows-msvc`. The Linux `.2.17` targets need `cargo-zigbuild`,
+and Windows MSVC needs `cargo-xwin`, as in the general release runbook.
+Check each archive contains only `bin/ve-adrive-cli` (or `.exe` on Windows),
+plus the packaged documentation, and that its binary reports the selected
+version. Before uploading, confirm the package versions and GitHub tag are
+available; existing versions and tags must not be overwritten or retargeted.
+Keep the ADrive-only GitHub Release out of the generic `latest` installer
+channel because that installer expects all three CLIs:
+
+```bash
+gh release create "v$release_version" "$release_dir"/ve-storage-uni-cli-* "$release_dir/SHA256SUMS" \
+  --repo volcengine/ve-storage-uni-cli --target <public-commit-sha> --latest=false \
+  --title "ve-adrive-cli v$release_version" --notes 'ADrive-only release.'
+```
+
+After the assets are available, generate and publish only the npm package.
+Its postinstall script requires the archive for the installer's target platform:
+
+```bash
+python3 packaging/scripts/release.py npm --version "$release_version" --package ve-adrive-cli --out-dir "$release_dir/npm"
+python3 packaging/scripts/release.py npm --version "$release_version" --package ve-adrive-cli --out-dir "$release_dir/npm" --execute-publish
+```
+
+Build the PyPI wheel once per supported wheel target. Collect the wheels in
+the same release-specific `wheels/` directory, then upload only the selected
+package and version. PyPI wheels contain the binary and do not download
+GitHub assets, so a PyPI-only release does not require a GitHub Release:
+
+```bash
+python3 packaging/scripts/release.py pip --version "$release_version" --package ve-adrive-cli \
+  --target <triple> --out-dir "$release_dir/pip" --build-wheel
+python3 packaging/scripts/release.py pip --version "$release_version" --package ve-adrive-cli \
+  --out-dir "$release_dir/pip" --upload
+```
+
+For PyPI Linux wheels use the `.2.17` triples in `platforms.json`; the plain
+GNU triples have no default manylinux wheel tag. The `--package` selector also
+filters upload files by package and version if the wheel directory contains
+unrelated files. This procedure publishes no Cargo, Homebrew, WinGet, or
+ByteCloud TOS artifacts.
+
+Choose the version for this package and verify its availability in each
+selected registry before publishing.
 
 ## curl Installer
 

@@ -20,7 +20,6 @@ members = [
     "crates/tosvector",
     "crates/tostable",
     "crates/adrive",
-    "services/ask-auth",
 ]
 
 [workspace.dependencies]
@@ -82,6 +81,11 @@ clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+uuid = { version = "1", features = ["v7"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }

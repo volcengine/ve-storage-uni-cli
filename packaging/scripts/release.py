@@ -24,6 +24,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 import platform
 import re
 import shlex
@@ -38,6 +39,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
 PUBLIC_PACKAGES = ("ve-tos-cli", "tos-cli", "ve-adrive-cli")
+ASK_BUILD_ENV_NAMES = (
+    "STORAGE_CLI_BUILD_DOUBAO_APP_ID",
+    "STORAGE_CLI_BUILD_DOUBAO_APP_SECRET",
+)
+ASK_APP_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,256}")
+ASK_SECRET_PATTERN = re.compile(r"[\x21-\x7e]{1,4096}")
 # [Review Fix #NpmReservedName] The npm tos-cli name is owned by another publisher.
 NPM_PUBLISH_PACKAGES = ("ve-tos-cli", "ve-adrive-cli")
 ENTRY_CRATES = PUBLIC_PACKAGES
@@ -385,10 +392,76 @@ def verify_native_bytetos_auth(target: str) -> None:
         raise SystemExit("dedicated tos-cli artifact does not expose built-in ZTI")
 
 
+def validate_ask_build_environment(is_required: bool, is_skip_build: bool) -> None:
+    """Validate inherited Ask build inputs before release side effects.
+
+    Args select mandatory bundle presence and reuse of existing binaries.
+    Returns None; raises value-free SystemExit for incomplete or invalid input.
+    """
+    if is_required and is_skip_build:
+        raise SystemExit("--require-ask-credentials is incompatible with --skip-build")
+    values = tuple(os.environ.get(name) for name in ASK_BUILD_ENV_NAMES)
+    if all(value is None for value in values) and not is_required:
+        return
+    if any(value is None for value in values):
+        raise SystemExit("Ask build credentials require both App ID and App Secret environment inputs")
+    app_id, secret = values
+    if not (
+        ASK_APP_ID_PATTERN.fullmatch(app_id)
+        and ASK_SECRET_PATTERN.fullmatch(secret)
+    ):
+        raise SystemExit("Ask build credentials contain invalid environment inputs")
+
+
+def verify_bundled_ask_binary(binary: Path) -> None:
+    """Inspect a dedicated CLI's pure Ask description without exposing output.
+
+    Takes the executable path; returns None only for a successful bundled result.
+    Raises a fixed SystemExit for missing, failing or malformed artifacts.
+    """
+    failure_message = "could not verify bundled Ask application in dedicated CLI artifact"
+    try:
+        if not binary.is_file():
+            raise SystemExit(failure_message)
+        result = subprocess.run(
+            [str(binary), "ask", "--describe", "--output", "json"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        is_bundled = json.loads(result.stdout)["data"]["application_bundled"] is True
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, RecursionError):
+        raise SystemExit(failure_message) from None
+    if result.returncode != 0 or not is_bundled:
+        raise SystemExit(failure_message)
+
+
+def verify_native_ask_application(target: str, package: str | None = None) -> None:
+    """Check selected native CLI bundles, or report required cross-runner work.
+
+    Args are the public target and optional selected package. Returns None;
+    raises SystemExit if any native artifact cannot prove a bundled application.
+    """
+    if not native_target_matches_host(target):
+        print(f"# skip executable Ask bundle check for cross target {target}; "
+              "target-runner validation is required")
+        return
+    suffix = ".exe" if target.endswith("windows-msvc") else ""
+    for entry_name in ((package,) if package else PUBLIC_PACKAGES):
+        binary_dir = entry_release_dir(entry_name, cargo_artifact_target(target))
+        verify_bundled_ask_binary(binary_dir / f"{entry_name}{suffix}")
+
+
 def run_archives(args: argparse.Namespace) -> None:
+    is_ask_required = getattr(args, "require_ask_credentials", False)
+    validate_ask_build_environment(is_ask_required, args.skip_build)
     package = getattr(args, "package", None)
     for target in args.target:
         build_release_binaries(target, args.skip_build, package)
+        if is_ask_required:
+            verify_native_ask_application(target, package)
         if package is None or package == "tos-cli":
             verify_native_bytetos_auth(target)
         archive_args = [
@@ -879,6 +952,11 @@ def add_common_version(parser: argparse.ArgumentParser) -> None:
 def add_archive_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--target", action="append", required=True, help="Rust target triple")
     parser.add_argument("--skip-build", action="store_true", help="Use already-built binaries")
+    parser.add_argument(
+        "--require-ask-credentials",
+        action="store_true",
+        help="Require inherited Ask build credentials and verify native CLI bundles",
+    )
     parser.add_argument("--target-dir", default=Path("target"), type=Path, help="Root target dir")
     parser.add_argument("--out-dir", default=Path("dist"), type=Path, help="Release archive dir")
     parser.add_argument("--package", choices=PUBLIC_PACKAGES, help="Build only this CLI")

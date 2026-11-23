@@ -93,6 +93,12 @@ Use the installed version's help and structured contract as the authority. If a 
 help and report the version mismatch; do not guess equivalent flags or automatically change authentication modes. Keep
 the same executable, profile, endpoint, and authentication mode throughout the task unless the user requests a change.
 
+Use each command's help for applicable shared options. Local capability discovery,
+completion and Skill metadata do not use storage profiles, authentication or network
+overrides. ADrive `auth` keeps its own mode and stores; its login can use an endpoint
+fallback. `doctor --describe` / `doctor --dry-run` do not inspect authentication or run
+live probes. `skill export --describe` never writes export files.
+
 ```bash
 ve-adrive-cli cp --help
 ve-adrive-cli cp --describe ./file.txt adrive://instance-id/space-id/file.txt --output json

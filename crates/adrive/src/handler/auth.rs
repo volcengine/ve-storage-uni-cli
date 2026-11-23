@@ -97,6 +97,7 @@ impl PollingSchedule {
 }
 
 /// Handle ADrive authentication commands.
+// [Review Fix #10] Legacy ADrive authentication keeps its original options and configuration.
 pub async fn handle_auth_command(
     global: &GlobalArgs,
     auth_args: &ADriveAuthArgs,
@@ -570,9 +571,10 @@ fn validate_and_save_token(
 ) -> Result<SavedLogin, CliError> {
     let (stored, saved) = validated_login(settings, auth_endpoint, token)?;
     let credentials_path = global.credentials_path();
-    let mut credentials = CredentialsFile::load_from(&credentials_path)?;
-    credentials.set_adrive_oauth(&global.profile, stored)?;
-    credentials.save_to_path(&credentials_path)?;
+    // [Review Fix #CredentialTransaction5] Authentication HTTP work is complete before acquiring the shared store lock.
+    CredentialsFile::update(&credentials_path, |credentials| {
+        credentials.set_adrive_oauth(&global.profile, stored)
+    })?;
     Ok(saved)
 }
 
@@ -711,14 +713,20 @@ fn handle_logout(global: &GlobalArgs, mode: AuthMode) -> Result<i32, CliError> {
         return output_logout_dry_run(global, would_clear);
     }
     let mut cleared = false;
-    if credentials_path.exists() {
-        let mut credentials = CredentialsFile::load_from(&credentials_path)?;
-        let existing = credentials.adrive_oauth(&global.profile, &credentials_path)?;
-        if !existing.is_empty() {
-            credentials.clear_adrive_oauth(&global.profile);
-            credentials.save_to_path(&credentials_path)?;
-            cleared = true;
-        }
+    if credentials_path.exists()
+        && !CredentialsFile::load_from(&credentials_path)?
+            .adrive_oauth(&global.profile, &credentials_path)?
+            .is_empty()
+    {
+        // [Review Fix #CredentialTransaction6] Keep an empty logout read-only; recheck the latest state under lock before clearing only this namespace.
+        cleared = CredentialsFile::update(&credentials_path, |credentials| {
+            let existing = credentials.adrive_oauth(&global.profile, &credentials_path)?;
+            let has_existing = !existing.is_empty();
+            if has_existing {
+                credentials.clear_adrive_oauth(&global.profile);
+            }
+            Ok(has_existing)
+        })?;
     }
     output_envelope(
         global,
@@ -1334,6 +1342,57 @@ mod tests {
         );
         assert!(!directory.join(".key").exists());
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn oauth_logout_with_empty_namespace_does_not_create_lock_or_key() {
+        let directory = test_directory();
+        std::fs::create_dir_all(&directory).unwrap();
+        let credentials_path = directory.join("credentials.toml");
+        let original = "schema_version = 1\n";
+        std::fs::write(&credentials_path, original).unwrap();
+        let global = GlobalArgs {
+            credentials_path: Some(credentials_path.clone()),
+            quiet: true,
+            ..GlobalArgs::default()
+        };
+
+        assert_eq!(super::handle_logout(&global, AuthMode::Oauth).unwrap(), 0);
+
+        assert_eq!(
+            std::fs::read_to_string(&credentials_path).unwrap(),
+            original
+        );
+        assert!(!directory.join(".credentials.lock").exists());
+        assert!(!directory.join(".key").exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn oauth_logout_dry_run_does_not_open_transaction_lock() {
+        let directory = test_directory();
+        std::fs::create_dir_all(&directory).unwrap();
+        let credentials_path = directory.join("credentials.toml");
+        // [Review Fix #CredentialTransaction9] The preview fixture must include the required persisted schema version.
+        let original = "schema_version = 1\n[default.adrive.oauth]\naccess_token = 'synthetic-preview-token'\n";
+        std::fs::write(&credentials_path, original).unwrap();
+        // A directory cannot be opened as the transaction lock; preview must never touch it.
+        std::fs::create_dir(directory.join(".credentials.lock")).unwrap();
+        let global = GlobalArgs {
+            credentials_path: Some(credentials_path.clone()),
+            dry_run: true,
+            quiet: true,
+            ..GlobalArgs::default()
+        };
+
+        assert_eq!(super::handle_logout(&global, AuthMode::Oauth).unwrap(), 0);
+
+        assert_eq!(
+            std::fs::read_to_string(&credentials_path).unwrap(),
+            original
+        );
+        assert!(!directory.join(".key").exists());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

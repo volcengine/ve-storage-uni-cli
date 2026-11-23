@@ -16,6 +16,10 @@
 
 #![recursion_limit = "256"]
 
+mod ask;
+#[cfg(test)]
+mod ask_parser_tests;
+
 use clap::{error::ErrorKind as ClapErrorKind, Parser, Subcommand};
 use std::{fmt::Write as _, sync::OnceLock};
 use tos_core::agent::global_args::GlobalArgs;
@@ -2225,6 +2229,20 @@ const HELP_TRANSLATIONS_ZH: &[(&str, &str)] = &[
         "List TOS skill metadata or export Markdown SKILL.md files",
         "列出 TOS Skill 元数据或导出 Markdown SKILL.md 文件",
     ),
+    ("Experimental storage CLI recommendations (never executes commands)", "实验性存储 CLI 问答与命令建议（不执行命令）"),
+    ("Manage Doubao OAuth: ask auth login/status/logout", "豆包授权管理：ask auth login/status/logout"),
+    ("Manage the separate Doubao OAuth login", "管理独立的豆包 OAuth 登录"),
+    ("Experimental one-shot storage CLI recommendations (never executes commands)", "实验性单次存储 CLI 问答与命令建议（不执行命令）"),
+    // [Review Fix #4] New command/argument prose participates in the complete Chinese help audit.
+    ("Authorize directly with Doubao using a loopback callback", "通过本机回调直接向豆包授权"),
+    ("Inspect local expiry only; remote revocation is not checked", "仅查看本地有效期；不检查远端撤销状态"),
+    ("Print the authorization URL without opening a browser", "打印授权链接，不打开浏览器"),
+    ("Remove locally saved Doubao tokens; does not revoke the remote grant", "移除本地保存的豆包令牌；不撤销远端授权"),
+    // [Review Fix #10] Localize the restored ask grammar in each owning catalog.
+    ("Explicit question, including the reserved word auth", "显式问题，也可询问保留字 auth"),
+    ("Question text placed directly after ask (quote it as one argument)", "直接放在 ask 后的问题文本（请将整个问题用引号括为一个参数）"),
+    ("Put the quoted question directly after ask to get command recommendations.", "在 ask 后直接填写用引号括起的问题，获取命令建议。"),
+    ("Use ask auth to manage Doubao login. Recommended commands are never executed.", "使用 ask auth 管理豆包登录。推荐的命令不会自动执行。"),
     ("Environment diagnostics", "环境诊断"),
     ("Create a new bucket", "创建新 Bucket"),
     ("Get bucket metadata (HeadBucket)", "获取 Bucket 元数据（HeadBucket）"),
@@ -3207,6 +3225,10 @@ fn describe_language_for_canonical_dispatch(effective_args: &[String]) -> Option
     let language = requested_help_language(effective_args)?;
     let sanitized_args = args_without_help_language(effective_args);
     let parsed = Cli::try_parse_from(&sanitized_args).ok()?;
+    // [Review Fix #8] Typed assistant Describe owns its UUIDv7 preview, including localized prose.
+    if ask::Route::from_tool(&parsed.tool).is_some() {
+        return Some(language);
+    }
     let needs_canonical_dispatch = match parsed.tool {
         ToolCommand::TosCli {
             command: tos_cli::TosCliCommand::Api(_),
@@ -3838,6 +3860,12 @@ async fn run_with_args_and_zti_provider(
         Err(err) => handle_parse_error(&parser_args, err),
     };
 
+    if let Some(route) = ask::Route::from_tool(&cli.tool) {
+        let prefix = assistant_command_prefix(&cli.tool, effective_surface);
+        ask::dispatch(&cli.global, route, &prefix).await;
+        return;
+    }
+
     match cli.tool {
         ToolCommand::TosCli { auth, command } => {
             let global = bind_byte_tos_auth(
@@ -3855,6 +3883,17 @@ async fn run_with_args_and_zti_provider(
         ToolCommand::ADrive { auth, command } => {
             handle_adrive(cli.global, auth, command).await;
         }
+    }
+}
+
+fn assistant_command_prefix(tool: &ToolCommand, surface: InvocationSurface) -> String {
+    match (tool, surface) {
+        (ToolCommand::TosCli { .. }, InvocationSurface::BytedTosDirect) => "tos-cli".into(),
+        (ToolCommand::Tos { .. }, InvocationSurface::VeTosDirect) => "ve-tos-cli".into(),
+        (ToolCommand::ADrive { .. }, InvocationSurface::ADriveDirect) => "ve-adrive-cli".into(),
+        (ToolCommand::TosCli { .. }, _) => "ve-storage-uni-cli tos".into(),
+        (ToolCommand::Tos { .. }, _) => "ve-storage-uni-cli ve-tos".into(),
+        (ToolCommand::ADrive { .. }, _) => "ve-storage-uni-cli ve-adrive".into(),
     }
 }
 
@@ -4019,6 +4058,8 @@ fn help_uses_language_for_command_behavior(help: &str) -> bool {
 
 fn contextualized_help_text(effective_args: &[String], help: &str) -> String {
     use tos_core::agent::command_display::render_help_template;
+    let help = strip_command_global_help(effective_args, help);
+    let help = help.as_str();
     if is_byted_tos_invocation(effective_args) {
         let prefix =
             std::env::var(BYTED_TOS_EXAMPLE_PREFIX_ENV).unwrap_or_else(|_| "tos-cli".to_string());
@@ -4143,6 +4184,18 @@ fn strip_psm_global_help(help: &str) -> String {
     strip_clap_help_option_blocks(help, &["--psm", "--idc", "--cluster", "--addr-family"])
 }
 
+fn strip_command_global_help(effective_args: &[String], help: &str) -> String {
+    for tool in ["byted-tos", "ve-tos", "ve-adrive"] {
+        if let Some(position) = tool_position(effective_args, tool) {
+            let commands = recovered_command_tokens(&effective_args[position + 1..]);
+            let hidden =
+                tos_core::agent::help_scope::hidden_options(public_tool_name(tool), &commands);
+            return strip_clap_help_option_blocks(help, &hidden);
+        }
+    }
+    help.to_string()
+}
+
 fn strip_byted_tos_unsupported_help(help: &str) -> String {
     // [Review Fix #TOS-StorageHelp] Strip the whole clap option block so the
     // removed `--storage-class` flag cannot leave its description under the
@@ -4210,7 +4263,14 @@ fn strip_clap_help_option_blocks(help: &str, option_names: &[&str]) -> String {
             }
         }
 
-        if option_names.iter().any(|option| line.contains(option)) {
+        // [Review Fix #18] Match option headers, preserving examples and prose mentioning a flag.
+        let is_option_header = line.trim_start().starts_with('-');
+        if is_option_header
+            && line
+                .split_whitespace()
+                .take(2)
+                .any(|word| option_names.contains(&word.trim_end_matches(',')))
+        {
             is_skipping_block = true;
             continue;
         }
@@ -4257,10 +4317,30 @@ fn public_tos_example_command(command: &str) -> String {
     ve_tos_cli::registry::public_tos_command(command)
 }
 
+// [Review Fix #10] Invalid assistant syntax must not become a successful storage Describe.
+fn can_recover_storage_describe(effective_args: &[String], tool: &str) -> bool {
+    let Some(tool_position) = tool_position(effective_args, tool) else {
+        return false;
+    };
+    let arguments = &effective_args[tool_position + 1..];
+    let tokens = recovered_command_tokens(arguments);
+    match tokens.first().copied() {
+        Some("ask") => false,
+        Some("auth") => !arguments
+            .iter()
+            .take_while(|argument| argument.as_str() != "--")
+            .any(|argument| argument == "--provider" || argument.starts_with("--provider=")),
+        _ => true,
+    }
+}
+
 fn maybe_emit_byted_tos_describe_recovery(effective_args: &[String]) -> bool {
     if !has_flag(effective_args, "--describe")
         || tool_position(effective_args, "byted-tos").is_none()
     {
+        return false;
+    }
+    if !can_recover_storage_describe(effective_args, "byted-tos") {
         return false;
     }
     let _config_guard = EnvGuard::set(TOS_CONFIG_BINARY_ENV, "tos");
@@ -4321,6 +4401,9 @@ fn maybe_emit_tos_describe_recovery(effective_args: &[String]) -> bool {
     {
         return false;
     }
+    if !can_recover_storage_describe(effective_args, "ve-tos") {
+        return false;
+    }
     let _config_guard = EnvGuard::set(TOS_CONFIG_BINARY_ENV, "ve-tos");
     let global = recovered_global_args(effective_args);
     let command = recovered_command_path(effective_args, "ve-tos");
@@ -4378,6 +4461,9 @@ fn maybe_emit_adrive_describe_recovery(effective_args: &[String]) -> bool {
     if !has_flag(effective_args, "--describe")
         || tool_position(effective_args, "ve-adrive").is_none()
     {
+        return false;
+    }
+    if !can_recover_storage_describe(effective_args, "ve-adrive") {
         return false;
     }
     let global = recovered_global_args(effective_args);
@@ -4862,6 +4948,7 @@ fn recovered_global_args(effective_args: &[String]) -> GlobalArgs {
     global
 }
 
+// [Review Fix #12] Help normalization must preserve the explicit question value.
 fn flag_takes_value(flag: &str) -> bool {
     matches!(
         flag,
@@ -4869,6 +4956,7 @@ fn flag_takes_value(flag: &str) -> bool {
             | "--auth-mode"
             | "-o"
             | "--query"
+            | "--question"
             | "--profile"
             | "-P"
             | "--config-path"
@@ -5174,6 +5262,9 @@ async fn handle_byted_tos_inner(
     command: tos_cli::TosCliCommand,
 ) -> Result<i32, tos_core::agent::error::CliError> {
     match command {
+        tos_cli::TosCliCommand::Ask(_) => Err(tos_core::agent::error::CliError::ValidationError(
+            "assistant command requires the CLI dispatcher".into(),
+        )),
         tos_cli::TosCliCommand::Cp(args) => {
             tos_cli::handler::high_level::handle_high_level_command(
                 global,
@@ -5387,6 +5478,9 @@ async fn handle_tos_inner(
     let command = command.as_ref().expect("checked above");
 
     match command {
+        ve_tos_cli::TosCommand::Ask(_) => Err(tos_core::agent::error::CliError::ValidationError(
+            "assistant command requires the CLI dispatcher".into(),
+        )),
         ve_tos_cli::TosCommand::Bucket(cmd) => {
             ve_tos_cli::handler::bucket::handle_bucket_command(global, &cmd.action).await
         }
@@ -5797,6 +5891,11 @@ async fn handle_adrive_inner(
     command: &ve_adrive_cli::ADriveCommand,
 ) -> Result<i32, tos_core::agent::error::CliError> {
     match command {
+        ve_adrive_cli::ADriveCommand::Ask(_) => {
+            Err(tos_core::agent::error::CliError::ValidationError(
+                "assistant command requires the CLI dispatcher".into(),
+            ))
+        }
         ve_adrive_cli::ADriveCommand::File(group) => {
             ve_adrive_cli::handler::file::handle_file_command(global, auth, group).await
         }

@@ -633,6 +633,23 @@ pub const COMMAND_GROUPS: &[CommandGroupEntry] = &[
         "Environment diagnostics",
         true,
     ),
+    // [Review Fix #9] Append assistant utilities so existing discovery and Skill ordering stays stable.
+    group(
+        "ask",
+        "ve-tos ask",
+        CommandLayer::Meta,
+        "utilities",
+        "Experimental storage CLI recommendations (never executes commands)",
+        true,
+    ),
+    group(
+        "ask auth",
+        "ve-tos ask auth",
+        CommandLayer::Meta,
+        "utilities",
+        "Manage Doubao OAuth: ask auth login/status/logout",
+        true,
+    ),
 ];
 
 pub const CAPABILITIES: &[CapabilityEntry] = &[
@@ -1349,6 +1366,26 @@ pub const CAPABILITIES: &[CapabilityEntry] = &[
         examples: &["ve-tos bucket delete tos://bucket --force --confirm tos://bucket"],
         related_commands: &["ve-tos rb"],
     },
+    // [Review Fix #9] Append assistant utilities so existing discovery and Skill ordering stays stable.
+    CapabilityEntry {
+        command: "ve-tos ask", group: "ask", layer: CommandLayer::Meta,
+        description: "Experimental storage CLI recommendations (never executes commands)", risk_level: RiskLevel::Low,
+        apis: &[], endpoint_kind: None, method: None, supports_describe: true,
+        supports_dry_run: true, supports_force: false, supports_pipe: true,
+        supports_output_formats: SUPPORTED_OUTPUT_FORMATS, parameters: &[RegistryParameter { name: "question", location: ParameterLocation::Path, required: false, description: "One storage CLI question, up to 8192 bytes" }],
+        body_contract: None, consistency_guards: &["Direct Doubao OAuth; storage credentials are not used", "Recommendations are never executed"],
+        examples: &["ve-tos-cli ask '如何创建存储桶？'"], related_commands: &["ve-tos ask", "ve-tos ask auth"],
+    },
+    // [Review Fix #10] Assistant OAuth discovery follows the accepted ask auth namespace.
+    CapabilityEntry {
+        command: "ve-tos ask auth", group: "ask", layer: CommandLayer::Meta,
+        description: "Manage Doubao OAuth: ask auth login/status/logout", risk_level: RiskLevel::Low,
+        apis: &[], endpoint_kind: None, method: None, supports_describe: true,
+        supports_dry_run: true, supports_force: false, supports_pipe: true,
+        supports_output_formats: SUPPORTED_OUTPUT_FORMATS, parameters: &[],
+        body_contract: None, consistency_guards: &["Direct Doubao OAuth; storage credentials are not used", "Recommendations are never executed"],
+        examples: &["ve-tos-cli ask auth login --no-browser"], related_commands: &["ve-tos ask", "ve-tos ask auth"],
+    },
 ];
 
 pub fn command_groups() -> &'static [CommandGroupEntry] {
@@ -1605,10 +1642,14 @@ fn describe_scenario_routing(row: &RegistryCapabilityRow) -> HashMap<String, Str
     if let Some(body_contract) = &row.body_contract {
         routing.insert("body_contract".to_string(), body_contract.clone());
     }
-    routing.insert(
-        "dry_run".to_string(),
-        "returns a deterministic plan without mutating local files or TOS resources".to_string(),
-    );
+    // [Review Fix #21] Unsupported preview flags must not reappear as Describe guidance.
+    if row.supports_dry_run {
+        routing.insert(
+            "dry_run".to_string(),
+            "returns a deterministic plan without mutating local files or TOS resources"
+                .to_string(),
+        );
+    }
     routing.insert(
         "target_resolution".to_string(),
         "accept tos://bucket[/key] URI or command-specific --bucket/--key flags where supported"
@@ -2198,6 +2239,8 @@ fn command_tree_capability_row(
     let group_entry = find_group(group)?;
     let risk = infer_command_risk(&entry.command);
     let apis = inferred_api_names(&entry.command);
+    // [Review Fix #21] Capability discovery always reads metadata; it has no preview handler.
+    let supports_dry_run = entry.command != "ve-tos capabilities";
     let parameters = keep_parameters.then(|| {
         entry
             .parameters
@@ -2232,7 +2275,7 @@ fn command_tree_capability_row(
         endpoint_rule: inferred_endpoint_rule(&entry.command, group_entry),
         method: inferred_method(&entry.command),
         supports_describe: entry.supports_describe,
-        supports_dry_run: true,
+        supports_dry_run,
         supports_force,
         supports_pipe: command_supports_pipe(&entry.command),
         supports_output_formats: SUPPORTED_OUTPUT_FORMATS,
@@ -2240,10 +2283,14 @@ fn command_tree_capability_row(
         body_contract: inferred_body_contract(entry),
         consistency_guards: inferred_consistency_guards(&risk),
         examples: vec![format!("{} --describe", public_tos_command(&entry.command))],
-        related_commands: vec![
-            "ve-tos capabilities --view full".to_string(),
-            format!("{} --dry-run", entry.command),
-        ],
+        related_commands: if supports_dry_run {
+            vec![
+                "ve-tos capabilities --view full".to_string(),
+                format!("{} --dry-run", entry.command),
+            ]
+        } else {
+            vec!["ve-tos capabilities --view full".to_string()]
+        },
     })
 }
 
@@ -2368,6 +2415,10 @@ fn infer_command_risk(command: &str) -> &'static str {
 }
 
 fn inferred_api_names(command: &str) -> Vec<String> {
+    // [Review Fix #10] Assistant management actions are not storage API operations.
+    if command_root_group(command) == Some("ask") {
+        return Vec::new();
+    }
     let declared = source_declared_api_names(command);
     if !declared.is_empty() {
         return declared;
@@ -3527,12 +3578,7 @@ const CONFIG_INIT_PARAMETERS: &[RegistryParameter] = &[param(
 const CONFIG_SET_PARAMETERS: &[RegistryParameter] = &[
     param("key", ParameterLocation::Path, true, "Config key"),
     param("value", ParameterLocation::Path, true, "Config value"),
-    param(
-        "auth-mode",
-        ParameterLocation::Flag,
-        false,
-        "Per-invocation VeTos authentication override: --auth-mode <MODE>; supported values are aksk or unified. TOS_AUTH_MODE supplies the environment value.",
-    ),
+    // [Review Fix #21] config set writes explicit key/value pairs and ignores runtime auth-mode.
 ];
 
 const COMPLETION_PARAMETERS: &[RegistryParameter] = &[param(
@@ -3792,6 +3838,44 @@ const fn param(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    // [Review Fix #21] Configuration writes must not advertise ignored runtime authentication flags.
+    #[test]
+    fn config_set_metadata_excludes_runtime_authentication_override() {
+        let row = capability_row_for_command("ve-tos config set", true).unwrap();
+        let parameters = row.parameters.unwrap();
+        assert_eq!(
+            parameters
+                .iter()
+                .map(|parameter| parameter.name.as_str())
+                .collect::<Vec<_>>(),
+            ["key", "value"]
+        );
+    }
+
+    // [Review Fix #21] Pure metadata reads do not gain preview behavior from their parent groups.
+    #[test]
+    fn metadata_dry_run_support_matches_executable_handlers() {
+        for (command, is_supported) in [
+            ("ve-tos capabilities", false),
+            ("ve-tos completion", false),
+            ("ve-tos skill list", false),
+            ("ve-tos skill export", true),
+            ("ve-tos doctor", true),
+        ] {
+            let description = describe_command_metadata(command)
+                .unwrap_or_else(|| panic!("missing metadata for {command}"));
+            assert_eq!(description.supports_dry_run, is_supported, "{command}");
+            assert_eq!(
+                description
+                    .scenario_routing
+                    .unwrap()
+                    .contains_key("dry_run"),
+                is_supported,
+                "{command} preview guidance"
+            );
+        }
+    }
 
     #[test]
     fn test_registry_covers_top_level_groups() {
