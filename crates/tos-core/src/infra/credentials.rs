@@ -27,6 +27,9 @@ use crate::infra::crypto;
 
 const CREDENTIALS_FILE_NAME: &str = "credentials.toml";
 const CURRENT_SCHEMA_VERSION: u32 = 1;
+mod doubao;
+pub(crate) mod transaction;
+pub use doubao::StoredDoubaoOAuth;
 
 /// Credential namespace in `credentials.toml`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -184,6 +187,8 @@ struct CredentialProfile {
     ve_tos: Option<StoredAkskCredentials>,
     #[serde(skip_serializing_if = "Option::is_none")]
     adrive: Option<AdriveCredentials>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doubao: Option<doubao::DoubaoCredentials>,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -258,9 +263,18 @@ impl CredentialsFile {
     }
 
     /// Save encrypted credentials atomically with owner-only permissions.
+    /// This replaces the whole snapshot; use `update` for coordinated read-modify-write operations.
     pub fn save_to_path(&self, path: &Path) -> Result<(), CliError> {
+        let _guard = transaction::Lock::acquire(path)?;
+        self.save_unlocked(path)
+    }
+
+    fn save_unlocked(&self, path: &Path) -> Result<(), CliError> {
         self.validate()?;
-        let directory = path.parent().unwrap_or_else(|| Path::new("."));
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(directory).map_err(CliError::Io)?;
         let key = crypto::load_or_init_key(directory)?;
         let mut encrypted = self.clone();
@@ -411,6 +425,9 @@ impl CredentialsFile {
             if let Some(credentials) = profile.adrive.as_mut() {
                 encrypt_adrive(credentials, key)?;
             }
+            if let Some(credentials) = profile.doubao.as_mut() {
+                doubao::encrypt(credentials, key)?;
+            }
         }
         Ok(())
     }
@@ -461,7 +478,7 @@ impl StoredAkskCredentials {
     }
 }
 
-fn validate_profile_name(profile_name: &str) -> Result<(), CliError> {
+pub(crate) fn validate_profile_name(profile_name: &str) -> Result<(), CliError> {
     if profile_name == "schema_version" {
         return Err(CliError::ValidationError(
             "'schema_version' is reserved and cannot be used as a credentials profile".to_string(),

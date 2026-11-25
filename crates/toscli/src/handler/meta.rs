@@ -44,6 +44,26 @@ use crate::registry::{
 
 const TOS_CONFIG_BINARY_ENV: &str = "VE_STORAGE_UNI_TOS_CONFIG_BINARY";
 const TOS_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    ("Skill name", "Skill 名称"),
+    ("Output directory", "输出目录"),
+    ("Documentation language", "文档语言"),
+    // [Review Fix #6] Each product owns a separate exact catalog for Describe and Skill metadata.
+    ("Experimental storage CLI recommendations (never executes commands)", "实验性存储 CLI 问答与命令建议（不执行命令）"),
+    ("Manage Doubao OAuth: ask auth login/status/logout", "豆包授权管理：ask auth login/status/logout"),
+    ("One storage CLI question, up to 8192 bytes", "一个存储 CLI 问题，最多 8192 字节"),
+    ("Direct Doubao OAuth; storage credentials are not used", "直接使用豆包 OAuth；不使用存储凭证"),
+    ("Recommendations are never executed", "不执行建议的命令"),
+    ("Experimental one-shot storage CLI recommendations (never executes commands)", "实验性单次存储 CLI 问答与命令建议（不执行命令）"),
+    ("Manage the separate Doubao OAuth login", "管理独立的豆包 OAuth 登录"),
+    // [Review Fix #10] Localize the restored ask grammar in each owning catalog.
+    ("Explicit question, including the reserved word auth", "显式问题，也可询问保留字 auth"),
+    ("Question text placed directly after ask (quote it as one argument)", "直接放在 ask 后的问题文本（请将整个问题用引号括为一个参数）"),
+    (tos_core::ask::cli::ASK_HELP_OVERVIEW, "在 ask 后直接填写用引号括起的问题，获取命令建议。\n\n使用 ask auth 管理豆包登录。推荐的命令不会自动执行。"),
+    ("Authorize directly with Doubao using a loopback callback", "通过本机回调直接向豆包授权"),
+    ("Print the authorization URL without opening a browser", "打印授权链接，不打开浏览器"),
+    ("Inspect local expiry only; remote revocation is not checked", "仅查看本地有效期；不检查远端撤销状态"),
+    ("Remove locally saved Doubao tokens; does not revoke the remote grant", "移除本地保存的豆包令牌；不撤销远端授权"),
+    ("Login, inspect local status, or remove local credentials", "登录、查看本地状态或移除本地凭证"),
     // [Review Fix #DirectoryLocalization] ByteTOS metadata has a separate catalog from shared CLI help.
     ("Skip explicit directory uploads. By default, preserve directories including empty directories. Files may still create required parent directories", "跳过显式目录上传。默认保留目录，包括空目录。文件仍可能创建所需的父目录"),
     ("Run one check: auth, config, registry, network (or endpoint), mcp, or completion", "运行一项检查：auth、config、registry、network（或 endpoint）、mcp 或 completion"),
@@ -318,6 +338,17 @@ pub async fn handle_capabilities_command(
     global: &GlobalArgs,
     args: &CapabilitiesArgs,
 ) -> Result<i32, CliError> {
+    // [Review Fix #22] Describe returns this command's contract rather than a capability listing.
+    if global.describe {
+        let description = describe_tos_command_metadata("tos capabilities").ok_or_else(|| {
+            CliError::ValidationError("no metadata registered for tos capabilities".into())
+        })?;
+        ve_tos_cli::handler::common::output_result(
+            global,
+            &Envelope::success("tos capabilities", description),
+        )?;
+        return Ok(0);
+    }
     let mut rows = capabilities()
         .iter()
         .filter(|row| {
@@ -962,6 +993,10 @@ pub async fn handle_skill_command(
     global: &GlobalArgs,
     command: &SkillCommand,
 ) -> Result<i32, CliError> {
+    // [Review Fix #19] Describe must short-circuit before skill export creates directories.
+    if global.describe {
+        return describe_skill_command(global, command);
+    }
     match &command.action {
         SkillAction::List { language } => {
             ve_tos_cli::handler::common::output_result(
@@ -992,6 +1027,22 @@ pub async fn handle_skill_command(
             )?;
         }
     }
+    Ok(0)
+}
+
+fn describe_skill_command(global: &GlobalArgs, command: &SkillCommand) -> Result<i32, CliError> {
+    let (command_path, language) = match &command.action {
+        SkillAction::List { language } => ("tos skill list", language),
+        SkillAction::Export { language, .. } => ("tos skill export", language),
+    };
+    let description = describe_tos_command_metadata(command_path).ok_or_else(|| {
+        CliError::ValidationError(format!("no metadata registered for {command_path}"))
+    })?;
+    let mut payload = serde_json::to_value(description)?;
+    if *language == DocumentationLanguage::Zh {
+        localize_tos_documentation_zh(&mut payload);
+    }
+    ve_tos_cli::handler::common::output_result(global, &Envelope::success(command_path, payload))?;
     Ok(0)
 }
 
@@ -1046,15 +1097,22 @@ pub async fn handle_doctor_command(
     global: &GlobalArgs,
     args: &DoctorArgs,
 ) -> Result<i32, CliError> {
-    if global.describe {
+    if global.describe || global.dry_run {
         // [Review Fix #18] Describe must not read configuration or perform an
         // optional live probe; report the command contract instead.
         let description = describe_tos_command_metadata("tos doctor").ok_or_else(|| {
             CliError::ValidationError("no metadata registered for tos doctor".to_string())
         })?;
+        // [Review Fix #20] A dry-run cannot execute auth checks or an explicit live probe.
+        let mut payload = serde_json::to_value(description)?;
+        if global.dry_run {
+            payload["dry_run"] = json!(true);
+            payload["executed"] = json!(false);
+            payload["network_requests"] = json!(0);
+        }
         ve_tos_cli::handler::common::output_result(
             global,
-            &Envelope::success("tos doctor", description),
+            &Envelope::success("tos doctor", payload),
         )?;
         return Ok(0);
     }
@@ -1114,7 +1172,11 @@ pub async fn handle_doctor_command(
 }
 
 pub fn describe_tos_command_metadata(command: &str) -> Option<CommandDescription> {
-    let row = find_capability(command)?;
+    let registry_command = match command {
+        "tos skill list" | "tos skill export" => "tos skill",
+        _ => command,
+    };
+    let row = find_capability(registry_command)?;
     let mut auth_parameter = tos_core::infra::byte_tos_auth::byte_tos_auth_parameter();
     if command == "tos presign" {
         // [Review Fix #1] The mode description must agree with presign's AK/SK-only schema.
@@ -1150,9 +1212,16 @@ pub fn describe_tos_command_metadata(command: &str) -> Option<CommandDescription
             },
         })
         .collect::<Vec<_>>();
-    parameters.push(auth_parameter);
+    // [Review Fix #23] Leaf skill contracts retain their accepted flags after the read-only guard.
+    if registry_command != command {
+        parameters = skill_describe_parameters(command == "tos skill export");
+    }
+    // [Review Fix #21] Discovery must not advertise authentication overrides for local tools.
+    if tos_core::agent::help_scope::supports_global_option(command, "auth-mode") {
+        parameters.push(auth_parameter);
+    }
     Some(CommandDescription {
-        command: row.command.to_string(),
+        command: command.to_string(),
         layer: if row.layer == "high_level" {
             CommandLayer::HighLevel
         } else {
@@ -1166,12 +1235,39 @@ pub fn describe_tos_command_metadata(command: &str) -> Option<CommandDescription
             _ => RiskLevel::Low,
         },
         parameters: Some(parameters),
-        supports_dry_run: row.supports_dry_run,
+        supports_dry_run: row.supports_dry_run
+            && tos_core::agent::help_scope::supports_global_option(command, "dry-run"),
         supports_pipe: matches!(row.domain, "cat"),
         low_level_apis: Some(row.api_actions.iter().map(|api| api.to_string()).collect()),
         wraps_apis: Some(row.api_actions.iter().map(|api| api.to_string()).collect()),
         ..Default::default()
     })
+}
+
+fn skill_describe_parameters(is_export: bool) -> Vec<CommandParameter> {
+    let fields: &[(&str, &str)] = if is_export {
+        &[
+            ("name", "Skill name"),
+            ("dir", "Output directory"),
+            ("language", "Documentation language"),
+        ]
+    } else {
+        &[("language", "Documentation language")]
+    };
+    fields
+        .iter()
+        .map(|&(name, description)| CommandParameter {
+            name: name.into(),
+            location: ParameterLocation::Flag,
+            required: false,
+            description: description.into(),
+            schema: Some(match name {
+                "language" => json!({"type":"string", "enum":["en", "zh"], "default":"en"}),
+                "dir" => json!({"type":"string", "default":"./tos-skills"}),
+                _ => json!({"type":"string"}),
+            }),
+        })
+        .collect()
 }
 
 fn row_matches_search(row: &CapabilityRow, needle: &str) -> bool {
@@ -1372,7 +1468,10 @@ fn skill_input_schema(row: &CapabilityRow) -> Value {
         }
     }
     for (name, schema) in mcp_common_schema_properties() {
-        properties.entry(name.to_string()).or_insert(schema);
+        // [Review Fix #21] Skill and MCP discovery share the same command-specific option scope.
+        if tos_core::agent::help_scope::supports_global_option(row.command, name) {
+            properties.entry(name.to_string()).or_insert(schema);
+        }
     }
     if row.command == "tos presign" {
         properties.insert(
@@ -2103,6 +2202,27 @@ fn bool_field(
 mod chinese_metadata_tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn ask_mcp_questions_already_use_the_explicit_question_option() {
+        for question in ["auth", "how to upload a file"] {
+            let arguments = json!({"question":question});
+            let argv = build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                "tos ask",
+                arguments.as_object().unwrap(),
+            )
+            .unwrap();
+            assert!(argv.windows(2).any(|pair| pair == ["--question", question]));
+        }
+        let duplicate = json!({"question":"auth", "explicit_question":"other"});
+        assert!(build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            "tos ask",
+            duplicate.as_object().unwrap()
+        )
+        .is_err());
+    }
 
     #[test]
     fn mcp_doctor_uses_switch_for_live_network_and_value_for_timeout() {

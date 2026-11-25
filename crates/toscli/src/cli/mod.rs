@@ -24,6 +24,13 @@ const TOS_CLI_EXAMPLE_PREFIX_ENV: &str = "VE_STORAGE_UNI_BYTED_TOS_EXAMPLE_PREFI
 
 #[derive(Debug, Subcommand)]
 pub enum TosCliCommand {
+    /// Experimental one-shot storage CLI recommendations (never executes commands)
+    #[command(
+        long_about = tos_core::ask::cli::ASK_HELP_OVERVIEW,
+        after_help = tos_core::ask::cli::question_help_examples("tos-cli"),
+        override_usage = tos_core::ask::cli::question_help_usage("tos-cli")
+    )]
+    Ask(tos_core::ask::cli::AskArgs),
     // High-Level Commands
     /// Copy local files, TOS objects, or prefixes
     Cp(high_level::CpArgs),
@@ -176,6 +183,7 @@ impl RmArgs {
 /// Stable command path used by envelopes and parse errors.
 pub fn command_path(command: &TosCliCommand) -> String {
     match command {
+        TosCliCommand::Ask(_) => "tos ask",
         TosCliCommand::Cp(_) => "tos cp",
         TosCliCommand::Mv(_) => "tos mv",
         TosCliCommand::Sync(_) => "tos sync",
@@ -237,6 +245,7 @@ High-Level Commands:
   presign       Generate presigned URL (AK/SK only; ZTI is not supported)
 
 Capabilities / Utilities:
+  ask           Experimental storage CLI recommendations (never executes commands)
   capabilities  Discover CLI capabilities
   api           Guarded API metadata and dry-run planning utility
   config        Configuration management

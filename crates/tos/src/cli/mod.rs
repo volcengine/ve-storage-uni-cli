@@ -26,6 +26,13 @@ pub use auth::VeTosAuthArgs;
 
 #[derive(Debug, Subcommand)]
 pub enum TosCommand {
+    /// Experimental one-shot storage CLI recommendations (never executes commands)
+    #[command(
+        long_about = tos_core::ask::cli::ASK_HELP_OVERVIEW,
+        after_help = tos_core::ask::cli::question_help_examples("ve-tos-cli"),
+        override_usage = tos_core::ask::cli::question_help_usage("ve-tos-cli")
+    )]
+    Ask(tos_core::ask::cli::AskArgs),
     // ─── High-Level Commands ───────────────────────────────
     /// Copy local files, TOS objects, or prefixes
     Cp(high_level::CpArgs),
@@ -209,6 +216,7 @@ pub fn command_path(command: &Option<TosCommand>) -> String {
         return "ve-tos".to_string();
     };
     let suffix: &str = match command {
+        TosCommand::Ask(_) => "ask",
         // High-level
         TosCommand::Cp(_) => "cp",
         TosCommand::Mv(_) => "mv",

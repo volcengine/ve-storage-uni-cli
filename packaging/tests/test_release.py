@@ -127,7 +127,8 @@ def test_adrive_only_npm_publish_does_not_publish_ve_tos(tmp_path, monkeypatch):
     args = release.build_parser().parse_args(
         [
             "npm", "--version", "1.0.4", "--package", "ve-adrive-cli",
-            "--out-dir", str(tmp_path), "--execute-publish",
+            "--out-dir", str(tmp_path), "--archive-dir", str(tmp_path / "archives"),
+            "--execute-publish",
         ]
     )
 
@@ -135,6 +136,7 @@ def test_adrive_only_npm_publish_does_not_publish_ve_tos(tmp_path, monkeypatch):
 
     assert len(commands) == 2
     assert commands[0][0][-2:] == ("--package", "ve-adrive-cli")
+    assert commands[0][0][commands[0][0].index("--archive-dir") + 1] == str(tmp_path / "archives")
     assert commands[1][0][:3] == ("npm", "publish", str(tmp_path / "ve-adrive-cli"))
     assert commands[1][1] is True
 
@@ -188,7 +190,7 @@ def test_adrive_only_pip_preview_lists_only_selected_wheels(tmp_path, monkeypatc
     )
 
 
-def test_adrive_only_generators_emit_only_the_selected_cli(tmp_path):
+def test_adrive_only_generators_emit_only_the_selected_cli(tmp_path, npm_archives):
     binary_dir = tmp_path / "bin"
     binary_dir.mkdir()
     (binary_dir / "ve-adrive-cli").write_bytes(b"adrive executable")
@@ -213,6 +215,7 @@ def test_adrive_only_generators_emit_only_the_selected_cli(tmp_path):
             "python3", str(REPO_ROOT / "packaging/scripts/npm.py"),
             "--version", "1.0.4", "--out-dir", str(npm_dir),
             "--package", "ve-adrive-cli",
+            "--archive-dir", str(npm_archives),
         ],
         cwd=REPO_ROOT,
         check=True,
@@ -1494,8 +1497,12 @@ def test_all_publish_enables_external_publish_steps(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         release,
-        "run_npm",
+        "publish_npm",
         lambda args: calls.append(("npm", args.execute_publish, args.otp)),
+    )
+    monkeypatch.setattr(
+        release, "prepare_npm",
+        lambda args: calls.append(("npm-prepare", str(args.archive_dir))),
     )
     monkeypatch.setattr(
         release,
@@ -1549,6 +1556,7 @@ def test_all_publish_enables_external_publish_steps(tmp_path, monkeypatch):
 
     assert calls == [
         ("archives", None),
+        ("npm-prepare", "dist"),
         ("github-release", True, "auto"),
         ("cargo", True),
         ("npm", True, "123456"),
@@ -1558,6 +1566,22 @@ def test_all_publish_enables_external_publish_steps(tmp_path, monkeypatch):
     ]
 
 
+def test_all_missing_npm_archives_aborts_before_any_external_publication(tmp_path, monkeypatch):
+    release = load_release_module()
+    external_calls = []
+    monkeypatch.setattr(release, "run_archives", lambda args: None)
+    monkeypatch.setattr(release, "checksums_for_all", lambda args: tmp_path / "SHA256SUMS")
+    for name in ("run_cargo", "run_github_release", "publish_npm", "run_pip", "run_homebrew", "run_winget"):
+        monkeypatch.setattr(release, name, lambda args: external_calls.append(True))
+    args = release.build_parser().parse_args([
+        "all", "--version", "1.0.5", "--target", "aarch64-apple-darwin",
+        "--out-dir", str(tmp_path / "missing-release"), "--publish", "--tap-dir", str(tmp_path),
+    ])
+    with pytest.raises(subprocess.CalledProcessError):
+        release.run_all(args)
+    assert external_calls == []
+
+
 def test_all_publish_respects_explicit_homebrew_commit_and_push(tmp_path, monkeypatch):
     release = load_release_module()
     calls = []
@@ -1565,7 +1589,8 @@ def test_all_publish_respects_explicit_homebrew_commit_and_push(tmp_path, monkey
     monkeypatch.setattr(release, "run_cargo", lambda args: None)
     monkeypatch.setattr(release, "run_archives", lambda args: None)
     monkeypatch.setattr(release, "run_github_release", lambda args: None)
-    monkeypatch.setattr(release, "run_npm", lambda args: None)
+    monkeypatch.setattr(release, "prepare_npm", lambda args: None)
+    monkeypatch.setattr(release, "publish_npm", lambda args: None)
     monkeypatch.setattr(release, "run_pip", lambda args: None)
     monkeypatch.setattr(
         release,

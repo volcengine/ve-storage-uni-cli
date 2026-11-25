@@ -29,6 +29,13 @@ const ADRIVE_EXAMPLE_PREFIX_ENV: &str = "VE_STORAGE_UNI_ADRIVE_EXAMPLE_PREFIX";
 
 #[derive(Debug, Subcommand)]
 pub enum ADriveCommand {
+    /// Experimental one-shot storage CLI recommendations (never executes commands)
+    #[command(
+        long_about = tos_core::ask::cli::ASK_HELP_OVERVIEW,
+        after_help = tos_core::ask::cli::question_help_examples("ve-adrive-cli"),
+        override_usage = tos_core::ask::cli::question_help_usage("ve-adrive-cli")
+    )]
+    Ask(tos_core::ask::cli::AskArgs),
     // ─── High-Level Commands ───────────────────────────────
     /// Copy local files, ADrive files, or folders
     Cp(high_level::CpArgs),
@@ -93,6 +100,7 @@ pub enum ADriveCommand {
 /// Stable, debug-syntax-free command path used by error envelopes.
 pub fn command_path(command: &ADriveCommand) -> String {
     let suffix: &str = match command {
+        ADriveCommand::Ask(_) => "ask",
         ADriveCommand::File(group) => {
             return group
                 .action
@@ -204,6 +212,7 @@ Low-Level Commands:
   chunk         Search and read document chunks
 
 Capabilities / Utilities:
+  ask           Experimental storage CLI recommendations (never executes commands)
   capabilities  Discover CLI capabilities
   api           Inspect API metadata
   config        Configuration management

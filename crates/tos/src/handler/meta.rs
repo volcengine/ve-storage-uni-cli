@@ -59,6 +59,23 @@ use crate::registry::{
 mod mcp_entrypoint;
 
 const VE_TOS_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    // [Review Fix #6] Each product owns a separate exact catalog for Describe and Skill metadata.
+    ("Experimental storage CLI recommendations (never executes commands)", "实验性存储 CLI 问答与命令建议（不执行命令）"),
+    ("Manage Doubao OAuth: ask auth login/status/logout", "豆包授权管理：ask auth login/status/logout"),
+    ("One storage CLI question, up to 8192 bytes", "一个存储 CLI 问题，最多 8192 字节"),
+    ("Direct Doubao OAuth; storage credentials are not used", "直接使用豆包 OAuth；不使用存储凭证"),
+    ("Recommendations are never executed", "不执行建议的命令"),
+    ("Experimental one-shot storage CLI recommendations (never executes commands)", "实验性单次存储 CLI 问答与命令建议（不执行命令）"),
+    ("Manage the separate Doubao OAuth login", "管理独立的豆包 OAuth 登录"),
+    // [Review Fix #10] Localize the restored ask grammar in each owning catalog.
+    ("Explicit question, including the reserved word auth", "显式问题，也可询问保留字 auth"),
+    ("Question text placed directly after ask (quote it as one argument)", "直接放在 ask 后的问题文本（请将整个问题用引号括为一个参数）"),
+    (tos_core::ask::cli::ASK_HELP_OVERVIEW, "在 ask 后直接填写用引号括起的问题，获取命令建议。\n\n使用 ask auth 管理豆包登录。推荐的命令不会自动执行。"),
+    ("Authorize directly with Doubao using a loopback callback", "通过本机回调直接向豆包授权"),
+    ("Print the authorization URL without opening a browser", "打印授权链接，不打开浏览器"),
+    ("Inspect local expiry only; remote revocation is not checked", "仅查看本地有效期；不检查远端撤销状态"),
+    ("Remove locally saved Doubao tokens; does not revoke the remote grant", "移除本地保存的豆包令牌；不撤销远端授权"),
+    ("Login, inspect local status, or remove local credentials", "登录、查看本地状态或移除本地凭证"),
     (crate::cli::high_level::HNS_FILTERED_MOVE_HELP, "递归移动目录或前缀。以 HNS 为源时，使用 --include/--exclude 仅移动选中的文件，保留源目录和排除的文件。未使用筛选条件时，仍可执行整目录 rename。"),
     ("Skip explicit directory uploads. By default, preserve directories including empty directories. Files may still create required parent directories", "跳过显式目录上传。默认保留目录，包括空目录。文件仍可能创建所需的父目录"),
     // [Review Fix #2] The shared Skill export parameter must be localized on ve-tos Describe.
@@ -886,6 +903,8 @@ const VE_TOS_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
     ("Planned delete manifest path", "计划删除 manifest 路径"),
     ("Planned restore manifest path", "计划恢复 manifest 路径"),
     ("Planned transfer manifest path", "计划传输 manifest 路径"),
+    // [Review Fix #27] The optional Doubao MCP profile description also needs exact schema localization.
+    ("Configuration profile name", "配置 Profile 名称"),
     ("Profile name, default is default", "Profile 名称，默认为 default"),
     ("PutObject for a single object body up to 5GB.", "使用 PutObject 上传最大 5GB 的单个对象正文。"),
     ("Quote paths and object keys that contain spaces or shell metacharacters.", "包含空格或 shell 元字符的路径和对象 key 需要加引号。"),
@@ -1494,6 +1513,17 @@ pub async fn handle_capabilities_command(
     global: &GlobalArgs,
     args: &CapabilitiesArgs,
 ) -> Result<i32, CliError> {
+    // [Review Fix #22] Describe returns this command's contract rather than a capability listing.
+    if global.describe {
+        let description = describe_command_metadata("ve-tos capabilities").ok_or_else(|| {
+            CliError::ValidationError("no metadata registered for ve-tos capabilities".into())
+        })?;
+        output_result(
+            global,
+            &Envelope::success("ve-tos capabilities", description),
+        )?;
+        return Ok(0);
+    }
     let mut view = serde_json::to_value(capabilities_view(args)?)?;
     render_ve_tos_documentation(&mut view);
     output_result_with_columns(
@@ -1610,10 +1640,28 @@ pub async fn handle_serve_command(global: &GlobalArgs, args: &ServeArgs) -> Resu
     Ok(0)
 }
 
+/// Report diagnostics, or describe their contract without running checks.
+///
+/// `global` selects output and preview modes; `args` selects executable checks.
+/// Returns zero on success and propagates metadata, check, or output errors.
 pub async fn handle_doctor_command(
     global: &GlobalArgs,
     args: &DoctorArgs,
 ) -> Result<i32, CliError> {
+    // [Review Fix #20] Preview modes must precede config, credential SDK, and live-network checks.
+    if global.describe || global.dry_run {
+        let description = describe_command_metadata("ve-tos doctor").ok_or_else(|| {
+            CliError::ValidationError("no metadata registered for ve-tos doctor".to_string())
+        })?;
+        let mut documentation = serde_json::to_value(description)?;
+        if global.dry_run {
+            documentation["dry_run"] = json!(true);
+            documentation["executed"] = json!(false);
+            documentation["network_requests"] = json!(0);
+        }
+        output_result(global, &Envelope::success("ve-tos doctor", documentation))?;
+        return Ok(0);
+    }
     let report = doctor_report(global, args).await?;
     output_result(global, &Envelope::success("ve-tos doctor", report))?;
     Ok(0)
@@ -3075,6 +3123,49 @@ async fn mcp_execute_typed_command(
     Ok((payload, is_error))
 }
 
+// [Review Fix #10] Keep the public browser switch aligned with its typed clap field.
+fn normalize_ask_browser_argument(
+    arguments: &mut serde_json::Map<String, Value>,
+) -> Result<(), CliError> {
+    if arguments
+        .get("is_no_browser")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(CliError::ValidationError(
+            "no-browser must be a single boolean".into(),
+        ));
+    }
+    let Some(value) = arguments.remove("no-browser") else {
+        return Ok(());
+    };
+    if !value.is_boolean() || arguments.contains_key("is_no_browser") {
+        return Err(CliError::ValidationError(
+            "no-browser must be a single boolean".into(),
+        ));
+    }
+    arguments.insert("is_no_browser".into(), value);
+    Ok(())
+}
+
+// [Review Fix #13] MCP questions use the explicit option so auth remains a question.
+fn normalize_ask_question_argument(
+    command: &str,
+    arguments: &mut serde_json::Map<String, Value>,
+) -> Result<(), CliError> {
+    if command != "ve-tos ask" {
+        return Ok(());
+    }
+    if arguments.contains_key("question") && arguments.contains_key("explicit_question") {
+        return Err(CliError::ValidationError(
+            "question must only be supplied once".into(),
+        ));
+    }
+    if let Some(question) = arguments.remove("question") {
+        arguments.insert("explicit_question".into(), question);
+    }
+    Ok(())
+}
+
 fn build_mcp_typed_argv(
     global: &GlobalArgs,
     command: &str,
@@ -3082,6 +3173,8 @@ fn build_mcp_typed_argv(
 ) -> Result<Vec<String>, CliError> {
     // [Review Fix #DirectoryMcpType] Registry uses the public flag name; clap stores its Rust field ID.
     let mut arguments = arguments.clone();
+    normalize_ask_question_argument(command, &mut arguments)?;
+    normalize_ask_browser_argument(&mut arguments)?;
     if let Some(value) = arguments.remove("disable-dir-object") {
         arguments.insert("disable_dir_object".into(), value);
     }
@@ -4464,6 +4557,13 @@ fn capability_row_input_schema(row: &CapabilityRow) -> Value {
             required.push(parameter.name.clone());
         }
     }
+    // [Review Fix #26] Doubao selects per-call profiles; stores remain inherited server defaults.
+    if row.command == "ve-tos ask" || row.command.starts_with("ve-tos ask ") {
+        properties.insert(
+            "profile".to_string(),
+            json!({"type": "string", "description": "Configuration profile name"}),
+        );
+    }
     add_skill_control_schema(&mut properties);
     json!({
         "type": "object",
@@ -4544,7 +4644,9 @@ fn add_skill_control_schema(properties: &mut serde_json::Map<String, Value>) {
 
 fn registry_parameter_schema_type(name: &str) -> &'static str {
     match name {
-        "recursive"
+        // [Review Fix #10] The restored ask auth login switch is a boolean.
+        "no-browser"
+        | "recursive"
         | "checkpoint"
         | "force"
         | "destroy"
@@ -4619,6 +4721,184 @@ fn contains_ignore_case(value: &str, needle: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // [Review Fix #20] Preview and Describe must return before validating or running doctor checks.
+    #[tokio::test]
+    async fn doctor_preview_precedes_all_check_execution() {
+        for is_dry_run in [false, true] {
+            let mut global = test_global_args();
+            let directory =
+                std::env::temp_dir().join(format!("ve-tos-doctor-preview-{}", ulid::Ulid::new()));
+            global.config_path = Some(directory.join("missing-config.toml"));
+            global.credentials_path = Some(directory.join("missing-credentials.toml"));
+            global.describe = !is_dry_run;
+            global.dry_run = is_dry_run;
+            let args = DoctorArgs {
+                check: Some("invalid-preview-check".to_string()),
+                bucket: None,
+                live_network: true,
+                network_timeout_ms: 1,
+            };
+            assert_eq!(handle_doctor_command(&global, &args).await.unwrap(), 0);
+            assert!(!directory.exists());
+        }
+    }
+
+    // [Review Fix #21] Skill export and MCP advertise the same config-set operands as Describe.
+    #[test]
+    fn config_set_skill_schema_excludes_runtime_authentication_override() {
+        let row = capability_row_for_command("ve-tos config set", true).unwrap();
+        let schema = capability_row_input_schema(&row);
+        assert!(schema["properties"].get("auth-mode").is_none());
+        assert_eq!(schema["required"], json!(["key", "value"]));
+    }
+
+    #[tokio::test]
+    async fn ask_mcp_questions_use_explicit_question_option_without_execution() {
+        use tos_core::ask::cli::AskArgs;
+        let directory = std::env::temp_dir().join(format!("ve-tos-ask-plan-{}", ulid::Ulid::new()));
+        let mut global = test_global_args();
+        global.config_path = Some(directory.join("missing-config.toml"));
+        global.credentials_path = Some(directory.join("missing-credentials.toml"));
+        let skill = skill_definitions()
+            .into_iter()
+            .find(|skill| skill.command == "ve-tos ask")
+            .unwrap();
+        assert_eq!(
+            skill.input_schema["properties"]["question"]["type"],
+            "string"
+        );
+        for question in ["auth", "how to upload a file"] {
+            let (plan, is_error) =
+                mcp_execute_typed_command(&global, &skill, &json!({"question":question}))
+                    .await
+                    .unwrap();
+            assert!(!is_error);
+            assert_eq!(plan["execution_status"], "planned_not_executed");
+            let argv: Vec<String> = serde_json::from_value(plan["argv"].clone()).unwrap();
+            assert!(argv.windows(2).any(|pair| pair == ["--question", question]));
+            let ask_position = argv.iter().position(|argument| argument == "ask").unwrap();
+            let parser = <AskArgs as clap::Args>::augment_args(clap::Command::new("ask"));
+            let matches = parser.try_get_matches_from(&argv[ask_position..]).unwrap();
+            let parsed = <AskArgs as clap::FromArgMatches>::from_arg_matches(&matches).unwrap();
+            assert!(parsed.action.is_none());
+            assert_eq!(parsed.explicit_question.as_deref(), Some(question));
+            assert!(!directory.exists());
+        }
+    }
+
+    #[test]
+    fn ask_mcp_question_aliases_conflict_and_unrelated_commands_keep_their_inputs() {
+        let duplicate = json!({"question":"auth", "explicit_question":"other"});
+        assert!(build_mcp_typed_argv(
+            &test_global_args(),
+            "ve-tos ask",
+            duplicate.as_object().unwrap()
+        )
+        .is_err());
+        let unrelated = json!({"question":"auth"});
+        let error = build_mcp_typed_argv(
+            &test_global_args(),
+            "ve-tos cp",
+            unrelated.as_object().unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown argument 'question'"));
+    }
+
+    #[test]
+    fn assistant_schema_profile_matches_forwarded_call_and_parent_defaults() {
+        let mut global = test_global_args();
+        global.profile = "parent".into();
+        global.config_path = Some("/synthetic/config.toml".into());
+        global.credentials_path = Some("/synthetic/credentials.toml".into());
+        for command in [
+            "ve-tos ask",
+            "ve-tos ask auth",
+            "ve-tos ask auth login",
+            "ve-tos ask auth status",
+            "ve-tos ask auth logout",
+        ] {
+            assert_assistant_profile_contract(&global, command);
+        }
+        let unrelated = capability_row_for_command("ve-tos cp", true).unwrap();
+        assert!(capability_row_input_schema(&unrelated)["properties"]
+            .get("profile")
+            .is_none());
+    }
+
+    fn assert_assistant_profile_contract(global: &GlobalArgs, command: &str) {
+        let row = capability_row_for_command(command, true).unwrap();
+        let schema = capability_row_input_schema(&row);
+        assert_eq!(
+            schema["properties"]["profile"]["type"], "string",
+            "{command}"
+        );
+        assert!(!schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("profile")));
+        for property in [
+            "config_path",
+            "credentials_path",
+            "auth_mode",
+            "region",
+            "endpoint",
+        ] {
+            assert!(
+                schema["properties"].get(property).is_none(),
+                "{command}: {property}"
+            );
+        }
+        for (arguments, expected_profile) in [
+            (json!({}), "parent"),
+            (json!({"profile":"child '$(opaque)"}), "child '$(opaque)"),
+        ] {
+            let argv =
+                build_mcp_typed_argv(global, command, arguments.as_object().unwrap()).unwrap();
+            for expected in [
+                ["--profile", expected_profile],
+                ["--config-path", "/synthetic/config.toml"],
+                ["--credentials-path", "/synthetic/credentials.toml"],
+            ] {
+                assert!(
+                    argv.windows(2).any(|pair| pair == expected),
+                    "{command}: {argv:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn assistant_auth_schema_and_argv_use_the_boolean_browser_switch() {
+        let row = capability_row_for_command("ve-tos ask auth login", true).unwrap();
+        let schema = capability_row_input_schema(&row);
+        assert_eq!(schema["properties"]["no-browser"]["type"], "boolean");
+        let arguments = json!({"no-browser": true});
+        let argv = build_mcp_typed_argv(
+            &test_global_args(),
+            &row.command,
+            arguments.as_object().unwrap(),
+        )
+        .unwrap();
+        assert!(argv.iter().any(|argument| argument == "--no-browser"));
+        for value in [json!("true"), json!(1), Value::Null] {
+            let arguments = json!({"no-browser": value});
+            assert!(build_mcp_typed_argv(
+                &test_global_args(),
+                &row.command,
+                arguments.as_object().unwrap()
+            )
+            .is_err());
+            let arguments = json!({"is_no_browser": value});
+            assert!(build_mcp_typed_argv(
+                &test_global_args(),
+                &row.command,
+                arguments.as_object().unwrap()
+            )
+            .is_err());
+        }
+    }
+
     #[test]
     fn directory_mcp_rejects_non_boolean_opt_out() {
         for value in [json!("true"), json!(1), Value::Null] {

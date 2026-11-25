@@ -1250,7 +1250,8 @@ pub const CAPABILITIES: &[CapabilityRow] = &[
         risk_level: "low",
         destructive: false,
         supports_force: false,
-        supports_dry_run: true,
+        // [Review Fix #21] Capability discovery ignores dry-run; keep registry metadata aligned with help and schemas.
+        supports_dry_run: false,
         api_actions: &[],
         parameters: &[],
         examples: &["ve-adrive-cli capabilities --view full"],
@@ -1349,7 +1350,8 @@ pub const CAPABILITIES: &[CapabilityRow] = &[
         risk_level: "low",
         destructive: false,
         supports_force: false,
-        supports_dry_run: false,
+        // [Review Fix #20] Doctor now offers an offline metadata preview before authentication or network checks.
+        supports_dry_run: true,
         api_actions: &[],
         parameters: &[],
         examples: &["ve-adrive-cli doctor --check principles"],
@@ -1377,6 +1379,20 @@ pub const CAPABILITIES: &[CapabilityRow] = &[
             "ve-adrive-cli config set auth_mode unified",
             "ve login",
         ],
+    },
+    // [Review Fix #9] Append assistant utilities so existing discovery and Skill ordering stays stable.
+    CapabilityRow {
+        command: "ve-adrive ask", domain: "ask", group: "Capabilities / Utilities", layer: "utility",
+        description: "Experimental storage CLI recommendations (never executes commands)", risk_level: "low", destructive: false,
+        supports_force: false, supports_dry_run: true, api_actions: &[],
+        parameters: &[RegistryParameter { name: "question", required: false, description: "One storage CLI question, up to 8192 bytes" }], examples: &["ve-adrive-cli ask '如何上传文件？'"],
+    },
+    // [Review Fix #10] Assistant OAuth is separate from legacy ADrive auth metadata.
+    CapabilityRow {
+        command: "ve-adrive ask auth", domain: "ask", group: "Capabilities / Utilities", layer: "utility",
+        description: "Manage Doubao OAuth: ask auth login/status/logout", risk_level: "low", destructive: false,
+        supports_force: false, supports_dry_run: true, api_actions: &[], parameters: &[],
+        examples: &["ve-adrive-cli ask auth login --no-browser"],
     },
 ];
 

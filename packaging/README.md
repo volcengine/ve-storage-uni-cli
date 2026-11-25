@@ -71,8 +71,9 @@ The public `tos-cli` source build includes ZTI in `tos-core`; no private ZTI
 crate or Cargo registry is required. The three standalone entry crates keep
 their `Cargo.lock` files in this repository, and the release archive builder
 uses `--locked` so archive builds cannot silently select a different dependency graph.
-The archive builder packages the dedicated binaries. npm, Homebrew, and WinGet
-consume those release archives; pip copies the same build outputs into wheels.
+The archive builder packages the dedicated binaries. npm copies each CLI's
+binaries from those archives into one self-contained package per CLI; Homebrew
+and WinGet download the release archives. pip copies the build outputs into wheels.
 The `ve-tos-cli` and `ve-adrive-cli` binaries continue to reject
 `--auth-mode zti`.
 
@@ -217,18 +218,158 @@ The archive step writes `dist/ve-storage-uni-cli-*`, `dist/SHA256SUMS`, and
 `dist/install.sh`. Archives contain `bin/ve-tos-cli`, `bin/tos-cli`, and
 `bin/ve-adrive-cli`.
 
+For an official build that includes the publisher's Doubao application, inject
+`STORAGE_CLI_BUILD_DOUBAO_APP_ID` and `STORAGE_CLI_BUILD_DOUBAO_APP_SECRET`
+through the protected local/SCM build environment,
+then add `--require-ask-credentials` to `archives` or `all`.
+
+| Build environment variable | Value source |
+| --- | --- |
+| `STORAGE_CLI_BUILD_DOUBAO_APP_ID` | The publisher's App ID. |
+| `STORAGE_CLI_BUILD_DOUBAO_APP_SECRET` | The same application's App Secret, supplied through a protected input. |
+
+Both variables must be present and valid. The CLI requests the fixed scopes
+`doubao:session:write`, `doubao:session.event:read`, and `offline_access` for
+session creation, reply streaming, and refresh credentials. Enable those user
+permissions for the publisher application before real authorization testing;
+see the [permission sources](../docs/ask-direct.md#21-准备应用).
+`STORAGE_CLI_BUILD_DOUBAO_SCOPES` is no longer read and can be removed from CI.
+
+For a local build, run the following in **Bash**, replacing the App ID placeholder
+with the actual value. Secret input is hidden and
+does not appear in shell command history. Use the target for your build runner;
+the example below is for macOS arm64.
+
+```bash
+set +x
+export STORAGE_CLI_BUILD_DOUBAO_APP_ID='<publisher App ID>'
+read -r -s -p 'App Secret: ' STORAGE_CLI_BUILD_DOUBAO_APP_SECRET
+printf '\n'
+export STORAGE_CLI_BUILD_DOUBAO_APP_SECRET
+
+python3 packaging/scripts/release.py archives \
+  --target aarch64-apple-darwin --require-ask-credentials
+
+unset STORAGE_CLI_BUILD_DOUBAO_APP_SECRET
+```
+
+For **SCM builds**, configure App ID as a build environment variable.
+Store App Secret in SCM's protected secret configuration and map it to the exact
+environment variable name `STORAGE_CLI_BUILD_DOUBAO_APP_SECRET` in the Cargo build
+step. The build script then runs the same `release.py archives` command above;
+no Secret value belongs in the script. Do not enable shell tracing (`set -x`) or
+print the build environment. Every target runner must receive the complete
+application configuration.
+
+Do not put secret values in source, command arguments, logs, or this runbook.
+The build emits a value-free `Doubao ask application: bundled` or `not bundled`
+notice. Cargo inherits exported environment variables; it does not automatically
+load `.env` files or unexported shell variables. Both inputs are tracked for
+rebuilds. Inspect the newly built binary's `ask --describe` output and require
+`application_bundled: true`; use the matching debug/release/custom target path.
+Later Cargo builds or tests without the inputs may replace the configured
+artifact with an unconfigured one.
+
+`--require-ask-credentials` requires a fresh build and cannot be combined with
+`--skip-build`. Native binaries are inspected with a read-only describe
+operation; cross-built binaries still require acceptance on their target
+platform. Keep using those same build outputs when making package wrappers.
+Rotating the application Secret requires rebuilding and distributing new
+binaries. Customers running the built binaries do not need these build
+environment variables. Binaries and compiler caches contain application
+credentials; compile-time injection does not prevent their extraction.
+
+The flag verifies embedded application configuration, not provider permissions,
+user login, or operating-system support. A customer-side `cargo install` compiles
+source without the publisher's private environment. See the
+[direct ask guide](../docs/ask-direct.md) for customer usage, internal overrides,
+credential rotation, and remaining platform acceptance work.
+
 ### 2. Build package wrappers
 
-Generate npm packages:
+Collect the five npm platform archives in `dist` before generating npm packages.
+The required targets are:
+
+| OS | Architecture | Release target |
+| --- | --- | --- |
+| macOS | x64 | `x86_64-apple-darwin` |
+| macOS | arm64 | `aarch64-apple-darwin` |
+| Linux (glibc 2.17+) | x64 | `x86_64-unknown-linux-gnu.2.17` |
+| Linux (glibc 2.17+) | arm64 | `aarch64-unknown-linux-gnu.2.17` |
+| Windows | x64 | `x86_64-pc-windows-msvc` |
+
+Generate npm packages from the collected release archives with one command:
 
 ```bash
 python3 packaging/scripts/release.py npm --version <version>
 ```
 
-All three local wrappers are generated, but npm publishing includes only
+The script reads `dist` by default, calculates and atomically creates or completes
+`dist/SHA256SUMS`, validates the required files, and generates the packages.
+Existing checksum entries must still match; a mismatch fails without overwriting
+the expected value. You do not need to run `checksums` or `npm pack` yourself.
+`npm publish` performs the actual npm tarball packaging when publication is enabled.
+Use `--archive-dir <directory>` only when archives are outside `dist`; it is an
+optional override, not part of the normal release command.
+
+All three local packages are generated, but npm publishing includes only
 `ve-tos-cli` and `ve-adrive-cli`. The npm name `tos-cli` is already occupied
 by another publisher and is excluded from both publish previews and execution,
 including `all --publish`.
+
+Each package contains only its own CLI, with all five platform binaries under
+`vendor/<target>/bin/`. There are no extra platform npm packages. Generation
+verifies archive SHA256 values and copies only regular binary entries; missing
+archives, missing binaries or invalid checksums fail before npm publication.
+Use a clean, version-specific archive directory, verify every binary's reported
+version, and never mix assets from different versions. `--version` labels the
+package; it does not rebuild or change the embedded binary versions.
+
+The npm launcher requires Node.js 18 or later. Its installation behavior is:
+
+1. npm downloads the full package, including all supported platform binaries.
+2. `postinstall` validates the current platform's bundled binary and does not
+   contact GitHub when it is present and valid. Installation and execution also
+   work with `npm install --ignore-scripts` because binaries are already included.
+3. Only when the current platform's binary is missing does `postinstall` download
+   the same version's archive from GitHub. Both archive and extracted binary must
+   match hashes pinned in the npm package's `lib/binaries.json`. Downloads have
+   HTTPS-only redirects, a 30-second deadline per request, at most five redirects
+   and a 256 MiB archive-size limit. Temporary files are removed after success or
+   failure.
+4. A present but corrupt binary, unsupported platform (including Linux musl),
+   permission error or CLI business error does not trigger a download. A missing
+   binary after installation is reported by the launcher; repair it by reinstalling
+   with installation scripts enabled.
+
+`VE_STORAGE_UNI_CLI_REPO_URL` can select an HTTPS mirror for fallback only; it
+must serve the identical archived bytes. `VE_STORAGE_UNI_CLI_VERSION` may be
+unset or equal the package version (with an optional `v` prefix). `latest` or a
+different version is rejected when fallback is needed. These variables do not
+replace a healthy bundled binary.
+
+If npm cannot download the package itself, its scripts cannot run and cannot
+automatically switch to GitHub. Use the [curl installer](#curl-installer) as a
+separate installation path. The package fallback only covers a missing binary
+after npm has obtained the package.
+
+For normal publication, add `--execute-publish` to the same command. The script
+checks all required platform payloads before invoking `npm publish`. For a single
+CLI, add `--package ve-adrive-cli` or `--package ve-tos-cli`. Without
+`--execute-publish`, it generates packages and prints the publish command only.
+
+Packaging regression tests exercise real npm tarballs and offline installs:
+
+```bash
+python3 -m pytest packaging/tests/test_npm.py packaging/tests/test_release.py
+```
+
+The generated package must include all five binaries for the selected CLI and none
+for other CLIs. Native release acceptance should test installation on macOS,
+Linux and Windows runners; local fixture tests do not replace native acceptance.
+Published npm versions are immutable: existing `1.0.4` packages cannot receive
+these files. Publish the new layout under an unused version, for example `1.0.5`.
+Retain the old GitHub assets because existing versions still download them.
 
 Generate PyPI package trees and wheels from already-built CLI binaries. Pass
 the release target triple; the release script resolves the corresponding
@@ -480,66 +621,127 @@ Registry authentication is handled by the underlying tools: `cargo login` or
 git access to the source repository for Homebrew Formulae, and GitHub access to
 your `winget-pkgs` fork.
 
-For a CI job that has already selected a single build target, `all --publish`
-runs the same flow in one entry point: build archives, upload GitHub Release
+`all --publish` runs the same flow in one entry point: build archives, validate
+and stage all npm packages, upload GitHub Release
 assets, publish Cargo, publish npm, build and upload PyPI wheels for
 `--pip-target`, and write Homebrew formulae into the source repository. Add
 `--homebrew-commit --homebrew-push` only when the current checkout should push
 Formula changes directly instead of relying on repository synchronization.
 For macOS release machines, run the WinGet PR flow above separately after the
-GitHub Release assets are available.
+GitHub Release assets are available. npm staging runs before any channel is
+published, so incomplete npm payloads abort the release early. All five npm
+archives must be present in `--out-dir`, either collected beforehand or built
+using all five `--target` arguments:
 
 ```bash
-python3 packaging/scripts/release.py all --version <version> --target <triple> --pip-target <triple> --publish --tap-dir . --github-release-clobber
+python3 packaging/scripts/release.py all --version <version> \
+  --target x86_64-apple-darwin --target aarch64-apple-darwin \
+  --target x86_64-unknown-linux-gnu.2.17 --target aarch64-unknown-linux-gnu.2.17 \
+  --target x86_64-pc-windows-msvc --pip-target <triple> \
+  --publish --tap-dir . --github-release-clobber
 ```
 
-### Coordinated CLI release 1.0.4
+### Single-CLI npm and PyPI release (ADrive example)
 
-The current release includes `ve-tos-cli`, `tos-cli`, and `ve-adrive-cli`.
-The root dispatcher, shared `tos-core`, CLI implementation crates, and entry
-crates all use 1.0.4. Vector/Table scaffold versions are aligned with the workspace
-but are not new public install channels. The independently deployed ask-auth
-service keeps its own version.
+`ve-adrive-cli` can be released independently to npm and PyPI. Choose an
+unpublished version for the selected package; it does not need to match the
+versions of `ve-tos-cli` or `tos-cli`. Publish matching GitHub assets to keep
+the missing-binary fallback available; normal npm installs use bundled files.
+Use `--package ve-adrive-cli` throughout this procedure.
+The `all --publish` command and the unfiltered registry commands publish
+multiple packages and are outside this procedure.
 
-This supersedes the previous ADrive-only 1.0.4 preparation instructions. The
-current `tos-cli` release includes shared Help/Usage, error-message, remediation,
-and Doctor fixes already merged in master. See
-[`docs/release-v1.0.4.md`](../docs/release-v1.0.4.md) for release notes and known
-validation limits.
+Before building, update the version in `crates/adrive/Cargo.toml` and
+`packaging/cargo/ve-adrive-cli/Cargo.toml`, and refresh the affected lockfiles
+and dependency requirements as needed. The binary reports the ADrive core
+version. `--version` sets npm/PyPI wrapper metadata and the GitHub release
+reference; it does not change the Rust package versions or relabel a binary.
+Other CLI and shared crate versions only change when their own changes require
+a release. Build from the final reviewed commit after it has reached the
+public source repository, and verify the binary and wrapper versions agree.
 
-Prepare from the final reviewed commit after it has reached the public source
-repository. Before any upload, inspect the actual target registries and GitHub
-tag: an existing published package/version must not be overwritten, and an
-existing tag must not be retargeted. If a previous ADrive-only 1.0.4 is already
-published in a channel, new ADrive code requires a new version there; a new local
-1.0.4 binary does not establish registry availability.
-
-Preview Cargo publishing in dependency order (this only prints commands):
+Replace `<version>` with the selected version and keep it in the release terminal
+for the commands below. Use a clean `dist` directory for this release:
 
 ```bash
-python3 packaging/scripts/release.py cargo --dry-run
+release_version='<version>'
 ```
 
-Build complete archives on each supported CI runner, using a clean directory:
+Build an ADrive-only `ve-storage-uni-cli-<target>` archive for each of the five
+npm targets on its matching runner. Collect the archives into the same release
+directory. The npm package will include all five ADrive binaries, and fallback
+will use identical archives from the GitHub Release tagged `v<version>`.
+Build each target and collect its archive in `dist`:
 
 ```bash
-python3 packaging/scripts/release.py archives --target <triple> --out-dir dist/1.0.4
-python3 packaging/scripts/release.py checksums --out-dir dist/1.0.4
+python3 packaging/scripts/release.py archives --package ve-adrive-cli --target <triple>
 ```
 
-Verify the archive contains all three dedicated binaries and each reports 1.0.4.
-Generate wrappers without uploading:
+The npm targets are `x86_64-apple-darwin`, `aarch64-apple-darwin`,
+`x86_64-unknown-linux-gnu.2.17`, `aarch64-unknown-linux-gnu.2.17`, and
+`x86_64-pc-windows-msvc`. The Linux `.2.17` targets need `cargo-zigbuild`,
+and Windows MSVC needs `cargo-xwin`, as in the general release runbook.
+Check each archive contains only `bin/ve-adrive-cli` (or `.exe` on Windows),
+plus the packaged documentation, and that its binary reports the selected
+version. Generate the package and complete checksums with one preview command:
 
 ```bash
-python3 packaging/scripts/release.py npm --version 1.0.4 --out-dir dist/1.0.4/npm
-python3 packaging/scripts/release.py pip --version 1.0.4 --target <triple> --out-dir dist/1.0.4/pip --build-wheel
+python3 packaging/scripts/release.py npm --version "$release_version" --package ve-adrive-cli
 ```
 
-The npm publishing selector includes only `ve-tos-cli` and `ve-adrive-cli`; the
-`tos-cli` npm name belongs to another publisher. The existing PyPI, Cargo,
-Homebrew, WinGet and internal ByteCloud channels keep their documented scope.
-Publishing and release-asset updates are separate execution steps after these
-artifacts and the selected version have been verified.
+This validates the five archives, creates or completes `dist/SHA256SUMS`, and
+generates `dist/npm/ve-adrive-cli`. It only prints the publish command; no npm
+package is uploaded. No separate `checksums` or `npm pack` step is required.
+
+Before uploading, confirm the package versions and GitHub tag are
+available; existing versions and tags must not be overwritten or retargeted.
+Keep the ADrive-only GitHub Release out of the generic `latest` installer
+channel because that installer expects all three CLIs:
+
+```bash
+gh release create "v$release_version" dist/ve-storage-uni-cli-* dist/SHA256SUMS \
+  --repo volcengine/ve-storage-uni-cli --target <public-commit-sha> --latest=false \
+  --title "ve-adrive-cli v$release_version" --notes 'ADrive-only release.'
+```
+
+After the fallback assets are available, publish the ADrive npm package with the
+same command plus `--execute-publish`:
+
+```bash
+python3 packaging/scripts/release.py npm --version "$release_version" --package ve-adrive-cli \
+  --execute-publish
+```
+
+Without `--execute-publish`, package generation runs and the publish command is
+only printed. With it, the same complete package is generated and `npm publish`
+is executed. Neither command publishes `ve-tos-cli` or creates platform subpackages.
+Do not reuse a published version such as `1.0.4`; choose an unused version such
+as `1.0.5`, after checking the selected package's registry history.
+
+Only custom archive layouts need `--archive-dir <directory>`; optionally change
+generated package output with `--out-dir <directory>`. Keep these overrides out
+of the default workflow unless the release job actually uses custom paths.
+
+Build the PyPI wheel once per supported wheel target. Collect the wheels in
+the same release-specific `wheels/` directory, then upload only the selected
+package and version. PyPI wheels contain the binary and do not download
+GitHub assets, so a PyPI-only release does not require a GitHub Release:
+
+```bash
+python3 packaging/scripts/release.py pip --version "$release_version" --package ve-adrive-cli \
+  --target <triple> --build-wheel
+python3 packaging/scripts/release.py pip --version "$release_version" --package ve-adrive-cli \
+  --upload
+```
+
+For PyPI Linux wheels use the `.2.17` triples in `platforms.json`; the plain
+GNU triples have no default manylinux wheel tag. The `--package` selector also
+filters upload files by package and version if the wheel directory contains
+unrelated files. This procedure publishes no Cargo, Homebrew, WinGet, or
+ByteCloud TOS artifacts.
+
+Choose the version for this package and verify its availability in each
+selected registry before publishing.
 
 ## curl Installer
 

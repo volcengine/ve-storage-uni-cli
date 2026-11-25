@@ -826,7 +826,8 @@ ve-tos 以 HNS 为源时，与 ADrive 一样：`mv --recursive` 使用 `--includ
 
 ## Common Options
 
-Most commands share these options:
+Commands share option names, but each command's `--help` lists the options it actually uses.
+Group help includes options needed by any child command.
 
 | Option                      | Env           | Description                                               |
 |-----------------------------|---------------|-----------------------------------------------------------|
@@ -844,10 +845,25 @@ Most commands share these options:
 | `-y, --yes`                 |               | Auto-confirm supported destructive prompts.               |
 | `--confirm <RESOURCE>`      |               | Confirm critical delete operations with the exact target. |
 | `--no-color [<BOOL>]`       | `NO_COLOR`    | Disable colored output.                                   |
-| `-v, --verbose`             |               | Verbose logs to stderr.                                   |
-| `-q, --quiet`               |               | Suppress non-error output.                                |
+| `-v, --verbose`             |               | Command-specific diagnostics, such as TOS table metadata or ADrive `du` details. |
+| `-q, --quiet`               |               | Disable automatic prompts and progress where supported; results and errors remain visible. |
 | `--trace-dir <DIR>`         |               | Write trace diagnostics.                                  |
 | `--trace-redact <LEVEL>`    |               | `strict`, `relaxed`, or `off`; default `strict`.          |
+
+| Command family | Applicable shared options |
+| --- | --- |
+| `capabilities`, `completion`, `skill list/export` | Output and documentation options. Storage authentication, profiles, network overrides and deletion confirmation do not apply. `--dry-run` is available for Skill export. |
+| `config init/show/set` | Selected configuration stores and supported preview options. Network flags do not change stored values; use `config set <KEY> <VALUE>`. TOS `config show` also uses the selected authentication mode. |
+| ADrive `auth` | ADrive authentication mode, profile and credential stores. `auth login` can use `--endpoint` as an authorization endpoint fallback; `auth status/logout` do not use it. |
+| `serve` | Startup preview and the defaults actually passed to MCP calls. The supported subset differs by product. |
+| `ls/stat/du/find/cat/presign` | Storage access options, without deletion confirmation flags. |
+
+`cat` streams resource bytes during execution; `--output` and `--query` apply to its
+structured `--describe` / `--dry-run` output. Doctor previews return the command contract;
+`doctor --describe` and `doctor --dry-run` do not read profiles, inspect authentication,
+or run live network probes, even when `--live-network` is present. `skill export --describe`
+does not create export files. Existing shared argument parsing remains compatible;
+an irrelevant storage flag does not change a local command's behavior.
 
 Credential variables are resolved by the config layer:
 

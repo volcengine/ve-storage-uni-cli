@@ -906,11 +906,46 @@ pub const CAPABILITIES: &[CapabilityRow] = &[
         "Environment diagnostics",
         "low",
         false,
-        false,
+        // [Review Fix #20] Doctor now has an offline dry-run guard before configuration or probes.
+        true,
         DOCTOR_PARAMS,
         &[],
         &["tos-cli doctor"],
     ),
+    // [Review Fix #9] Append assistant utilities so existing discovery and Skill ordering stays stable.
+    CapabilityRow {
+        command: "tos ask",
+        domain: "ask",
+        group: "utilities",
+        layer: "utilities",
+        description: "Experimental storage CLI recommendations (never executes commands)",
+        risk_level: "low",
+        destructive: false,
+        supports_force: false,
+        supports_dry_run: true,
+        api_actions: &[],
+        parameters: &[RegistryParameter {
+            name: "question",
+            required: false,
+            description: "One storage CLI question, up to 8192 bytes",
+        }],
+        examples: &["tos-cli ask '如何上传文件？'"],
+    },
+    // [Review Fix #10] Assistant OAuth discovery follows the accepted ask auth namespace.
+    CapabilityRow {
+        command: "tos ask auth",
+        domain: "ask",
+        group: "utilities",
+        layer: "utilities",
+        description: "Manage Doubao OAuth: ask auth login/status/logout",
+        risk_level: "low",
+        destructive: false,
+        supports_force: false,
+        supports_dry_run: true,
+        api_actions: &[],
+        parameters: &[],
+        examples: &["tos-cli ask auth status"],
+    },
 ];
 
 const fn row(

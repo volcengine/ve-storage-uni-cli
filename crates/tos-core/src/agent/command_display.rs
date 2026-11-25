@@ -11,6 +11,8 @@ const COMMAND_ROOTS: &[&str] = &[
     "acl",
     "ap",
     "api",
+    // [Review Fix #4] Keep assistant command help and parse recovery in the presentation vocabulary.
+    "ask",
     "auth",
     "bucket",
     "cap",

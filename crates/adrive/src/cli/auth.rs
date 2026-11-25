@@ -35,6 +35,7 @@ pub struct ADriveAuthArgs {
     pub auth_mode: Option<AuthMode>,
 }
 
+// [Review Fix #10] Restore legacy ADrive authentication independently of ask auth.
 /// Inspect or manage the selected ADrive authentication strategy.
 #[derive(Debug, Args)]
 #[command(

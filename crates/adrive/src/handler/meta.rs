@@ -107,6 +107,23 @@ const ADRIVE_DEFAULT_BATCH_REPORT_DIR: &str = "~/.tos/reports/ve-adrive";
 
 // Exact owner catalog: identifiers inside each full phrase remain unchanged.
 const ADRIVE_METADATA_TRANSLATIONS_ZH: &[(&str, &str)] = &[
+    // [Review Fix #6] Each product owns a separate exact catalog for Describe and Skill metadata.
+    ("Experimental storage CLI recommendations (never executes commands)", "实验性存储 CLI 问答与命令建议（不执行命令）"),
+    ("Manage Doubao OAuth: ask auth login/status/logout", "豆包授权管理：ask auth login/status/logout"),
+    ("One storage CLI question, up to 8192 bytes", "一个存储 CLI 问题，最多 8192 字节"),
+    ("Direct Doubao OAuth; storage credentials are not used", "直接使用豆包 OAuth；不使用存储凭证"),
+    ("Recommendations are never executed", "不执行建议的命令"),
+    ("Experimental one-shot storage CLI recommendations (never executes commands)", "实验性单次存储 CLI 问答与命令建议（不执行命令）"),
+    ("Manage the separate Doubao OAuth login", "管理独立的豆包 OAuth 登录"),
+    // [Review Fix #10] Localize the restored ask grammar in each owning catalog.
+    ("Explicit question, including the reserved word auth", "显式问题，也可询问保留字 auth"),
+    ("Question text placed directly after ask (quote it as one argument)", "直接放在 ask 后的问题文本（请将整个问题用引号括为一个参数）"),
+    (tos_core::ask::cli::ASK_HELP_OVERVIEW, "在 ask 后直接填写用引号括起的问题，获取命令建议。\n\n使用 ask auth 管理豆包登录。推荐的命令不会自动执行。"),
+    ("Authorize directly with Doubao using a loopback callback", "通过本机回调直接向豆包授权"),
+    ("Print the authorization URL without opening a browser", "打印授权链接，不打开浏览器"),
+    ("Inspect local expiry only; remote revocation is not checked", "仅查看本地有效期；不检查远端撤销状态"),
+    ("Remove locally saved Doubao tokens; does not revoke the remote grant", "移除本地保存的豆包令牌；不撤销远端授权"),
+    ("Login, inspect local status, or remove local credentials", "登录、查看本地状态或移除本地凭证"),
     (crate::cli::high_level::USERMETA_HELP, "用户元数据使用 key=value#key2=value2 或字符串值 JSON 对象。键仅接受 ASCII 字母、数字、连字符、下划线，忽略大小写，ids-* 为保留字段。空值会被存储，不表示删除。容量由服务端校验。cp 仅对本地上传文件生效，不修改目录标记，不支持远端源。"),
     ("Incrementally update file user metadata", "增量更新文件用户元数据"),
     ("Exact file URI: adrive://instance/space/path", "精确文件 URI：adrive://instance/space/path"),
@@ -588,6 +605,20 @@ pub async fn handle_capabilities_command(
     global: &GlobalArgs,
     args: &CapabilitiesArgs,
 ) -> Result<i32, CliError> {
+    // [Review Fix #22] Describe returns this command's contract rather than a capability listing.
+    if global.describe {
+        let description =
+            describe_adrive_command_metadata("ve-adrive capabilities").ok_or_else(|| {
+                CliError::ValidationError(
+                    "no metadata registered for ve-adrive capabilities".into(),
+                )
+            })?;
+        output_envelope(
+            global,
+            &Envelope::success("ve-adrive capabilities", description),
+        )?;
+        return Ok(0);
+    }
     let rows = filtered_capabilities(args);
     let view = if args.view == "tree" {
         "full"
@@ -1435,7 +1466,10 @@ fn skill_input_schema(row: &CapabilityRow) -> Value {
         properties.insert("password".into(),json!({"type":"string","maxLength":4096,"writeOnly":true,"description":"Share password supplied through child stdin"}));
     }
     for (name, schema) in mcp_common_schema_properties() {
-        properties.entry(name.to_string()).or_insert(schema);
+        // [Review Fix #21] Advertise only applicable globals; legacy argument acceptance and forwarding remain compatible.
+        if tos_core::agent::help_scope::supports_global_option(row.command, name) {
+            properties.entry(name.to_string()).or_insert(schema);
+        }
     }
     json!({
         "type": "object",
@@ -1531,6 +1565,8 @@ fn is_boolean_parameter(name: &str) -> bool {
     matches!(
         name,
         "password-stdin"
+            // [Review Fix #5] Keep Doubao login's clap switch boolean in registry/MCP descriptions.
+            | "no-browser"
             | "no-recursive"
             | "checkpoint"
             | "overwrite"
@@ -2169,9 +2205,10 @@ fn handle_adrive_credential_set(
     // `default.tos.access_key_id`; only bare ADrive keys default to ADrive.
     let section = credential_section_for_adrive_path(&segments)?;
     let credentials_path = global.credentials_path();
-    let mut credentials = CredentialsFile::load_from(&credentials_path)?;
-    credentials.set_aksk_field(profile_name, section, field, value)?;
-    credentials.save_to_path(&credentials_path)?;
+    // [Review Fix #CredentialTransaction4] Merge this field into the latest shared credential store while holding its transaction lock.
+    CredentialsFile::update(&credentials_path, |credentials| {
+        credentials.set_aksk_field(profile_name, section, field, value)
+    })?;
 
     let envelope = Envelope::success(
         "ve-adrive config set",
@@ -2528,7 +2565,8 @@ pub fn describe_adrive_command_metadata(command_path: &str) -> Option<Value> {
         "layer": "meta",
         "description": describe_meta_command_description(command_path, row.description),
         "risk_level": row.risk_level,
-        "supports_dry_run": row.supports_dry_run,
+        // [Review Fix #21] The skill group includes export; listing alone does not consume dry-run.
+        "supports_dry_run": row.supports_dry_run && command_path != "ve-adrive skill list",
         "supports_pipe": false,
         "parameters": parameters,
         "scenario_routing": describe_meta_scenario_routing(command_path),
@@ -3737,6 +3775,20 @@ pub async fn handle_doctor_command(
     auth: &ADriveAuthArgs,
     args: &DoctorArgs,
 ) -> Result<i32, CliError> {
+    // [Review Fix #20] Metadata and previews must return before config, credential SDK inspection, or live probes.
+    if global.describe || global.dry_run {
+        let mut description =
+            describe_adrive_command_metadata("ve-adrive doctor").ok_or_else(|| {
+                CliError::ValidationError("no metadata registered for ve-adrive doctor".to_string())
+            })?;
+        if global.dry_run {
+            description["dry_run"] = json!(true);
+            description["executed"] = json!(false);
+            description["network_requests"] = json!(0);
+        }
+        output_envelope(global, &Envelope::success("ve-adrive doctor", description))?;
+        return Ok(0);
+    }
     let report = doctor_report(global, auth, args).await?;
     let envelope = Envelope::success("ve-adrive doctor", serde_json::to_value(&report).unwrap());
     output_envelope(global, &envelope)?;
@@ -4514,6 +4566,121 @@ mod tests {
 
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn scoped_global_schema_omits_unused_local_metadata_options() {
+        for command in [
+            "ve-adrive completion",
+            "ve-adrive capabilities",
+            "ve-adrive skill",
+        ] {
+            let schema = skill_input_schema(find_capability(command).unwrap());
+            let properties = schema["properties"].as_object().unwrap();
+            for name in [
+                "profile",
+                "config_path",
+                "credentials_path",
+                "auth_mode",
+                "region",
+                "endpoint",
+                "verbose",
+                "quiet",
+                "yes",
+            ] {
+                assert!(
+                    !properties.contains_key(name),
+                    "{command} advertises unused {name}"
+                );
+            }
+            assert!(properties.contains_key("execute"));
+            assert!(properties.contains_key("output"));
+        }
+        let completion = skill_input_schema(find_capability("ve-adrive completion").unwrap());
+        assert!(completion["properties"].get("dry_run").is_none());
+        assert_eq!(completion["required"], json!(["shell"]));
+        assert!(completion["properties"].get("shell").is_some());
+    }
+
+    #[test]
+    fn scoped_global_schema_preserves_mcp_forwarding_and_share_confirmation() {
+        let serve = skill_input_schema(find_capability("ve-adrive serve").unwrap());
+        for name in [
+            "profile",
+            "config_path",
+            "credentials_path",
+            "region",
+            "endpoint",
+            "dry_run",
+            "describe",
+            "verbose",
+            "quiet",
+            "yes",
+        ] {
+            assert!(serve["properties"].get(name).is_some(), "serve lost {name}");
+        }
+        assert!(serve["properties"].get("auth_mode").is_none());
+        let cancel = skill_input_schema(find_capability("ve-adrive share cancel").unwrap());
+        assert!(cancel["properties"].get("yes").is_some());
+        let create = skill_input_schema(find_capability("ve-adrive share create").unwrap());
+        assert!(create["properties"].get("yes").is_none());
+        assert!(create["properties"].get("auth_mode").is_some());
+        assert!(create["properties"].get("password").is_some());
+    }
+
+    #[test]
+    fn scoped_global_schema_keeps_legacy_argument_acceptance() {
+        let arguments =
+            json!({"shell":"bash", "profile":"legacy", "region":"legacy-region", "yes":true});
+        let argv = build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            "ve-adrive completion",
+            arguments.as_object().unwrap(),
+        )
+        .unwrap();
+        assert!(argv.windows(2).any(|pair| pair == ["--profile", "legacy"]));
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["--region", "legacy-region"]));
+        assert!(argv.iter().any(|argument| argument == "--yes"));
+    }
+
+    #[test]
+    fn local_metadata_reports_dry_run_only_for_supported_actions() {
+        assert!(
+            !find_capability("ve-adrive capabilities")
+                .unwrap()
+                .supports_dry_run
+        );
+        let list = describe_adrive_command_metadata("ve-adrive skill list").unwrap();
+        let export = describe_adrive_command_metadata("ve-adrive skill export").unwrap();
+        let group = describe_adrive_command_metadata("ve-adrive skill").unwrap();
+        assert_eq!(list["supports_dry_run"], false);
+        assert_eq!(export["supports_dry_run"], true);
+        assert_eq!(group["supports_dry_run"], true);
+        let doctor = describe_adrive_command_metadata("ve-adrive doctor").unwrap();
+        assert_eq!(doctor["supports_dry_run"], true);
+    }
+
+    #[test]
+    fn ask_mcp_questions_already_use_the_explicit_question_option() {
+        for question in ["auth", "how to upload a file"] {
+            let arguments = json!({"question":question});
+            let argv = build_mcp_typed_argv(
+                &GlobalArgs::default(),
+                "ve-adrive ask",
+                arguments.as_object().unwrap(),
+            )
+            .unwrap();
+            assert!(argv.windows(2).any(|pair| pair == ["--question", question]));
+        }
+        let duplicate = json!({"question":"auth", "explicit_question":"other"});
+        assert!(build_mcp_typed_argv(
+            &GlobalArgs::default(),
+            "ve-adrive ask",
+            duplicate.as_object().unwrap()
+        )
+        .is_err());
+    }
 
     #[test]
     fn legacy_share_config_keys_canonicalize_only_the_adrive_namespace() {
@@ -5720,5 +5887,9 @@ mod command_display_metadata_tests {
         );
         assert_eq!(document["examples"][0], "ve-adrive ls | ve-adrive cat");
         assert_eq!(document["script"], "ve-adrive doctor");
+    }
+    #[test]
+    fn doubao_no_browser_metadata_is_a_boolean_flag() {
+        assert_eq!(super::parameter_schema_type("no-browser"), "boolean");
     }
 }
